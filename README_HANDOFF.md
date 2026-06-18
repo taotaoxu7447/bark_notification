@@ -24,6 +24,12 @@ Default rollout root:
 
 On first background start, existing rollout files are baselined at EOF so old Codex history is not pushed. New rollout files and appended lines are then polled every 2 seconds.
 
+To avoid false pushes from Codex account/session tools such as Cockpit Tools, the monitor also:
+
+- skips Codex completion events older than `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` seconds, default `3600`;
+- uses semantic de-duplication based on thread id, event type, and turn id instead of JSONL byte offset;
+- detects known rollout files whose header changes, then baselines them at EOF instead of replaying history.
+
 Triggers:
 
 - `event_msg.payload.type == "task_complete"`
@@ -125,4 +131,5 @@ This removes only the LaunchAgent plist. Config and logs remain in `~/.codex-wat
 
 - Do not print, commit, or share the Bark URL; it is a push token.
 - Do not remove first-run EOF baselining; otherwise the target Mac may receive many old Codex completion pushes.
+- Keep `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` enabled unless you explicitly want old rewritten rollout history to be replayed.
 - If this Mac stores Codex rollout files somewhere other than `~/.codex/sessions`, find the actual `rollout-*.jsonl` location and set `--sessions-root` by adapting the LaunchAgent/wrapper.

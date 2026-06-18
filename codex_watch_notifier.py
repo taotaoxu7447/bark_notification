@@ -21,6 +21,7 @@ DEFAULT_SESSIONS_ROOT = "~/.codex/sessions"
 DEFAULT_ARCHIVED_ROOT = "~/.codex/archived_sessions"
 DEFAULT_SESSION_INDEX = "~/.codex/session_index.jsonl"
 DEFAULT_ZCODE_LOG_ROOT = "~/.zcode/cli/log"
+DEFAULT_MAX_EVENT_AGE_SECONDS = 3600
 MAX_SENT_KEYS = 3000
 
 
@@ -43,6 +44,65 @@ def compact(text: str, limit: int = 900) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1] + "..."
+
+
+def parse_timestamp(value: Any) -> dt.datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000_000:
+            timestamp /= 1_000_000
+        elif timestamp > 10_000_000_000:
+            timestamp /= 1_000
+        return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc)
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.isdigit():
+            return parse_timestamp(int(text))
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def max_event_age_seconds() -> float | None:
+    raw = os.getenv("CODEX_WATCH_MAX_EVENT_AGE_SECONDS", str(DEFAULT_MAX_EVENT_AGE_SECONDS)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(DEFAULT_MAX_EVENT_AGE_SECONDS)
+    if value <= 0:
+        return None
+    return value
+
+
+def event_age_seconds(timestamp: Any) -> float | None:
+    parsed = parse_timestamp(timestamp)
+    if parsed is None:
+        return None
+    return (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds()
+
+
+def is_stale_event(event: dict[str, Any]) -> tuple[bool, float | None, float | None]:
+    max_age = max_event_age_seconds()
+    age = event_age_seconds(event.get("timestamp"))
+    if max_age is None or age is None:
+        return False, age, max_age
+    return age > max_age, age, max_age
+
+
+def file_head_hash(path: Path, limit: int = 4096) -> str:
+    try:
+        with path.open("rb") as handle:
+            return hashlib.sha256(handle.read(limit)).hexdigest()[:24]
+    except OSError:
+        return ""
 
 
 def shell_quote_for_applescript(value: str) -> str:
@@ -429,6 +489,19 @@ def trigger_from_record(path: Path, offset: int, record: dict[str, Any], extra_t
     return event
 
 
+def codex_event_stable_id(event: dict[str, Any]) -> str:
+    thread_id = str(event.get("thread_id") or "")
+    event_type = str(event.get("event_type") or "")
+    turn_id = str(event.get("turn_id") or "").strip()
+    if turn_id:
+        source = f"codex:{thread_id}:{event_type}:turn:{turn_id}"
+    else:
+        message = str(event.get("message") or "")
+        message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()[:24]
+        source = f"codex:{thread_id}:{event_type}:time:{event.get('timestamp')}:message:{message_hash}"
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+
+
 def trigger_from_zcode_record(path: Path, offset: int, record: dict[str, Any]) -> dict[str, Any] | None:
     if record.get("message") != "ZCode Protocol background turn completed":
         return None
@@ -501,8 +574,23 @@ def process_file(
         return 0
 
     offset = int(rec.get("offset", 0))
+    previous_size = int(rec.get("size", 0) or 0)
+    previous_head_hash = str(rec.get("head_hash") or "")
+    current_head_hash = file_head_hash(path)
+    if previous_head_hash and current_head_hash and current_head_hash != previous_head_hash and offset > 0:
+        rec["offset"] = size
+        rec["size"] = size
+        rec["head_hash"] = current_head_hash
+        rec["updated_at"] = int(time.time())
+        log(f"rollout appears rewritten; baselined at EOF without replaying history: {path.name}")
+        return 0
     if offset > size:
-        offset = 0
+        rec["offset"] = size
+        rec["size"] = size
+        rec["head_hash"] = current_head_hash or file_head_hash(path)
+        rec["updated_at"] = int(time.time())
+        log(f"rollout shrank; baselined at EOF without replaying history: {path.name}")
+        return 0
 
     sent_count = 0
     try:
@@ -526,10 +614,19 @@ def process_file(
                 if not event:
                     continue
 
-                stable_id_src = (
-                    f"{path}:{line_offset}:{event['event_type']}:{event.get('turn_id') or event.get('timestamp')}"
-                )
-                stable_id = hashlib.sha256(stable_id_src.encode("utf-8")).hexdigest()[:24]
+                stale, age, max_age = is_stale_event(event)
+                if stale:
+                    skipped = int(rec.get("stale_events_skipped", 0) or 0) + 1
+                    rec["stale_events_skipped"] = skipped
+                    if skipped <= 3 or skipped in {10, 50, 100, 250, 500} or skipped % 1000 == 0:
+                        log(
+                            "skipped stale "
+                            f"{event['event_type']} for {event['thread_id']} from {path.name} "
+                            f"(age={age:.0f}s, max={max_age:.0f}s)"
+                        )
+                    continue
+
+                stable_id = codex_event_stable_id(event)
                 if stable_id in state.setdefault("sent", {}):
                     continue
 
@@ -545,6 +642,7 @@ def process_file(
         log(f"cannot read {path}: {exc}")
     finally:
         rec["size"] = size
+        rec["head_hash"] = current_head_hash or file_head_hash(path)
         rec["updated_at"] = int(time.time())
     return sent_count
 
@@ -621,7 +719,12 @@ def baseline_existing_files(state: dict[str, Any], roots: list[Path], log: Logge
             size = path.stat().st_size
         except OSError:
             continue
-        files[str(path)] = {"offset": size, "size": size, "updated_at": int(time.time())}
+        files[str(path)] = {
+            "offset": size,
+            "size": size,
+            "head_hash": file_head_hash(path),
+            "updated_at": int(time.time()),
+        }
         count += 1
     state["initialized"] = True
     log(f"initialized baseline at EOF for {count} rollout files", always_stdout=True)
@@ -764,7 +867,11 @@ def main() -> int:
     while True:
         for path in rollout_files(roots):
             if str(path) not in state.setdefault("files", {}):
-                state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time())}
+                state["files"][str(path)] = {
+                    "offset": 0,
+                    "head_hash": file_head_hash(path),
+                    "new_file_at": int(time.time()),
+                }
                 log(f"new rollout discovered: {path}")
             process_file(path, state, notifier, extra_types, log)
         if zcode_enabled:
