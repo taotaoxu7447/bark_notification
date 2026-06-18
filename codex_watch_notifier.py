@@ -163,14 +163,16 @@ class Notifier:
         if not url:
             key = os.environ["BARK_KEY"].strip()
             url = f"https://api.day.app/{urllib.parse.quote(key)}"
-        data = urllib.parse.urlencode(
-            {
-                "title": title,
-                "body": body,
-                "group": os.getenv("BARK_GROUP", "Codex"),
-                "level": os.getenv("BARK_LEVEL", "timeSensitive"),
-            }
-        ).encode("utf-8")
+        payload = {
+            "title": title,
+            "body": body,
+            "group": os.getenv("BARK_GROUP", "Codex"),
+            "level": os.getenv("BARK_LEVEL", "timeSensitive"),
+        }
+        icon = (os.getenv("BARK_ICON") or "").strip()
+        if icon:
+            payload["icon"] = icon
+        data = urllib.parse.urlencode(payload).encode("utf-8")
         return self._http_post(url, data, "application/x-www-form-urlencoded")
 
     def _send_generic_webhook(self, title: str, body: str, event: dict[str, Any]) -> bool:

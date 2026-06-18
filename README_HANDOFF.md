@@ -11,6 +11,7 @@ Goal: configure this Mac so any local Codex session completion, stop, attention-
 - `install_launch_agent.zsh`: installs runtime copies into `~/.codex-watch-notifier/bin` and starts a user LaunchAgent.
 - `uninstall_launch_agent.zsh`: stops/removes the LaunchAgent.
 - `env.example`: template config. Copy it to `~/.codex-watch-notifier/env` and fill in a private push token or webhook.
+- Optional Bark icon: set `BARK_ICON` to a public image URL. This repo includes `assets/codex-icon.png`, available after push at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon.png`.
 
 ## What It Monitors
 
