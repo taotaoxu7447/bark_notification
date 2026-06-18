@@ -20,6 +20,7 @@ DEFAULT_LOG = "~/.codex-watch-notifier/notifier.log"
 DEFAULT_SESSIONS_ROOT = "~/.codex/sessions"
 DEFAULT_ARCHIVED_ROOT = "~/.codex/archived_sessions"
 DEFAULT_SESSION_INDEX = "~/.codex/session_index.jsonl"
+DEFAULT_ZCODE_LOG_ROOT = "~/.zcode/cli/log"
 MAX_SENT_KEYS = 3000
 
 
@@ -105,7 +106,7 @@ class Notifier:
         for channel in self.channels:
             try:
                 if channel == "bark":
-                    ok = self._send_bark(title, body) or ok
+                    ok = self._send_bark(title, body, event) or ok
                 elif channel == "serverchan":
                     ok = self._send_serverchan(title, body) or ok
                 elif channel == "generic_webhook":
@@ -121,7 +122,7 @@ class Notifier:
                 time.sleep(1)
                 try:
                     if channel == "bark":
-                        ok = self._send_bark(title, body) or ok
+                        ok = self._send_bark(title, body, event) or ok
                     elif channel == "serverchan":
                         ok = self._send_serverchan(title, body) or ok
                     elif channel == "generic_webhook":
@@ -158,18 +159,28 @@ class Notifier:
         data = urllib.parse.urlencode({"title": title, "text": title, "desp": body}).encode("utf-8")
         return self._http_post(url, data, "application/x-www-form-urlencoded")
 
-    def _send_bark(self, title: str, body: str) -> bool:
+    def _send_bark(self, title: str, body: str, event: dict[str, Any]) -> bool:
         url = (os.getenv("BARK_URL") or "").strip()
         if not url:
             key = os.environ["BARK_KEY"].strip()
             url = f"https://api.day.app/{urllib.parse.quote(key)}"
+        group = (
+            str(event.get("bark_group") or "").strip()
+            or os.getenv("CODEX_BARK_GROUP")
+            or os.getenv("BARK_GROUP", "Codex")
+        )
         payload = {
             "title": title,
             "body": body,
-            "group": os.getenv("BARK_GROUP", "Codex"),
+            "group": group,
             "level": os.getenv("BARK_LEVEL", "timeSensitive"),
         }
-        icon = (os.getenv("BARK_ICON") or "").strip()
+        icon = (
+            str(event.get("bark_icon") or "").strip()
+            or os.getenv("CODEX_BARK_ICON")
+            or os.getenv("BARK_ICON")
+            or ""
+        ).strip()
         if icon:
             payload["icon"] = icon
         data = urllib.parse.urlencode(payload).encode("utf-8")
@@ -246,6 +257,14 @@ def rollout_files(roots: list[Path]) -> list[Path]:
         else:
             paths.extend(root.glob("**/rollout-*.jsonl"))
     return sorted(set(paths), key=lambda path: str(path))
+
+
+def zcode_log_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    if root.is_file() and root.name.endswith(".jsonl"):
+        return [root]
+    return sorted(root.glob("zcode-*.jsonl"), key=lambda path: str(path))
 
 
 def load_session_meta(path: Path) -> dict[str, Any]:
@@ -410,6 +429,61 @@ def trigger_from_record(path: Path, offset: int, record: dict[str, Any], extra_t
     return event
 
 
+def trigger_from_zcode_record(path: Path, offset: int, record: dict[str, Any]) -> dict[str, Any] | None:
+    if record.get("message") != "ZCode Protocol background turn completed":
+        return None
+
+    context = record.get("context") or {}
+    session_id = str(record.get("sessionId") or "")
+    input_id = str(context.get("inputId") or "")
+    query_id = str(context.get("queryId") or "")
+    workspace = str(context.get("workspacePath") or "")
+    display_name = Path(workspace).name if workspace else (session_id or "ZCode")
+    timestamp = record.get("timestamp")
+    local_time = utc_to_local(timestamp)
+    duration_ms = record.get("durationMs")
+    duration = ""
+    if isinstance(duration_ms, (int, float)):
+        duration = f"{duration_ms / 1000:.1f}s"
+
+    event = {
+        "event_type": "zcode_turn_completed",
+        "timestamp": timestamp,
+        "local_time": local_time,
+        "session_id": session_id,
+        "input_id": input_id,
+        "query_id": query_id,
+        "status": "完成",
+        "status_detail": "ZCode background turn completed",
+        "cwd": workspace or "(unknown workspace)",
+        "log_path": str(path),
+        "offset": offset,
+        "duration_ms": duration_ms,
+        "bark_group": os.getenv("ZCODE_BARK_GROUP", "ZCode"),
+        "bark_icon": os.getenv("ZCODE_BARK_ICON", ""),
+    }
+
+    body_parts = [
+        "状态: 完成",
+        "判断: ZCode 本轮已结束",
+        f"会话: {display_name}",
+        f"时间: {local_time}",
+        f"目录: {workspace or '(unknown workspace)'}",
+    ]
+    if session_id:
+        body_parts.append(f"Session: {session_id[:12]}")
+    if query_id:
+        body_parts.append(f"Query: {query_id[:12]}")
+    if input_id:
+        body_parts.append(f"Input: {input_id[:12]}")
+    if duration:
+        body_parts.append(f"耗时: {duration}")
+
+    event["notification_title"] = f"ZCode 已完成: {compact(display_name, 42)}"
+    event["notification_body"] = "\n".join(body_parts)
+    return event
+
+
 def process_file(
     path: Path,
     state: dict[str, Any],
@@ -475,6 +549,70 @@ def process_file(
     return sent_count
 
 
+def process_zcode_file(
+    path: Path,
+    state: dict[str, Any],
+    notifier: Notifier,
+    log: Logger,
+) -> int:
+    files = state.setdefault("files", {})
+    key = str(path)
+    rec = files.setdefault(key, {"offset": 0})
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        log(f"cannot stat {path}: {exc}")
+        return 0
+
+    offset = int(rec.get("offset", 0))
+    if offset > size:
+        offset = 0
+
+    sent_count = 0
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            while True:
+                line_offset = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    break
+                try:
+                    record = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    rec["offset"] = handle.tell()
+                    continue
+
+                event = trigger_from_zcode_record(path, line_offset, record)
+                rec["offset"] = handle.tell()
+                if not event:
+                    continue
+
+                stable_id_src = (
+                    f"{path}:{line_offset}:{event['event_type']}:{event.get('query_id') or event.get('timestamp')}"
+                )
+                stable_id = hashlib.sha256(stable_id_src.encode("utf-8")).hexdigest()[:24]
+                if stable_id in state.setdefault("sent", {}):
+                    continue
+
+                title = event["notification_title"]
+                body = event["notification_body"]
+                if notifier.send(title, body, event):
+                    state["sent"][stable_id] = int(time.time())
+                    sent_count += 1
+                    log(f"sent {event['event_type']} for {event['session_id']} from {path.name}")
+                else:
+                    log(f"failed to send {event['event_type']} for {event['session_id']} from {path.name}")
+    except OSError as exc:
+        log(f"cannot read {path}: {exc}")
+    finally:
+        rec["size"] = size
+        rec["updated_at"] = int(time.time())
+    return sent_count
+
+
 def baseline_existing_files(state: dict[str, Any], roots: list[Path], log: Logger) -> None:
     files = state.setdefault("files", {})
     count = 0
@@ -489,12 +627,36 @@ def baseline_existing_files(state: dict[str, Any], roots: list[Path], log: Logge
     log(f"initialized baseline at EOF for {count} rollout files", always_stdout=True)
 
 
+def baseline_existing_zcode_files(state: dict[str, Any], root: Path, log: Logger) -> None:
+    files = state.setdefault("files", {})
+    count = 0
+    for path in zcode_log_files(root):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        files[str(path)] = {"offset": size, "size": size, "updated_at": int(time.time()), "kind": "zcode"}
+        count += 1
+    state["zcode_initialized"] = True
+    log(f"initialized ZCode baseline at EOF for {count} log files", always_stdout=True)
+
+
 def build_roots(args: argparse.Namespace) -> list[Path]:
     roots = [expand_path(value) for value in (args.sessions_root or [DEFAULT_SESSIONS_ROOT])]
     include_archived = args.include_archived or os.getenv("CODEX_WATCH_INCLUDE_ARCHIVED") in {"1", "true", "True"}
     if include_archived:
         roots.append(expand_path(DEFAULT_ARCHIVED_ROOT))
     return roots
+
+
+def build_zcode_log_root(args: argparse.Namespace) -> Path:
+    return expand_path(args.zcode_log_root or os.getenv("ZCODE_WATCH_LOG_ROOT", DEFAULT_ZCODE_LOG_ROOT))
+
+
+def zcode_watch_enabled(args: argparse.Namespace) -> bool:
+    if args.disable_zcode:
+        return False
+    return os.getenv("ZCODE_WATCH_ENABLED", "1") not in {"0", "false", "False"}
 
 
 def parse_extra_event_types() -> set[str]:
@@ -518,6 +680,22 @@ def send_test_notification(args: argparse.Namespace, log: Logger) -> int:
     return 0 if ok else 1
 
 
+def send_zcode_test_notification(args: argparse.Namespace, log: Logger) -> int:
+    notifier = Notifier(args.dry_run, log)
+    event = {
+        "event_type": "zcode_test",
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "local_time": dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "session_id": "test",
+        "cwd": str(Path.cwd()),
+        "message": "ZCode Watch Notifier test",
+        "bark_group": os.getenv("ZCODE_BARK_GROUP", "ZCode"),
+        "bark_icon": os.getenv("ZCODE_BARK_ICON", ""),
+    }
+    ok = notifier.send("ZCode 测试提醒", "这是一条 ZCode 测试提醒。收到它说明 ZCode 分组和图标配置可用。", event)
+    return 0 if ok else 1
+
+
 def replay_file(args: argparse.Namespace, log: Logger) -> int:
     path = expand_path(args.replay_file)
     state = {"version": 1, "initialized": True, "files": {str(path): {"offset": 0}}, "sent": {}}
@@ -536,9 +714,12 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Process currently appended data once and exit.")
     parser.add_argument("--process-existing", action="store_true", help="Do not baseline old files on first run.")
     parser.add_argument("--include-archived", action="store_true", help="Also scan ~/.codex/archived_sessions.")
+    parser.add_argument("--zcode-log-root", help="Root containing ZCode zcode-*.jsonl log files.")
+    parser.add_argument("--disable-zcode", action="store_true", help="Disable ZCode log notifications.")
     parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them.")
     parser.add_argument("--verbose", action="store_true", help="Also print log lines to stdout.")
     parser.add_argument("--test", action="store_true", help="Send one test notification and exit.")
+    parser.add_argument("--test-zcode", action="store_true", help="Send one ZCode test notification and exit.")
     parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
     args = parser.parse_args()
 
@@ -547,23 +728,38 @@ def main() -> int:
 
     if args.test:
         return send_test_notification(args, log)
+    if args.test_zcode:
+        return send_zcode_test_notification(args, log)
     if args.replay_file:
         return replay_file(args, log)
 
     roots = build_roots(args)
+    zcode_enabled = zcode_watch_enabled(args)
+    zcode_root = build_zcode_log_root(args)
     state_path = expand_path(args.state)
     state = load_state(state_path)
+    did_baseline = False
     if not state.get("initialized") and not args.process_existing:
         baseline_existing_files(state, roots, log)
+        did_baseline = True
+    else:
+        state["initialized"] = True
+    if zcode_enabled:
+        if not state.get("zcode_initialized") and not args.process_existing:
+            baseline_existing_zcode_files(state, zcode_root, log)
+            did_baseline = True
+        else:
+            state["zcode_initialized"] = True
+    if did_baseline:
         save_state(state_path, state)
         if args.once:
             return 0
-    else:
-        state["initialized"] = True
 
     notifier = Notifier(args.dry_run, log)
     extra_types = parse_extra_event_types()
     log(f"watching {', '.join(str(root) for root in roots)} with channels={notifier.channels}", always_stdout=True)
+    if zcode_enabled:
+        log(f"watching ZCode {zcode_root} with channels={notifier.channels}", always_stdout=True)
 
     while True:
         for path in rollout_files(roots):
@@ -571,6 +767,12 @@ def main() -> int:
                 state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time())}
                 log(f"new rollout discovered: {path}")
             process_file(path, state, notifier, extra_types, log)
+        if zcode_enabled:
+            for path in zcode_log_files(zcode_root):
+                if str(path) not in state.setdefault("files", {}):
+                    state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time()), "kind": "zcode"}
+                    log(f"new ZCode log discovered: {path}")
+                process_zcode_file(path, state, notifier, log)
         save_state(state_path, state)
         if args.once:
             return 0

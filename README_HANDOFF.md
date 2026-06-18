@@ -11,7 +11,8 @@ Goal: configure this Mac so any local Codex session completion, stop, attention-
 - `install_launch_agent.zsh`: installs runtime copies into `~/.codex-watch-notifier/bin` and starts a user LaunchAgent.
 - `uninstall_launch_agent.zsh`: stops/removes the LaunchAgent.
 - `env.example`: template config. Copy it to `~/.codex-watch-notifier/env` and fill in a private push token or webhook.
-- Optional Bark icon: set `BARK_ICON` to a public image URL. This repo includes `assets/codex-icon-large-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png`.
+- Optional Bark icon/group: set `CODEX_BARK_ICON` and `CODEX_BARK_GROUP`. This repo includes `assets/codex-icon-large-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png`.
+- ZCode Bark settings: set `ZCODE_BARK_ICON` and `ZCODE_BARK_GROUP`. This repo includes `assets/zcode-icon-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/zcode-icon-v1.png`. ZCode notifications watch `~/.zcode/cli/log/zcode-*.jsonl`.
 
 ## What It Monitors
 
@@ -27,6 +28,7 @@ Triggers:
 
 - `event_msg.payload.type == "task_complete"`
 - `event_msg.payload.type == "turn_aborted"`
+- ZCode `message == "ZCode Protocol background turn completed"` from `~/.zcode/cli/log/zcode-*.jsonl`
 
 Thread title:
 
