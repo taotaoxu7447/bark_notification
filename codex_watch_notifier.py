@@ -135,8 +135,6 @@ class Notifier:
         channels: list[str] = []
         if os.getenv("BARK_URL") or os.getenv("BARK_KEY"):
             channels.append("bark")
-        if os.getenv("SERVERCHAN_SENDKEY"):
-            channels.append("serverchan")
         if os.getenv("CODEX_NOTIFY_WEBHOOK_URL"):
             channels.append("generic_webhook")
         if os.getenv("WECOM_WEBHOOK_URL") or os.getenv("WECHAT_WORK_WEBHOOK"):
@@ -159,7 +157,7 @@ class Notifier:
             return True
 
         if not self.channels:
-            self.log("no notification channel configured; set SERVERCHAN_SENDKEY or CODEX_NOTIFY_WEBHOOK_URL")
+            self.log("no notification channel configured; set BARK_URL, BARK_KEY, or CODEX_NOTIFY_WEBHOOK_URL")
             return False
 
         ok = False
@@ -167,8 +165,6 @@ class Notifier:
             try:
                 if channel == "bark":
                     ok = self._send_bark(title, body, event) or ok
-                elif channel == "serverchan":
-                    ok = self._send_serverchan(title, body) or ok
                 elif channel == "generic_webhook":
                     ok = self._send_generic_webhook(title, body, event) or ok
                 elif channel == "wecom":
@@ -183,8 +179,6 @@ class Notifier:
                 try:
                     if channel == "bark":
                         ok = self._send_bark(title, body, event) or ok
-                    elif channel == "serverchan":
-                        ok = self._send_serverchan(title, body) or ok
                     elif channel == "generic_webhook":
                         ok = self._send_generic_webhook(title, body, event) or ok
                     elif channel == "wecom":
@@ -212,12 +206,6 @@ class Notifier:
             return True
         self.log(f"http webhook returned status={status}: {response_body}")
         return False
-
-    def _send_serverchan(self, title: str, body: str) -> bool:
-        sendkey = os.environ["SERVERCHAN_SENDKEY"].strip()
-        url = f"https://sctapi.ftqq.com/{urllib.parse.quote(sendkey)}.send"
-        data = urllib.parse.urlencode({"title": title, "text": title, "desp": body}).encode("utf-8")
-        return self._http_post(url, data, "application/x-www-form-urlencoded")
 
     def _send_bark(self, title: str, body: str, event: dict[str, Any]) -> bool:
         url = (os.getenv("BARK_URL") or "").strip()

@@ -15,7 +15,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   cp "$SCRIPT_DIR/env.example" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   echo "Created $ENV_FILE"
-  echo "Edit it and set SERVERCHAN_SENDKEY or another push channel, then run this installer again."
+  echo "Edit it and set BARK_URL, BARK_KEY, or another notification channel, then run this installer again."
   exit 0
 fi
 
