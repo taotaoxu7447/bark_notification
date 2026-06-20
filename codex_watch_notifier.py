@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 import time
@@ -29,6 +30,28 @@ def expand_path(value: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
 
 
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = os.path.expandvars(os.path.expanduser(value))
+
+
+def default_env_path() -> Path:
+    return expand_path(os.getenv("CODEX_WATCH_ENV", os.getenv("CODEX_WATCH_CONFIG_DIR", "~/.codex-watch-notifier") + "/env"))
+
+
 def utc_to_local(value: str | None) -> str:
     if not value:
         return dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -44,6 +67,35 @@ def compact(text: str, limit: int = 900) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1] + "..."
+
+
+def env_flag(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw not in {"0", "false", "False", "no", "No", "off", "Off"}
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def include_workspace_in_notifications() -> bool:
+    return env_flag("NOTIFY_INCLUDE_WORKSPACE", True)
+
+
+def include_message_excerpt_in_notifications() -> bool:
+    return env_flag("NOTIFY_INCLUDE_MESSAGE", True)
+
+
+def notification_body_max_chars() -> int:
+    return max(env_int("NOTIFY_BODY_MAX_CHARS", 1100), 0)
 
 
 def parse_timestamp(value: Any) -> dt.datetime | None:
@@ -141,7 +193,11 @@ class Notifier:
             channels.append("wecom")
         if os.getenv("CODEX_NOTIFY_COMMAND"):
             channels.append("command")
-        if os.getenv("CODEX_WATCH_MACOS_NOTIFICATION", "1") not in {"0", "false", "False"}:
+        if platform.system() == "Darwin" and os.getenv("CODEX_WATCH_MACOS_NOTIFICATION", "1") not in {
+            "0",
+            "false",
+            "False",
+        }:
             channels.append("macos")
         if self.dry_run and not channels:
             channels.append("dry_run")
@@ -467,10 +523,11 @@ def trigger_from_record(path: Path, offset: int, record: dict[str, Any], extra_t
         f"会话: {display_name}",
         f"线程: {short_thread}",
         f"时间: {local_time}",
-        f"目录: {cwd}",
     ]
-    if message:
-        body_parts.extend(["", compact(message, 1100)])
+    if include_workspace_in_notifications():
+        body_parts.append(f"目录: {cwd}")
+    if message and include_message_excerpt_in_notifications() and notification_body_max_chars() > 0:
+        body_parts.extend(["", compact(message, notification_body_max_chars())])
     body = "\n".join(body_parts)
     event["notification_title"] = f"{title}: {compact(display_name, 42)}"
     event["notification_body"] = body
@@ -529,8 +586,9 @@ def trigger_from_zcode_record(path: Path, offset: int, record: dict[str, Any]) -
         "判断: ZCode 本轮已结束",
         f"会话: {display_name}",
         f"时间: {local_time}",
-        f"目录: {workspace or '(unknown workspace)'}",
     ]
+    if include_workspace_in_notifications():
+        body_parts.append(f"目录: {workspace or '(unknown workspace)'}")
     if session_id:
         body_parts.append(f"Session: {session_id[:12]}")
     if query_id:
@@ -787,6 +845,84 @@ def send_zcode_test_notification(args: argparse.Namespace, log: Logger) -> int:
     return 0 if ok else 1
 
 
+def print_check(name: str, ok: bool, detail: str = "") -> None:
+    status = "OK" if ok else "WARN"
+    suffix = f" - {detail}" if detail else ""
+    print(f"[{status}] {name}{suffix}")
+
+
+def launch_agent_state() -> str:
+    if platform.system() != "Darwin":
+        return "not applicable"
+    label = os.getenv("CODEX_WATCH_LAUNCH_AGENT_LABEL", "com.xutao.codex-watch-notifier")
+    target = f"gui/{os.getuid()}/{label}"
+    try:
+        completed = subprocess.run(
+            ["launchctl", "print", target],
+            text=True,
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"unknown ({exc})"
+    if completed.returncode != 0:
+        return "not loaded"
+    for line in completed.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("state ="):
+            return stripped.split("=", 1)[1].strip()
+    return "loaded"
+
+
+def count_paths(paths: list[Path]) -> int:
+    return len(paths)
+
+
+def doctor(args: argparse.Namespace, log: Logger) -> int:
+    del log
+    env_path = default_env_path()
+    state_path = expand_path(args.state)
+    log_path = expand_path(args.log)
+    roots = build_roots(args)
+    zcode_root = build_zcode_log_root(args)
+    notifier = Notifier(False, Logger(None))
+
+    print("Codex Watch Notifier doctor")
+    print(f"Platform: {platform.system()} {platform.release()}")
+    print(f"Config: {env_path}")
+    print_check("config file", env_path.exists(), "chmod 600 recommended" if env_path.exists() else "run installer")
+    print_check("notification channels", bool(notifier.channels), ",".join(notifier.channels) or "none configured")
+    print_check("Bark configured", bool(os.getenv("BARK_URL") or os.getenv("BARK_KEY")), "BARK_URL/BARK_KEY")
+    print_check("Codex sessions root", any(root.exists() for root in roots), ", ".join(str(root) for root in roots))
+    print_check("Codex rollout files", count_paths(rollout_files(roots)) > 0, f"{count_paths(rollout_files(roots))} file(s)")
+    print_check("ZCode watch enabled", zcode_watch_enabled(args), f"root={zcode_root}")
+    if zcode_watch_enabled(args):
+        print_check("ZCode log root", zcode_root.exists(), str(zcode_root))
+        print_check("ZCode log files", count_paths(zcode_log_files(zcode_root)) > 0, f"{count_paths(zcode_log_files(zcode_root))} file(s)")
+    print_check("state file", state_path.exists(), str(state_path))
+    print_check("log file", log_path.exists(), str(log_path))
+    if platform.system() == "Darwin":
+        print_check("LaunchAgent", launch_agent_state() == "running", launch_agent_state())
+    elif platform.system() == "Linux":
+        print_check("background service", False, "use a systemd user service")
+    elif platform.system() == "Windows":
+        print_check("background service", False, "use Task Scheduler or a startup shortcut")
+    else:
+        print_check("background service", False, "manual setup required")
+    print(f"Privacy: workspace={include_workspace_in_notifications()} message={include_message_excerpt_in_notifications()} max_chars={notification_body_max_chars()}")
+
+    if log_path.exists():
+        print("\nRecent notifier log:")
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+            for line in lines:
+                print(line)
+        except OSError as exc:
+            print(f"cannot read log: {exc}")
+    return 0
+
+
 def replay_file(args: argparse.Namespace, log: Logger) -> int:
     path = expand_path(args.replay_file)
     state = {"version": 1, "initialized": True, "files": {str(path): {"offset": 0}}, "sent": {}}
@@ -797,6 +933,7 @@ def replay_file(args: argparse.Namespace, log: Logger) -> int:
 
 
 def main() -> int:
+    load_env_file(default_env_path())
     parser = argparse.ArgumentParser(description="Notify when Codex rollout sessions complete or stop.")
     parser.add_argument("--sessions-root", action="append", help="Root containing rollout-*.jsonl files.")
     parser.add_argument("--state", default=os.getenv("CODEX_WATCH_STATE", DEFAULT_STATE), help="State JSON path.")
@@ -811,6 +948,7 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true", help="Also print log lines to stdout.")
     parser.add_argument("--test", action="store_true", help="Send one test notification and exit.")
     parser.add_argument("--test-zcode", action="store_true", help="Send one ZCode test notification and exit.")
+    parser.add_argument("--doctor", action="store_true", help="Check configuration, log roots, and LaunchAgent status.")
     parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
     args = parser.parse_args()
 
@@ -821,6 +959,8 @@ def main() -> int:
         return send_test_notification(args, log)
     if args.test_zcode:
         return send_zcode_test_notification(args, log)
+    if args.doctor:
+        return doctor(args, log)
     if args.replay_file:
         return replay_file(args, log)
 

@@ -1,8 +1,24 @@
-# Codex Watch Notifier Handoff
+# Codex Watch Notifier
 
-This folder contains the exact notifier implementation from the source Mac.
+This folder contains a Bark-first notifier for local AI coding agents.
 
-Goal: configure this Mac so any local Codex session completion, stop, attention-needed state, or abort sends a Bark push to the user's existing iPhone and Apple Watch.
+Goal: when a local Codex or ZCode task completes, stops, needs attention, or aborts, send a Bark push to the user's iPhone and Apple Watch.
+
+## Platform Plan
+
+The Python monitor is shared across platforms. Internal releases should be split into three packages:
+
+- macOS: LaunchAgent package.
+- Ubuntu: systemd user service package.
+- Windows: Task Scheduler package.
+
+See `PACKAGING.md` for the package layout. The current installer in this repository is the macOS LaunchAgent installer.
+
+For coworkers, publish three release artifacts and ask them to download the one matching their OS:
+
+- `codex-watch-notifier-macos-<version>.zip`
+- `codex-watch-notifier-ubuntu-<version>.tar.gz`
+- `codex-watch-notifier-windows-<version>.zip`
 
 ## Files
 
@@ -51,7 +67,7 @@ Status labeling:
 
 There is no official structured complete-vs-attention-needed field in the observed Codex `task_complete` payload, so the status split is intentionally conservative and based on the final assistant message.
 
-## Install On The Target Mac
+## macOS Install
 
 Run these commands from this folder:
 
@@ -64,6 +80,39 @@ $EDITOR ~/.codex-watch-notifier/env
 ```
 
 If a previous `com.xutao.codex-watch-notifier` LaunchAgent exists, the installer will `bootout` it and install the current copy.
+
+## Ubuntu Install
+
+Run these commands from the Ubuntu package folder:
+
+```bash
+chmod +x install_systemd_user.sh uninstall_systemd_user.sh
+./install_systemd_user.sh
+$EDITOR ~/.codex-watch-notifier/env
+./install_systemd_user.sh
+python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --doctor
+python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --test
+```
+
+If the service must run while the user is not logged in:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+## Windows Install
+
+Run PowerShell from the Windows package folder:
+
+```powershell
+.\install_task_scheduler.ps1
+notepad $env:USERPROFILE\.codex-watch-notifier\env
+.\install_task_scheduler.ps1
+py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --doctor
+py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --test
+```
+
+The Windows package installs a scheduled task named `CodexWatchNotifier` that starts at logon.
 
 ## Test
 
@@ -99,6 +148,14 @@ Expected line:
 watching /Users/<user>/.codex/sessions with channels=['bark']
 ```
 
+Run diagnostics:
+
+```bash
+./codex-watch-notifier.zsh --doctor
+```
+
+The doctor command checks the config file, Bark setup, Codex/ZCode log roots, state file, notifier log, LaunchAgent state on macOS, and current privacy settings.
+
 ## Verify Real Codex Completion
 
 After the LaunchAgent is running, finish any Codex turn. Within a few seconds, Bark should send a notification with a title like:
@@ -118,6 +175,18 @@ The body includes:
 - time
 - working directory
 - final message excerpt
+
+## Privacy
+
+Notification bodies can include workspace paths and final assistant message excerpts. For a safer internal default, edit `~/.codex-watch-notifier/env`:
+
+```bash
+NOTIFY_INCLUDE_WORKSPACE=0
+NOTIFY_INCLUDE_MESSAGE=0
+NOTIFY_BODY_MAX_CHARS=0
+```
+
+Keep these enabled only when the extra context is useful and acceptable for your team.
 
 ## Uninstall
 
