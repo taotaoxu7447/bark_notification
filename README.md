@@ -4,13 +4,13 @@
 
 ![通知回路副封面](assets/cover-notification-loop.png)
 
-这是一个面向 AI 编程助手的本地任务提醒器。它会在本机持续监听已支持工具的日志或会话文件，当 AI 任务完成、停止、需要人工处理或异常中断时，通过 Bark 推送到手机和手表。
+这是一个面向 AI 编程助手的本地任务提醒器。它会在本机持续监听已支持工具的日志或会话文件，当 AI 任务完成、停止、需要人工处理或异常中断时，通过 Bark 推送到你的随身设备。
 
 项目当前优先服务内部同事使用：先让大家在自己的 macOS、Ubuntu、Windows 工作环境里稳定收到提醒；如果某个同事使用的工具还没适配，可以按本文档添加 watcher 后直接提交到主分支。
 
 ## 已支持能力
 
-- **通知通道**：Bark 是主线能力，支持 iPhone 和 Apple Watch 推送。
+- **通知通道**：Bark 是主线能力。iPhone / Apple Watch 是已验证路径；Android 手机、手环等设备取决于 Bark 兼容客户端和系统通知同步能力。
 - **已适配工具**：Codex App / Codex CLI、ZCode。
 - **分组和图标**：Codex、ZCode 使用不同 Bark `group` 和 `icon`，手机通知列表里能分开看。
 - **三端安装**：macOS LaunchAgent、Ubuntu systemd user service、Windows Task Scheduler。
@@ -27,17 +27,18 @@
 
 1. 在电脑上让 Codex、ZCode 或其他 AI 编程助手跑长任务。
 2. 人离开电脑，或切换去做别的事。
-3. AI 任务完成、卡住或需要确认时，手机和手表收到提醒。
+3. AI 任务完成、卡住或需要确认时，手机、手表或其他 Bark 客户端设备收到提醒。
 4. 回到对应电脑继续处理。
 
 它不是云端服务，不需要把代码上传到第三方。监听和判断都发生在你自己的电脑上。
 
-## 手机和手表准备
+## 随身设备准备
 
-1. 在 iPhone 安装 Bark。
-2. 打开 Bark，允许通知权限。
-3. 复制 Bark 首页显示的推送地址或 key。
+1. 在要接收通知的设备上安装 Bark 或 Bark 兼容客户端。
+2. 打开客户端，允许通知权限。
+3. 复制客户端显示的 Bark 推送地址或 key。
 4. 如果使用 Apple Watch，保持 iPhone 和 Apple Watch 的系统通知同步设置正常。Bark 通知会按 iOS / watchOS 的规则转发到手表。
+5. 如果使用 Android 手机、手环或其他穿戴设备，确认对应客户端能接收 Bark API 推送，并确认系统通知能同步到穿戴设备。
 
 配置时可以二选一：
 
