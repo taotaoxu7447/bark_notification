@@ -187,6 +187,8 @@ class Notifier:
         channels: list[str] = []
         if os.getenv("BARK_URL") or os.getenv("BARK_KEY"):
             channels.append("bark")
+        if os.getenv("NTFY_URL") or os.getenv("CODEX_NTFY_URL") or os.getenv("ZCODE_NTFY_URL"):
+            channels.append("ntfy")
         if os.getenv("CODEX_NOTIFY_WEBHOOK_URL"):
             channels.append("generic_webhook")
         if os.getenv("WECOM_WEBHOOK_URL") or os.getenv("WECHAT_WORK_WEBHOOK"):
@@ -213,7 +215,7 @@ class Notifier:
             return True
 
         if not self.channels:
-            self.log("no notification channel configured; set BARK_URL, BARK_KEY, or CODEX_NOTIFY_WEBHOOK_URL")
+            self.log("no notification channel configured; set BARK_URL, BARK_KEY, NTFY_URL, or CODEX_NOTIFY_WEBHOOK_URL")
             return False
 
         ok = False
@@ -221,6 +223,8 @@ class Notifier:
             try:
                 if channel == "bark":
                     ok = self._send_bark(title, body, event) or ok
+                elif channel == "ntfy":
+                    ok = self._send_ntfy(title, body, event) or ok
                 elif channel == "generic_webhook":
                     ok = self._send_generic_webhook(title, body, event) or ok
                 elif channel == "wecom":
@@ -235,6 +239,8 @@ class Notifier:
                 try:
                     if channel == "bark":
                         ok = self._send_bark(title, body, event) or ok
+                    elif channel == "ntfy":
+                        ok = self._send_ntfy(title, body, event) or ok
                     elif channel == "generic_webhook":
                         ok = self._send_generic_webhook(title, body, event) or ok
                     elif channel == "wecom":
@@ -247,11 +253,20 @@ class Notifier:
                     self.log(f"channel {channel} retry failed: {retry_exc}")
         return ok
 
-    def _http_post(self, url: str, payload: bytes, content_type: str) -> bool:
+    def _http_post(
+        self,
+        url: str,
+        payload: bytes,
+        content_type: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> bool:
+        headers = {"Content-Type": content_type, "User-Agent": "codex-watch-notifier/1.0"}
+        if extra_headers:
+            headers.update({key: value for key, value in extra_headers.items() if value})
         request = urllib.request.Request(
             url,
             data=payload,
-            headers={"Content-Type": content_type, "User-Agent": "codex-watch-notifier/1.0"},
+            headers=headers,
             method="POST",
         )
         timeout = float(os.getenv("CODEX_NOTIFY_HTTP_TIMEOUT", "12"))
@@ -289,6 +304,45 @@ class Notifier:
             payload["icon"] = icon
         data = urllib.parse.urlencode(payload).encode("utf-8")
         return self._http_post(url, data, "application/x-www-form-urlencoded")
+
+    def _send_ntfy(self, title: str, body: str, event: dict[str, Any]) -> bool:
+        prefix = "ZCODE" if str(event.get("event_type") or "").startswith("zcode") else "CODEX"
+        url = (
+            str(event.get("ntfy_url") or "").strip()
+            or os.getenv(f"{prefix}_NTFY_URL", "").strip()
+            or os.getenv("NTFY_URL", "").strip()
+        )
+        if not url:
+            self.log(f"ntfy channel skipped: set NTFY_URL or {prefix}_NTFY_URL")
+            return False
+
+        priority = (
+            str(event.get("ntfy_priority") or "").strip()
+            or os.getenv(f"{prefix}_NTFY_PRIORITY", "").strip()
+            or os.getenv("NTFY_PRIORITY", "default").strip()
+        )
+        tags = (
+            str(event.get("ntfy_tags") or "").strip()
+            or os.getenv(f"{prefix}_NTFY_TAGS", "").strip()
+            or os.getenv("NTFY_TAGS", "").strip()
+        )
+        query_params = {"title": title}
+        if priority:
+            query_params["priority"] = priority
+        if tags:
+            query_params["tags"] = tags
+        separator = "&" if urllib.parse.urlparse(url).query else "?"
+        url = url + separator + urllib.parse.urlencode(query_params)
+
+        headers = {}
+        token = os.getenv("NTFY_TOKEN", "").strip()
+        if token:
+            if token.lower().startswith(("bearer ", "basic ")):
+                headers["Authorization"] = token
+            else:
+                headers["Authorization"] = f"Bearer {token}"
+
+        return self._http_post(url, body.encode("utf-8"), "text/plain; charset=utf-8", headers)
 
     def _send_generic_webhook(self, title: str, body: str, event: dict[str, Any]) -> bool:
         url = os.environ["CODEX_NOTIFY_WEBHOOK_URL"].strip()
@@ -579,6 +633,8 @@ def trigger_from_zcode_record(path: Path, offset: int, record: dict[str, Any]) -
         "duration_ms": duration_ms,
         "bark_group": os.getenv("ZCODE_BARK_GROUP", "ZCode"),
         "bark_icon": os.getenv("ZCODE_BARK_ICON", ""),
+        "ntfy_url": os.getenv("ZCODE_NTFY_URL", ""),
+        "ntfy_tags": os.getenv("ZCODE_NTFY_TAGS", "zap,computer"),
     }
 
     body_parts = [
@@ -840,6 +896,8 @@ def send_zcode_test_notification(args: argparse.Namespace, log: Logger) -> int:
         "message": "ZCode Watch Notifier test",
         "bark_group": os.getenv("ZCODE_BARK_GROUP", "ZCode"),
         "bark_icon": os.getenv("ZCODE_BARK_ICON", ""),
+        "ntfy_url": os.getenv("ZCODE_NTFY_URL", ""),
+        "ntfy_tags": os.getenv("ZCODE_NTFY_TAGS", "zap,computer"),
     }
     ok = notifier.send("ZCode 测试提醒", "这是一条 ZCode 测试提醒。收到它说明 ZCode 分组和图标配置可用。", event)
     return 0 if ok else 1
@@ -894,6 +952,11 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     print_check("config file", env_path.exists(), "chmod 600 recommended" if env_path.exists() else "run installer")
     print_check("notification channels", bool(notifier.channels), ",".join(notifier.channels) or "none configured")
     print_check("Bark configured", bool(os.getenv("BARK_URL") or os.getenv("BARK_KEY")), "BARK_URL/BARK_KEY")
+    ntfy_configured = bool(os.getenv("NTFY_URL") or os.getenv("CODEX_NTFY_URL") or os.getenv("ZCODE_NTFY_URL"))
+    ntfy_detail = os.getenv("NTFY_URL") or os.getenv("CODEX_NTFY_URL") or os.getenv("ZCODE_NTFY_URL") or "NTFY_URL"
+    if str(ntfy_detail).startswith("https://ntfy.sh/") and len(str(ntfy_detail).rstrip("/").rsplit("/", 1)[-1]) < 12:
+        ntfy_detail = f"{ntfy_detail} (public topic should be long and random)"
+    print_check("ntfy configured", ntfy_configured, str(ntfy_detail))
     print_check("Codex sessions root", any(root.exists() for root in roots), ", ".join(str(root) for root in roots))
     print_check("Codex rollout files", count_paths(rollout_files(roots)) > 0, f"{count_paths(rollout_files(roots))} file(s)")
     print_check("ZCode watch enabled", zcode_watch_enabled(args), f"root={zcode_root}")

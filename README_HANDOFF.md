@@ -1,8 +1,8 @@
 # Codex Watch Notifier
 
-This folder contains a Bark-first notifier for local AI coding agents.
+This folder contains a Bark/ntfy notifier for local AI coding agents.
 
-Goal: when a local Codex or ZCode task completes, stops, needs attention, or aborts, send a Bark push to the user's iPhone and Apple Watch.
+Goal: when a local Codex or ZCode task completes, stops, needs attention, or aborts, send a push to the user's devices. Bark is recommended for iPhone and Apple Watch. Public `ntfy.sh` is the current Android-friendly channel for Android phones and wearable notification forwarding.
 
 ## Platform Plan
 
@@ -26,9 +26,10 @@ For coworkers, publish three release artifacts and ask them to download the one 
 - `codex-watch-notifier.zsh`: wrapper that loads `~/.codex-watch-notifier/env`.
 - `install_launch_agent.zsh`: installs runtime copies into `~/.codex-watch-notifier/bin` and starts a user LaunchAgent.
 - `uninstall_launch_agent.zsh`: stops/removes the LaunchAgent.
-- `env.example`: template config. Copy it to `~/.codex-watch-notifier/env` and fill in a private push token or webhook.
+- `env.example`: template config. Copy it to `~/.codex-watch-notifier/env` and fill in a private Bark URL/key, ntfy topic URL, or webhook.
 - Optional Bark icon/group: set `CODEX_BARK_ICON` and `CODEX_BARK_GROUP`. This repo includes `assets/codex-icon-large-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png`.
 - ZCode Bark settings: set `ZCODE_BARK_ICON` and `ZCODE_BARK_GROUP`. This repo includes `assets/zcode-icon-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/zcode-icon-v1.png`. ZCode notifications watch `~/.zcode/cli/log/zcode-*.jsonl`.
+- ntfy settings: set `NTFY_URL=https://ntfy.sh/<long-random-topic>`. Optional per-tool overrides are `CODEX_NTFY_URL` and `ZCODE_NTFY_URL`. Public ntfy.sh topics are shared secrets; never use short or guessable topic names.
 
 ## What It Monitors
 
@@ -116,13 +117,13 @@ The Windows package installs a scheduled task named `CodexWatchNotifier` that st
 
 ## Test
 
-Send one Bark test notification:
+Send one test notification through every configured channel:
 
 ```bash
 ./codex-watch-notifier.zsh --test
 ```
 
-Expected: iPhone receives `Codex 测试提醒`. If the iPhone is locked and the Apple Watch is worn/unlocked, the watch should vibrate.
+Expected: the configured Bark or ntfy client receives `Codex 测试提醒`. For Apple Watch, if the iPhone is locked and the Apple Watch is worn/unlocked, the watch should vibrate. For Android wearables, behavior depends on the phone's notification forwarding settings.
 
 Check service state:
 
@@ -145,7 +146,7 @@ tail -40 ~/.codex-watch-notifier/notifier.log
 Expected line:
 
 ```text
-watching /Users/<user>/.codex/sessions with channels=['bark']
+watching /Users/<user>/.codex/sessions with channels=['bark', 'ntfy']
 ```
 
 Run diagnostics:
@@ -154,11 +155,11 @@ Run diagnostics:
 ./codex-watch-notifier.zsh --doctor
 ```
 
-The doctor command checks the config file, Bark setup, Codex/ZCode log roots, state file, notifier log, LaunchAgent state on macOS, and current privacy settings.
+The doctor command checks the config file, Bark/ntfy setup, Codex/ZCode log roots, state file, notifier log, LaunchAgent state on macOS, and current privacy settings.
 
 ## Verify Real Codex Completion
 
-After the LaunchAgent is running, finish any Codex turn. Within a few seconds, Bark should send a notification with a title like:
+After the LaunchAgent is running, finish any Codex turn. Within a few seconds, the configured channel should send a notification with a title like:
 
 ```text
 Codex 需要处理: <会话标题>
@@ -198,7 +199,7 @@ This removes only the LaunchAgent plist. Config and logs remain in `~/.codex-wat
 
 ## Important Notes
 
-- Do not print, commit, or share the Bark URL; it is a push token.
+- Do not print, commit, or share the Bark URL, Bark key, or ntfy topic URL; they are push tokens.
 - Do not remove first-run EOF baselining; otherwise the target Mac may receive many old Codex completion pushes.
 - Keep `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` enabled unless you explicitly want old rewritten rollout history to be replayed.
 - If this Mac stores Codex rollout files somewhere other than `~/.codex/sessions`, find the actual `rollout-*.jsonl` location and set `--sessions-root` by adapting the LaunchAgent/wrapper.

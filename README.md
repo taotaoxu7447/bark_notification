@@ -4,15 +4,15 @@
 
 ![通知回路副封面](assets/cover-notification-loop.png)
 
-这是一个面向 AI 编程助手的本地任务提醒器。它会在本机持续监听已支持工具的日志或会话文件，当 AI 任务完成、停止、需要人工处理或异常中断时，通过 Bark 推送到你的随身设备。
+这是一个面向 AI 编程助手的本地任务提醒器。它会在本机持续监听已支持工具的日志或会话文件，当 AI 任务完成、停止、需要人工处理或异常中断时，通过 Bark 或 ntfy 推送到你的随身设备。
 
 项目当前优先服务内部同事使用：先让大家在自己的 macOS、Ubuntu、Windows 工作环境里稳定收到提醒；如果某个同事使用的工具还没适配，可以按本文档添加 watcher 后直接提交到主分支。
 
 ## 已支持能力
 
-- **通知通道**：Bark 是主线能力。iPhone / Apple Watch 是已验证路径；Android 手机、手环等设备取决于 Bark 兼容客户端和系统通知同步能力。
+- **通知通道**：Bark 和 ntfy。iPhone / Apple Watch 推荐 Bark；Android 手机和手环通知转发推荐公共 `ntfy.sh`。
 - **已适配工具**：Codex App / Codex CLI、ZCode。
-- **分组和图标**：Codex、ZCode 使用不同 Bark `group` 和 `icon`，手机通知列表里能分开看。
+- **分组和标签**：Bark 使用 `group` 和 `icon` 区分 Codex/ZCode；ntfy 使用 topic 和 tags 区分来源。
 - **三端安装**：macOS LaunchAgent、Ubuntu systemd user service、Windows Task Scheduler。
 - **诊断命令**：`--doctor` 检查配置、日志目录、状态文件、后台服务和隐私设置。
 - **测试命令**：`--test` 发送 Codex 测试通知，`--test-zcode` 发送 ZCode 测试通知。
@@ -27,18 +27,19 @@
 
 1. 在电脑上让 Codex、ZCode 或其他 AI 编程助手跑长任务。
 2. 人离开电脑，或切换去做别的事。
-3. AI 任务完成、卡住或需要确认时，手机、手表或其他 Bark 客户端设备收到提醒。
+3. AI 任务完成、卡住或需要确认时，手机、手表或其他通知客户端设备收到提醒。
 4. 回到对应电脑继续处理。
 
 它不是云端服务，不需要把代码上传到第三方。监听和判断都发生在你自己的电脑上。
 
 ## 随身设备准备
 
-1. 在要接收通知的设备上安装 Bark 或 Bark 兼容客户端。
-2. 打开客户端，允许通知权限。
-3. 复制客户端显示的 Bark 推送地址或 key。
+### iPhone / Apple Watch：Bark
+
+1. 在 iPhone 安装 Bark。
+2. 打开 Bark，允许通知权限。
+3. 复制 Bark 首页显示的推送地址或 key。
 4. 如果使用 Apple Watch，保持 iPhone 和 Apple Watch 的系统通知同步设置正常。Bark 通知会按 iOS / watchOS 的规则转发到手表。
-5. 如果使用 Android 手机、手环或其他穿戴设备，确认对应客户端能接收 Bark API 推送，并确认系统通知能同步到穿戴设备。
 
 配置时可以二选一：
 
@@ -48,7 +49,22 @@ BARK_URL=https://api.day.app/<your-key>
 BARK_KEY=<your-key>
 ```
 
-不要把真实的 Bark URL、key、webhook 地址提交到 GitHub。它们属于个人密钥。
+### Android / 手环：ntfy
+
+1. 在 Android 手机上安装 ntfy 客户端。
+2. 订阅一个长随机 topic，例如 `agent-xutao-9f3a7c2e8b1d`。
+3. 确认 Android 通知权限、锁屏通知和手环通知转发已经打开。
+4. 在电脑配置文件里填写公共 ntfy.sh URL：
+
+```bash
+NTFY_URL=https://ntfy.sh/<long-random-topic>
+NTFY_PRIORITY=default
+NTFY_TAGS=computer,robot
+```
+
+公共 `ntfy.sh` 的 topic 要当成密钥使用。不要用 `codex`、`work`、`ai` 这种短 topic；别人只要知道 topic，就可能订阅或发送消息。
+
+不要把真实的 Bark URL、Bark key、ntfy topic、webhook 地址提交到 GitHub。它们属于个人密钥。
 
 ## 新电脑安装
 
@@ -71,7 +87,7 @@ $EDITOR ~/.codex-watch-notifier/env
 ./codex-watch-notifier.zsh --test-zcode
 ```
 
-第一次执行安装脚本会复制程序和生成配置文件。编辑 `~/.codex-watch-notifier/env` 填入 Bark 配置后，再执行一次安装脚本来重载后台服务。
+第一次执行安装脚本会复制程序和生成配置文件。编辑 `~/.codex-watch-notifier/env` 填入 Bark 或 ntfy 配置后，再执行一次安装脚本来重载后台服务。
 
 常用排查：
 
@@ -150,6 +166,14 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 | `CODEX_BARK_ICON` | Codex 通知图标 URL |
 | `ZCODE_BARK_GROUP` | ZCode 通知分组，默认 `ZCode` |
 | `ZCODE_BARK_ICON` | ZCode 通知图标 URL |
+| `NTFY_URL` | ntfy 推送地址，例如 `https://ntfy.sh/<long-random-topic>` |
+| `NTFY_TOKEN` | ntfy 认证 token；公共 `ntfy.sh` 通常留空 |
+| `NTFY_PRIORITY` | ntfy 优先级，默认 `default` |
+| `NTFY_TAGS` | ntfy 标签，例如 `computer,robot` |
+| `CODEX_NTFY_URL` | Codex 专用 ntfy URL；留空则使用 `NTFY_URL` |
+| `CODEX_NTFY_TAGS` | Codex 专用 ntfy 标签 |
+| `ZCODE_NTFY_URL` | ZCode 专用 ntfy URL；留空则使用 `NTFY_URL` |
+| `ZCODE_NTFY_TAGS` | ZCode 专用 ntfy 标签 |
 | `CODEX_WATCH_POLL_INTERVAL` | 轮询间隔，默认 2 秒 |
 | `ZCODE_WATCH_ENABLED` | 是否启用 ZCode，默认 `1` |
 | `ZCODE_WATCH_LOG_ROOT` | ZCode 日志目录，默认 `~/.zcode/cli/log` |
@@ -173,9 +197,9 @@ NOTIFY_BODY_MAX_CHARS=0
 - ZCode watcher 监听 `~/.zcode/cli/log` 下的 `zcode-*.jsonl`。
 - watcher 会记录每个文件已经处理到的位置，状态存在 `~/.codex-watch-notifier/state.json`。
 - 第一次启动默认只建立基线，不回放旧历史。
-- 检测到完成、停止、等待人工或异常事件后，会组装统一通知，再交给 Bark 发送层。
+- 检测到完成、停止、等待人工或异常事件后，会组装统一通知，再交给 Bark、ntfy 或其他发送层。
 
-如果你要让 AI 帮你维护这个项目，可以直接把本节和下一节给它看。核心约束是：不要提交个人密钥，不要默认回放旧历史，不要绕过现有 Bark 发送层。
+如果你要让 AI 帮你维护这个项目，可以直接把本节和下一节给它看。核心约束是：不要提交个人密钥，不要默认回放旧历史，不要绕过现有 Bark / ntfy 发送层。
 
 ## 添加新的 AI 工具支持
 
@@ -198,7 +222,7 @@ NOTIFY_BODY_MAX_CHARS=0
 优先只改这些位置：
 
 - `codex_watch_notifier.py`：新增 watcher、解析函数、通知事件构造。
-- `env.example`：新增该工具的开关、日志路径、Bark 分组和图标配置。
+- `env.example`：新增该工具的开关、日志路径、Bark 分组、ntfy 标签和图标配置。
 - `README.md`：补充用户安装和测试说明。
 - `assets/`：新增该工具的图标，使用 raw GitHub URL 填入 env。
 - `build_packages.zsh`：如果新增文件需要进入发布包，把它加入 `COMMON`。
@@ -209,7 +233,7 @@ NOTIFY_BODY_MAX_CHARS=0
 2. 写一个只负责发现文件的函数，不在里面解析业务事件。
 3. 写一个解析单行或单条记录的函数，把工具私有格式转换成统一事件。
 4. 复用现有 state 机制，只处理文件新增内容。
-5. 为通知设置独立 `bark_group` 和 `bark_icon`。
+5. 为通知设置独立 `bark_group`、`bark_icon`、`ntfy_tags`；必要时设置独立 `ntfy_url`。
 6. 给 CLI 增加测试参数，例如 `--test-claude`。
 7. 扩展 `--doctor`，让它能检查新工具的日志目录和开关状态。
 8. 更新 README，让同事知道如何启用、测试和关闭。
@@ -218,7 +242,7 @@ NOTIFY_BODY_MAX_CHARS=0
 
 - 首次运行不推送旧历史。
 - 只推送明确的完成、失败、等待人工或中断事件。
-- 不把 API key、Bark key、公司内部 token 写进仓库。
+- 不把 API key、Bark key、ntfy topic、公司内部 token 写进仓库。
 - 通知正文必须受 `NOTIFY_INCLUDE_WORKSPACE`、`NOTIFY_INCLUDE_MESSAGE`、`NOTIFY_BODY_MAX_CHARS` 控制。
 - 新工具默认不要破坏 Codex 和 ZCode 已有行为。
 - Windows、Ubuntu、macOS 至少要能优雅地跳过不存在的日志目录。
@@ -241,16 +265,16 @@ python3 codex_watch_notifier.py --test-zcode
 
 - 小步提交，一次只适配一个工具或修一个明确问题。
 - 提交信息说明用户可见变化，例如 `Add Claude Code CLI watcher`。
-- 不提交 `~/.codex-watch-notifier/env`、个人 token、真实 Bark URL、公司内部 webhook。
+- 不提交 `~/.codex-watch-notifier/env`、个人 token、真实 Bark URL、真实 ntfy topic、公司内部 webhook。
 - 修改三端安装脚本时，至少说明自己在哪个系统上验证过。
 - 如果不确定日志格式是否稳定，在 README 里把该 watcher 标成实验支持。
 
 适合 AI 继续开发的任务描述模板：
 
 ```text
-请在这个仓库里为 <工具名> 添加 Bark 任务提醒支持。
+请在这个仓库里为 <工具名> 添加 Bark / ntfy 任务提醒支持。
 已知日志位置是 <路径>，完成事件长这样：<样例>。
-要求复用 codex_watch_notifier.py 的状态和 Bark 发送层，不提交密钥。
+要求复用 codex_watch_notifier.py 的状态和 Bark / ntfy 发送层，不提交密钥。
 请更新 env.example、README.md，并运行 py_compile 和 build_packages.zsh。
 ```
 
@@ -294,7 +318,8 @@ Windows：
 
 ## 当前边界
 
-- Bark 是唯一推荐的稳定通知主线。
+- iPhone / Apple Watch 推荐 Bark；Android / 手环通知转发推荐公共 `ntfy.sh`。
+- 公共 `ntfy.sh` 只适合个人或小规模内部试用，topic 必须长随机；公司大规模推广时建议再评估自建 ntfy。
 - 飞书、个人微信、企业微信等还没有作为正式主线启用。
 - Claude Code CLI、Trae、Cursor、VS Code Claude Code 插件等还需要同事提供本机日志样例后再适配。
 - 这个工具只做本机监听和推送，不负责启动、控制或接管 AI 编程助手。

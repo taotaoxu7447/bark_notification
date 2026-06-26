@@ -79,7 +79,7 @@ python3 codex_watch_notifier.py --test
 Notes:
 
 - If the machine must run without an active desktop login, enable lingering with `loginctl enable-linger "$USER"`.
-- macOS local notifications are not available; Bark remains the primary notification channel.
+- macOS local notifications are not available; Bark and ntfy remain the primary cross-device channels.
 
 ## Windows Package
 
@@ -112,7 +112,7 @@ py .\codex_watch_notifier.py --test
 Notes:
 
 - Paths in `env` may use Windows paths, for example `C:\Users\<name>\.codex\sessions`.
-- macOS local notifications are not available; Bark remains the primary notification channel.
+- macOS local notifications are not available; Bark and ntfy remain the primary cross-device channels.
 
 ## Internal Release Checklist
 
@@ -120,7 +120,7 @@ Before each internal release:
 
 1. Run `python3 -m py_compile codex_watch_notifier.py`.
 2. Run `--doctor` on macOS.
-3. Smoke test Bark with `--test`.
+3. Smoke test configured notification channels with `--test`.
 4. Confirm first-run baseline does not replay old Codex or ZCode history.
 5. Build all three package files from the same git commit.
 6. Tag the commit, for example `v0.1.0-internal`.
