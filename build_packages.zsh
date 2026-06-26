@@ -11,8 +11,10 @@ mkdir -p "$DIST"
 COMMON=(
   codex_watch_notifier.py
   env.example
+  README.md
   README_HANDOFF.md
   PACKAGING.md
+  assets/cover-agent-watch.png
   assets/codex-icon-large-v1.png
   assets/zcode-icon-v1.png
 )
