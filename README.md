@@ -2,6 +2,8 @@
 
 ![智能体回声封面](assets/cover-agent-watch.png)
 
+![通知回路副封面](assets/cover-notification-loop.png)
+
 这是一个面向 AI 编程助手的本地任务提醒器。它会在本机持续监听已支持工具的日志或会话文件，当 AI 任务完成、停止、需要人工处理或异常中断时，通过 Bark 推送到手机和手表。
 
 项目当前优先服务内部同事使用：先让大家在自己的 macOS、Ubuntu、Windows 工作环境里稳定收到提醒；如果某个同事使用的工具还没适配，可以按本文档添加 watcher 后直接提交到主分支。
