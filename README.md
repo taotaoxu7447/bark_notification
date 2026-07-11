@@ -186,6 +186,7 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 | `ZCODE_NTFY_URL` | ZCode 专用 ntfy URL；留空则使用 `NTFY_URL` |
 | `ZCODE_NTFY_TAGS` | ZCode 专用 ntfy 标签 |
 | `CODEX_WATCH_POLL_INTERVAL` | 轮询间隔，默认 2 秒 |
+| `CODEX_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Codex 子智能体事件，默认 `0`，只提醒主会话 |
 | `ZCODE_WATCH_ENABLED` | 是否启用 ZCode，默认 `1` |
 | `ZCODE_WATCH_LOG_ROOT` | ZCode 日志目录，默认 `~/.zcode/cli/log` |
 | `NOTIFY_INCLUDE_WORKSPACE` | 是否在通知里显示工作目录，默认 `1` |
@@ -208,6 +209,7 @@ NOTIFY_BODY_MAX_CHARS=0
 - ZCode watcher 监听 `~/.zcode/cli/log` 下的 `zcode-*.jsonl`。
 - watcher 会记录每个文件已经处理到的位置，状态存在 `~/.codex-watch-notifier/state.json`。
 - 第一次启动默认只建立基线，不回放旧历史。
+- Codex 5.6 创建的子智能体 rollout 默认静默，只提醒主会话最终完成、等待人工或中止；排障时可设置 `CODEX_WATCH_NOTIFY_SUBAGENTS=1` 恢复全部提醒。
 - 检测到完成、停止、等待人工或异常事件后，会组装统一通知，再交给 Bark、ntfy 或其他发送层。
 
 如果你要让 AI 帮你维护这个项目，可以直接把本节和下一节给它看。核心约束是：不要提交个人密钥，不要默认回放旧历史，不要绕过现有 Bark / ntfy 发送层。

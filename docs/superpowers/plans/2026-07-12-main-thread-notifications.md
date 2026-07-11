@@ -29,7 +29,7 @@
 - Consumes: rollout `session_meta` dictionaries and existing `env_flag(name: str, default: bool) -> bool`.
 - Produces: `notify_subagents_enabled() -> bool`, `is_subagent_session(meta: dict[str, Any]) -> bool`, and `trigger_from_record(..., meta: dict[str, Any] | None = None) -> dict[str, Any] | None`.
 
-- [ ] **Step 1: Write failing behavior tests**
+- [x] **Step 1: Write failing behavior tests**
 
 Create standard-library tests that write temporary rollout files and assert:
 
@@ -71,13 +71,13 @@ def test_first_session_meta_defines_rollout_identity(self):
     self.assertIsNone(notifier.trigger_from_record(path, 1, self.task_complete(), set()))
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `python3 -m unittest -v tests.test_codex_watch_notifier`
 
 Expected: the main and legacy tests pass under existing behavior, while the default subagent filtering tests fail because they receive notification dictionaries.
 
-- [ ] **Step 3: Implement minimal classification and filtering**
+- [x] **Step 3: Implement minimal classification and filtering**
 
 Add:
 
@@ -92,17 +92,17 @@ def is_subagent_session(meta: dict[str, Any]) -> bool:
 
 Include `parent_thread_id` in `load_session_meta()`. Update `trigger_from_record()` to accept optional preloaded metadata and return `None` when `is_subagent_session(meta)` is true and the opt-in is false.
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [x] **Step 4: Run the focused tests and verify GREEN**
 
 Run: `python3 -m unittest -v tests.test_codex_watch_notifier`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Cache metadata per file and log suppression once**
+- [x] **Step 5: Cache metadata per file and log suppression once**
 
 In `process_file()`, load metadata once, store a `subagent_suppression_logged` flag in that file's state record, emit one concise log line when suppression starts, and pass the metadata to `trigger_from_record()`.
 
-- [ ] **Step 6: Run tests and syntax validation**
+- [x] **Step 6: Run tests and syntax validation**
 
 Run: `python3 -m unittest discover -s tests -v`
 
@@ -110,7 +110,7 @@ Run: `python3 -m py_compile codex_watch_notifier.py tests/test_codex_watch_notif
 
 Expected: all tests pass and both files compile without output.
 
-- [ ] **Step 7: Commit behavior and tests**
+- [x] **Step 7: Commit behavior and tests**
 
 ```bash
 git add codex_watch_notifier.py tests/test_codex_watch_notifier.py
@@ -131,7 +131,7 @@ git commit -m "Silence Codex subagent notifications"
 - Consumes: `notify_subagents_enabled() -> bool` from Task 1.
 - Produces: documented `CODEX_WATCH_NOTIFY_SUBAGENTS` configuration and visible `--doctor` policy output.
 
-- [ ] **Step 1: Add a failing doctor-output test**
+- [x] **Step 1: Add a failing doctor-output test**
 
 Capture `doctor()` output with the opt-in unset and assert it contains:
 
@@ -143,7 +143,7 @@ Run: `python3 -m unittest -v tests.test_codex_watch_notifier.DoctorTests`
 
 Expected: FAIL because the policy line is absent.
 
-- [ ] **Step 2: Add diagnostic output**
+- [x] **Step 2: Add diagnostic output**
 
 Print exactly one policy line:
 
@@ -156,15 +156,15 @@ Run: `python3 -m unittest -v tests.test_codex_watch_notifier.DoctorTests`
 
 Expected: PASS.
 
-- [ ] **Step 3: Document the default**
+- [x] **Step 3: Document the default**
 
 Add `CODEX_WATCH_NOTIFY_SUBAGENTS=0` to `env.example`, add it to the README configuration table, and explain in both README files that Codex 5.6 child-agent rollouts are ignored by default while main-session completion, attention, and abort events remain enabled.
 
-- [ ] **Step 4: Keep packaged README images complete**
+- [x] **Step 4: Keep packaged README images complete**
 
 Add `assets/cover-notification-loop.png` to `build_packages.zsh` so the packaged README's second cover reference resolves.
 
-- [ ] **Step 5: Run full verification**
+- [x] **Step 5: Run full verification**
 
 Run:
 
@@ -178,7 +178,7 @@ python3 codex_watch_notifier.py --doctor
 
 Expected: tests pass, syntax checks are silent, dry-run prints one test notification without network delivery, doctor shows `main sessions only`, and all three platform archives build.
 
-- [ ] **Step 6: Install and restart the local LaunchAgent**
+- [x] **Step 6: Install and restart the local LaunchAgent**
 
 Run: `./install_launch_agent.zsh`
 
@@ -186,11 +186,11 @@ Then compare the repository and installed runtime hashes and inspect `launchctl 
 
 Expected: hashes match and LaunchAgent state is `running`.
 
-- [ ] **Step 7: Verify against real rollout metadata without sending**
+- [x] **Step 7: Verify against real rollout metadata without sending**
 
 Replay one known main-session rollout and one known subagent rollout with an isolated state and `--dry-run`, or invoke the parser directly through the tests. Expected: the main event produces output and the subagent event produces zero notification output.
 
-- [ ] **Step 8: Mark plan checkboxes complete and commit**
+- [x] **Step 8: Mark plan checkboxes complete and commit**
 
 ```bash
 git add env.example README.md README_HANDOFF.md codex_watch_notifier.py build_packages.zsh docs/superpowers/plans/2026-07-12-main-thread-notifications.md
