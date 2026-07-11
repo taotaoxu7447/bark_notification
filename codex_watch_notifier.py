@@ -94,6 +94,10 @@ def include_message_excerpt_in_notifications() -> bool:
     return env_flag("NOTIFY_INCLUDE_MESSAGE", True)
 
 
+def notify_subagents_enabled() -> bool:
+    return env_flag("CODEX_WATCH_NOTIFY_SUBAGENTS", False)
+
+
 def notification_body_max_chars() -> int:
     return max(env_int("NOTIFY_BODY_MAX_CHARS", 1100), 0)
 
@@ -444,10 +448,22 @@ def load_session_meta(path: Path) -> dict[str, Any]:
                         "source": payload.get("source") or "",
                         "originator": payload.get("originator") or "",
                         "thread_source": payload.get("thread_source") or "",
+                        "parent_thread_id": payload.get("parent_thread_id") or "",
                     }
     except OSError:
         pass
-    return {"thread_id": path.stem, "cwd": "", "source": "", "originator": "", "thread_source": ""}
+    return {
+        "thread_id": path.stem,
+        "cwd": "",
+        "source": "",
+        "originator": "",
+        "thread_source": "",
+        "parent_thread_id": "",
+    }
+
+
+def is_subagent_session(meta: dict[str, Any]) -> bool:
+    return str(meta.get("thread_source") or "").strip().lower() == "subagent"
 
 
 def load_thread_title(thread_id: str) -> str:
@@ -520,7 +536,13 @@ def classify_task_complete(message: str) -> tuple[str, str]:
     return "已停下", "Codex 已结束本轮；当前版本没有写出更细的官方状态"
 
 
-def trigger_from_record(path: Path, offset: int, record: dict[str, Any], extra_types: set[str]) -> dict[str, Any] | None:
+def trigger_from_record(
+    path: Path,
+    offset: int,
+    record: dict[str, Any],
+    extra_types: set[str],
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if record.get("type") != "event_msg":
         return None
 
@@ -529,7 +551,9 @@ def trigger_from_record(path: Path, offset: int, record: dict[str, Any], extra_t
     if event_type not in {"task_complete", "turn_aborted"} and event_type not in extra_types:
         return None
 
-    meta = load_session_meta(path)
+    meta = meta or load_session_meta(path)
+    if is_subagent_session(meta) and not notify_subagents_enabled():
+        return None
     timestamp = record.get("timestamp")
     message = payload.get("last_agent_message") or payload.get("reason") or payload.get("message") or ""
 
@@ -679,6 +703,11 @@ def process_file(
     previous_size = int(rec.get("size", 0) or 0)
     previous_head_hash = str(rec.get("head_hash") or "")
     current_head_hash = file_head_hash(path)
+    meta = load_session_meta(path)
+    subagent_suppressed = is_subagent_session(meta) and not notify_subagents_enabled()
+    if subagent_suppressed and not rec.get("subagent_suppression_logged"):
+        rec["subagent_suppression_logged"] = True
+        log(f"subagent notifications suppressed for {meta.get('thread_id') or path.stem} from {path.name}")
     if previous_head_hash and current_head_hash and current_head_hash != previous_head_hash and offset > 0:
         rec["offset"] = size
         rec["size"] = size
@@ -711,7 +740,7 @@ def process_file(
                     rec["offset"] = handle.tell()
                     continue
 
-                event = trigger_from_record(path, line_offset, record, extra_types)
+                event = trigger_from_record(path, line_offset, record, extra_types, meta)
                 rec["offset"] = handle.tell()
                 if not event:
                     continue
