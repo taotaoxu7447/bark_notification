@@ -1,8 +1,11 @@
+import contextlib
+import io
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import codex_watch_notifier as notifier
@@ -150,6 +153,35 @@ class CodexSessionFilteringTests(unittest.TestCase):
         self.assertEqual(0, recording_notifier.send_count)
         self.assertEqual(1, len(suppression_messages))
         self.assertEqual(path.stat().st_size, state["files"][str(path)]["offset"])
+
+
+class DoctorTests(unittest.TestCase):
+    def test_doctor_reports_main_session_only_policy_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = SimpleNamespace(
+                state=str(root / "state.json"),
+                log=str(root / "notifier.log"),
+                sessions_root=[str(root / "sessions")],
+                include_archived=False,
+                disable_zcode=True,
+                zcode_log_root=str(root / "zcode"),
+            )
+            output = io.StringIO()
+            environment = {
+                "CODEX_WATCH_ENV": str(root / "missing.env"),
+                "CODEX_WATCH_MACOS_NOTIFICATION": "0",
+                "CODEX_WATCH_NOTIFY_SUBAGENTS": "0",
+            }
+
+            with mock.patch.dict(os.environ, environment), mock.patch.object(
+                notifier.platform, "system", return_value="Linux"
+            ):
+                with contextlib.redirect_stdout(output):
+                    result = notifier.doctor(args, notifier.Logger(None))
+
+        self.assertEqual(0, result)
+        self.assertIn("Codex subagent notifications: main sessions only", output.getvalue())
 
 
 if __name__ == "__main__":

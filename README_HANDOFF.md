@@ -43,6 +43,7 @@ On first background start, existing rollout files are baselined at EOF so old Co
 
 To avoid false pushes from Codex account/session tools such as Cockpit Tools, the monitor also:
 
+- ignores rollout files whose first `session_meta.payload.thread_source` is `subagent` unless `CODEX_WATCH_NOTIFY_SUBAGENTS=1`; unknown or legacy metadata continues to notify;
 - skips Codex completion events older than `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` seconds, default `3600`;
 - uses semantic de-duplication based on thread id, event type, and turn id instead of JSONL byte offset;
 - detects known rollout files whose header changes, then baselines them at EOF instead of replaying history.

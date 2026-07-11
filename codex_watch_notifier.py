@@ -986,6 +986,8 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     if str(ntfy_detail).startswith("https://ntfy.sh/") and len(str(ntfy_detail).rstrip("/").rsplit("/", 1)[-1]) < 12:
         ntfy_detail = f"{ntfy_detail} (public topic should be long and random)"
     print_check("ntfy configured", ntfy_configured, str(ntfy_detail))
+    subagent_policy = "enabled" if notify_subagents_enabled() else "main sessions only"
+    print(f"Codex subagent notifications: {subagent_policy}")
     print_check("Codex sessions root", any(root.exists() for root in roots), ", ".join(str(root) for root in roots))
     print_check("Codex rollout files", count_paths(rollout_files(roots)) > 0, f"{count_paths(rollout_files(roots))} file(s)")
     print_check("ZCode watch enabled", zcode_watch_enabled(args), f"root={zcode_root}")
