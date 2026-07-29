@@ -29,6 +29,7 @@ For coworkers, publish three release artifacts and ask them to download the one 
 - `env.example`: template config. Copy it to `~/.codex-watch-notifier/env` and fill in a private Bark URL/key, ntfy topic URL, or webhook.
 - Optional Bark icon/group: set `CODEX_BARK_ICON` and `CODEX_BARK_GROUP`. This repo includes `assets/codex-icon-large-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png`.
 - ZCode Bark settings: set `ZCODE_BARK_ICON` and `ZCODE_BARK_GROUP`. This repo includes `assets/zcode-icon-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/zcode-icon-v1.png`. ZCode notifications watch `~/.zcode/cli/log/zcode-*.jsonl`.
+- Kimi Code and Grok Build use `assets/kimi-icon-v1.png` and `assets/grok-icon-v1.png` as their default Bark icons. Override them with `KIMI_BARK_ICON` or `GROK_BARK_ICON`.
 - Kimi Code watches `~/.kimi-code/sessions/**/agents/main/wire.jsonl`. Its child agents are silent unless `KIMI_WATCH_NOTIFY_SUBAGENTS=1`.
 - Grok Build watches `~/.grok/sessions/**/events.jsonl`. Sessions with `parent_session_id` are silent unless `GROK_WATCH_NOTIFY_SUBAGENTS=1`.
 - ntfy settings: set `NTFY_URL=https://ntfy.sh/<long-random-topic>`. Optional per-tool overrides are `CODEX_NTFY_URL`, `ZCODE_NTFY_URL`, `KIMI_NTFY_URL`, and `GROK_NTFY_URL`. Public ntfy.sh topics are shared secrets; never use short or guessable topic names.

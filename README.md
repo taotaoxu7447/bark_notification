@@ -185,9 +185,9 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 | `ZCODE_BARK_GROUP` | ZCode 通知分组，默认 `ZCode` |
 | `ZCODE_BARK_ICON` | ZCode 通知图标 URL |
 | `KIMI_BARK_GROUP` | Kimi Code 通知分组，默认 `Kimi Code` |
-| `KIMI_BARK_ICON` | Kimi Code 通知图标 URL；默认留空，使用 Bark 默认图标 |
+| `KIMI_BARK_ICON` | Kimi Code 通知图标 URL；默认使用仓库内的 Kimi 官方 App 图案适配版 |
 | `GROK_BARK_GROUP` | Grok Build 通知分组，默认 `Grok Build` |
-| `GROK_BARK_ICON` | Grok Build 通知图标 URL；默认留空，使用 Bark 默认图标 |
+| `GROK_BARK_ICON` | Grok Build 通知图标 URL；默认使用仓库内的 Grok 官方 App 图案适配版 |
 | `NTFY_URL` | ntfy 推送地址，例如 `https://ntfy.sh/<long-random-topic>` |
 | `NTFY_TOKEN` | ntfy 认证 token；公共 `ntfy.sh` 通常留空 |
 | `NTFY_PRIORITY` | ntfy 优先级，默认 `default` |

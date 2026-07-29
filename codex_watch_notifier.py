@@ -24,6 +24,12 @@ DEFAULT_SESSION_INDEX = "~/.codex/session_index.jsonl"
 DEFAULT_ZCODE_LOG_ROOT = "~/.zcode/cli/log"
 DEFAULT_KIMI_SESSIONS_ROOT = "~/.kimi-code/sessions"
 DEFAULT_GROK_SESSIONS_ROOT = "~/.grok/sessions"
+DEFAULT_KIMI_BARK_ICON = (
+    "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/kimi-icon-v1.png"
+)
+DEFAULT_GROK_BARK_ICON = (
+    "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/grok-icon-v1.png"
+)
 DEFAULT_MAX_EVENT_AGE_SECONDS = 3600
 MAX_SENT_KEYS = 3000
 
@@ -821,7 +827,7 @@ def trigger_from_kimi_record(path: Path, offset: int, record: dict[str, Any]) ->
         "message": message,
         "stable_id": hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24],
         "bark_group": os.getenv("KIMI_BARK_GROUP", "Kimi Code"),
-        "bark_icon": os.getenv("KIMI_BARK_ICON", ""),
+        "bark_icon": os.getenv("KIMI_BARK_ICON", DEFAULT_KIMI_BARK_ICON),
         "ntfy_url": os.getenv("KIMI_NTFY_URL", ""),
         "ntfy_tags": os.getenv("KIMI_NTFY_TAGS", "robot,computer"),
     }
@@ -924,7 +930,7 @@ def trigger_from_grok_record(path: Path, offset: int, record: dict[str, Any]) ->
         "message": message,
         "stable_id": hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24],
         "bark_group": os.getenv("GROK_BARK_GROUP", "Grok Build"),
-        "bark_icon": os.getenv("GROK_BARK_ICON", ""),
+        "bark_icon": os.getenv("GROK_BARK_ICON", DEFAULT_GROK_BARK_ICON),
         "ntfy_url": os.getenv("GROK_NTFY_URL", ""),
         "ntfy_tags": os.getenv("GROK_NTFY_TAGS", "robot,computer"),
     }
@@ -1325,6 +1331,10 @@ def send_external_test_notification(
 ) -> int:
     notifier = Notifier(args.dry_run, log)
     env_prefix = event_prefix.upper()
+    default_icon = {
+        "KIMI": DEFAULT_KIMI_BARK_ICON,
+        "GROK": DEFAULT_GROK_BARK_ICON,
+    }.get(env_prefix, "")
     event = {
         "event_type": f"{event_prefix}_test",
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1333,7 +1343,7 @@ def send_external_test_notification(
         "cwd": str(Path.cwd()),
         "message": f"{tool_name} Watch Notifier test",
         "bark_group": os.getenv(f"{env_prefix}_BARK_GROUP", tool_name),
-        "bark_icon": os.getenv(f"{env_prefix}_BARK_ICON", ""),
+        "bark_icon": os.getenv(f"{env_prefix}_BARK_ICON", default_icon),
         "ntfy_url": os.getenv(f"{env_prefix}_NTFY_URL", ""),
         "ntfy_tags": os.getenv(f"{env_prefix}_NTFY_TAGS", "robot,computer"),
     }

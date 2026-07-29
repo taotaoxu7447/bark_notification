@@ -18,6 +18,8 @@ COMMON=(
   assets/cover-notification-loop.png
   assets/codex-icon-large-v1.png
   assets/zcode-icon-v1.png
+  assets/kimi-icon-v1.png
+  assets/grok-icon-v1.png
 )
 
 make_pkg() {

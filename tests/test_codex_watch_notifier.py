@@ -241,6 +241,7 @@ class KimiWatcherTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual("kimi_turn_completed", event["event_type"])
         self.assertEqual("Kimi Code", event["bark_group"])
+        self.assertEqual(notifier.DEFAULT_KIMI_BARK_ICON, event["bark_icon"])
         self.assertEqual("Kimi 测试任务", event["session_title"])
         self.assertIn("Kimi 任务已完成", event["message"])
 
@@ -355,6 +356,7 @@ class GrokWatcherTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual("grok_turn_completed", event["event_type"])
         self.assertEqual("Grok Build", event["bark_group"])
+        self.assertEqual(notifier.DEFAULT_GROK_BARK_ICON, event["bark_icon"])
         self.assertEqual("Grok 测试任务", event["session_title"])
         self.assertIn("Grok 任务已完成", event["message"])
 
