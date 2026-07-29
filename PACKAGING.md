@@ -121,6 +121,6 @@ Before each internal release:
 1. Run `python3 -m py_compile codex_watch_notifier.py`.
 2. Run `--doctor` on macOS.
 3. Smoke test configured notification channels with `--test`.
-4. Confirm first-run baseline does not replay old Codex or ZCode history.
+4. Confirm first-run baseline does not replay old Codex, ZCode, Kimi Code, or Grok Build history.
 5. Build all three package files from the same git commit.
 6. Tag the commit, for example `v0.1.0-internal`.

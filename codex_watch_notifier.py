@@ -22,6 +22,8 @@ DEFAULT_SESSIONS_ROOT = "~/.codex/sessions"
 DEFAULT_ARCHIVED_ROOT = "~/.codex/archived_sessions"
 DEFAULT_SESSION_INDEX = "~/.codex/session_index.jsonl"
 DEFAULT_ZCODE_LOG_ROOT = "~/.zcode/cli/log"
+DEFAULT_KIMI_SESSIONS_ROOT = "~/.kimi-code/sessions"
+DEFAULT_GROK_SESSIONS_ROOT = "~/.grok/sessions"
 DEFAULT_MAX_EVENT_AGE_SECONDS = 3600
 MAX_SENT_KEYS = 3000
 
@@ -191,7 +193,10 @@ class Notifier:
         channels: list[str] = []
         if os.getenv("BARK_URL") or os.getenv("BARK_KEY"):
             channels.append("bark")
-        if os.getenv("NTFY_URL") or os.getenv("CODEX_NTFY_URL") or os.getenv("ZCODE_NTFY_URL"):
+        if any(
+            os.getenv(name)
+            for name in ("NTFY_URL", "CODEX_NTFY_URL", "ZCODE_NTFY_URL", "KIMI_NTFY_URL", "GROK_NTFY_URL")
+        ):
             channels.append("ntfy")
         if os.getenv("CODEX_NOTIFY_WEBHOOK_URL"):
             channels.append("generic_webhook")
@@ -298,19 +303,19 @@ class Notifier:
             "group": group,
             "level": os.getenv("BARK_LEVEL", "timeSensitive"),
         }
-        icon = (
-            str(event.get("bark_icon") or "").strip()
-            or os.getenv("CODEX_BARK_ICON")
-            or os.getenv("BARK_ICON")
-            or ""
-        ).strip()
+        if "bark_icon" in event:
+            icon = str(event.get("bark_icon") or "").strip()
+        else:
+            icon = (os.getenv("CODEX_BARK_ICON") or os.getenv("BARK_ICON") or "").strip()
         if icon:
             payload["icon"] = icon
         data = urllib.parse.urlencode(payload).encode("utf-8")
         return self._http_post(url, data, "application/x-www-form-urlencoded")
 
     def _send_ntfy(self, title: str, body: str, event: dict[str, Any]) -> bool:
-        prefix = "ZCODE" if str(event.get("event_type") or "").startswith("zcode") else "CODEX"
+        prefix = str(event.get("event_type") or "").partition("_")[0].upper()
+        if prefix not in {"CODEX", "ZCODE", "KIMI", "GROK"}:
+            prefix = "CODEX"
         url = (
             str(event.get("ntfy_url") or "").strip()
             or os.getenv(f"{prefix}_NTFY_URL", "").strip()
@@ -429,6 +434,33 @@ def zcode_log_files(root: Path) -> list[Path]:
     return sorted(root.glob("zcode-*.jsonl"), key=lambda path: str(path))
 
 
+def kimi_wire_files(root: Path, include_subagents: bool | None = None) -> list[Path]:
+    if not root.exists():
+        return []
+    if root.is_file() and root.name == "wire.jsonl":
+        return [root]
+    if include_subagents is None:
+        include_subagents = env_flag("KIMI_WATCH_NOTIFY_SUBAGENTS", False)
+    pattern = "**/agents/*/wire.jsonl" if include_subagents else "**/agents/main/wire.jsonl"
+    return sorted(root.glob(pattern), key=lambda path: str(path))
+
+
+def grok_event_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    if root.is_file() and root.name == "events.jsonl":
+        return [root]
+    return sorted(root.glob("**/events.jsonl"), key=lambda path: str(path))
+
+
+def load_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def load_session_meta(path: Path) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -486,7 +518,7 @@ def load_thread_title(thread_id: str) -> str:
     return title.strip()
 
 
-def classify_task_complete(message: str) -> tuple[str, str]:
+def classify_task_complete(message: str, agent_name: str = "Codex") -> tuple[str, str]:
     text = compact(message, 1600)
     lowered = text.lower()
 
@@ -533,7 +565,7 @@ def classify_task_complete(message: str) -> tuple[str, str]:
         return "需要处理", "根据最后回复判断，可能需要你确认、接手或处理异常"
     if any(marker in lowered for marker in completion_markers):
         return "完成", "根据最后回复判断，任务大概率已完成"
-    return "已停下", "Codex 已结束本轮；当前版本没有写出更细的官方状态"
+    return "已停下", f"{agent_name} 已结束本轮；当前版本没有写出更细的官方状态"
 
 
 def trigger_from_record(
@@ -679,6 +711,234 @@ def trigger_from_zcode_record(path: Path, offset: int, record: dict[str, Any]) -
         body_parts.append(f"耗时: {duration}")
 
     event["notification_title"] = f"ZCode 已完成: {compact(display_name, 42)}"
+    event["notification_body"] = "\n".join(body_parts)
+    return event
+
+
+def load_kimi_session_meta(path: Path) -> dict[str, Any]:
+    try:
+        session_dir = path.parents[2]
+        agent_id = path.parent.name
+    except IndexError:
+        return {}
+
+    state = load_json_object(session_dir / "state.json")
+    agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    agent = agents.get(agent_id) if isinstance(agents.get(agent_id), dict) else {}
+    session_id = session_dir.name.removeprefix("session_")
+    parent_agent_id = str(agent.get("parentAgentId") or "")
+    agent_type = str(agent.get("type") or "")
+    return {
+        "session_id": str(state.get("id") or session_id),
+        "session_title": str(state.get("title") or ""),
+        "cwd": str(state.get("workDir") or ""),
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "parent_agent_id": parent_agent_id,
+        "is_subagent": agent_id != "main" or (agent_type and agent_type != "main") or bool(parent_agent_id),
+    }
+
+
+def load_kimi_turn_message(path: Path, end_offset: int, turn_id: str, step: Any) -> str:
+    parts_by_step: dict[str, list[str]] = {}
+    try:
+        with path.open("rb") as handle:
+            while handle.tell() < end_offset:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line or line_start >= end_offset:
+                    break
+                try:
+                    record = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                event = record.get("event") if record.get("type") == "context.append_loop_event" else None
+                if not isinstance(event, dict) or event.get("type") != "content.part":
+                    continue
+                if str(event.get("turnId") or "") != turn_id:
+                    continue
+                part = event.get("part")
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                text = str(part.get("text") or "")
+                if text:
+                    parts_by_step.setdefault(str(event.get("step")), []).append(text)
+    except OSError:
+        return ""
+
+    requested_step = str(step)
+    if requested_step in parts_by_step:
+        return "".join(parts_by_step[requested_step]).strip()
+    if not parts_by_step:
+        return ""
+    latest_step = list(parts_by_step)[-1]
+    return "".join(parts_by_step[latest_step]).strip()
+
+
+def trigger_from_kimi_record(path: Path, offset: int, record: dict[str, Any]) -> dict[str, Any] | None:
+    if record.get("type") != "context.append_loop_event":
+        return None
+    loop_event = record.get("event")
+    if not isinstance(loop_event, dict) or loop_event.get("type") != "step.end":
+        return None
+    if loop_event.get("finishReason") != "end_turn":
+        return None
+
+    meta = load_kimi_session_meta(path)
+    if meta.get("is_subagent") and not env_flag("KIMI_WATCH_NOTIFY_SUBAGENTS", False):
+        return None
+
+    turn_id = str(loop_event.get("turnId") or "")
+    message = load_kimi_turn_message(path, offset, turn_id, loop_event.get("step"))
+    status, status_detail = classify_task_complete(message, "Kimi Code")
+    if status == "完成":
+        title = "Kimi Code 已完成"
+    elif status == "需要处理":
+        title = "Kimi Code 需要处理"
+    else:
+        title = "Kimi Code 已停下"
+
+    session_id = str(meta.get("session_id") or path.parent.name)
+    cwd = str(meta.get("cwd") or "(unknown workspace)")
+    session_title = str(meta.get("session_title") or "")
+    display_name = session_title or (Path(cwd).name if cwd != "(unknown workspace)" else session_id[:12])
+    timestamp = record.get("time") or loop_event.get("time")
+    local_time = utc_to_local(str(timestamp) if timestamp else None)
+    stable_source = f"kimi:{session_id}:{meta.get('agent_id')}:{turn_id}:{loop_event.get('step')}"
+    event = {
+        "event_type": "kimi_turn_completed",
+        "timestamp": timestamp,
+        "local_time": local_time,
+        "session_id": session_id,
+        "session_title": session_title,
+        "agent_id": meta.get("agent_id"),
+        "turn_id": turn_id,
+        "status": status,
+        "status_detail": status_detail,
+        "cwd": cwd,
+        "log_path": str(path),
+        "offset": offset,
+        "message": message,
+        "stable_id": hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24],
+        "bark_group": os.getenv("KIMI_BARK_GROUP", "Kimi Code"),
+        "bark_icon": os.getenv("KIMI_BARK_ICON", ""),
+        "ntfy_url": os.getenv("KIMI_NTFY_URL", ""),
+        "ntfy_tags": os.getenv("KIMI_NTFY_TAGS", "robot,computer"),
+    }
+    body_parts = [
+        f"状态: {status}",
+        f"判断: {status_detail}",
+        f"会话: {display_name}",
+        f"时间: {local_time}",
+    ]
+    if include_workspace_in_notifications():
+        body_parts.append(f"目录: {cwd}")
+    if message and include_message_excerpt_in_notifications() and notification_body_max_chars() > 0:
+        body_parts.extend(["", compact(message, notification_body_max_chars())])
+    event["notification_title"] = f"{title}: {compact(display_name, 42)}"
+    event["notification_body"] = "\n".join(body_parts)
+    return event
+
+
+def load_grok_session_meta(path: Path) -> dict[str, Any]:
+    summary = load_json_object(path.parent / "summary.json")
+    info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
+    return {
+        "session_id": str(info.get("id") or path.parent.name),
+        "session_title": str(summary.get("generated_title") or summary.get("session_summary") or ""),
+        "cwd": str(info.get("cwd") or ""),
+        "parent_session_id": str(summary.get("parent_session_id") or info.get("parent_session_id") or ""),
+    }
+
+
+def load_grok_last_assistant_message(path: Path) -> str:
+    history_path = path.parent / "chat_history.jsonl"
+    message = ""
+    try:
+        with history_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "assistant":
+                    continue
+                content = record.get("content")
+                if isinstance(content, str) and content.strip():
+                    message = content.strip()
+    except OSError:
+        return ""
+    return message
+
+
+def trigger_from_grok_record(path: Path, offset: int, record: dict[str, Any]) -> dict[str, Any] | None:
+    if record.get("type") != "turn_ended":
+        return None
+    outcome = str(record.get("outcome") or "")
+    if outcome not in {"completed", "error", "cancelled"}:
+        return None
+
+    meta = load_grok_session_meta(path)
+    if meta.get("parent_session_id") and not env_flag("GROK_WATCH_NOTIFY_SUBAGENTS", False):
+        return None
+
+    message = load_grok_last_assistant_message(path) if outcome == "completed" else ""
+    if outcome == "completed":
+        status, status_detail = classify_task_complete(message, "Grok Build")
+        title = {
+            "完成": "Grok Build 已完成",
+            "需要处理": "Grok Build 需要处理",
+            "已停下": "Grok Build 已停下",
+        }[status]
+        event_type = "grok_turn_completed"
+    elif outcome == "error":
+        status = "需要处理"
+        status_detail = "Grok Build 本轮执行失败"
+        title = "Grok Build 失败"
+        event_type = "grok_turn_error"
+    else:
+        status = "已取消"
+        status_detail = "Grok Build 本轮被取消或停止"
+        title = "Grok Build 已取消"
+        event_type = "grok_turn_cancelled"
+
+    session_id = str(meta.get("session_id") or path.parent.name)
+    cwd = str(meta.get("cwd") or "(unknown workspace)")
+    session_title = str(meta.get("session_title") or "")
+    display_name = session_title or (Path(cwd).name if cwd != "(unknown workspace)" else session_id[:12])
+    timestamp = record.get("ts") or record.get("timestamp")
+    local_time = utc_to_local(str(timestamp) if timestamp else None)
+    stable_source = f"grok:{session_id}:{outcome}:{timestamp}:{offset}"
+    event = {
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "local_time": local_time,
+        "session_id": session_id,
+        "session_title": session_title,
+        "parent_session_id": meta.get("parent_session_id"),
+        "status": status,
+        "status_detail": status_detail,
+        "cwd": cwd,
+        "log_path": str(path),
+        "offset": offset,
+        "message": message,
+        "stable_id": hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24],
+        "bark_group": os.getenv("GROK_BARK_GROUP", "Grok Build"),
+        "bark_icon": os.getenv("GROK_BARK_ICON", ""),
+        "ntfy_url": os.getenv("GROK_NTFY_URL", ""),
+        "ntfy_tags": os.getenv("GROK_NTFY_TAGS", "robot,computer"),
+    }
+    body_parts = [
+        f"状态: {status}",
+        f"判断: {status_detail}",
+        f"会话: {display_name}",
+        f"时间: {local_time}",
+    ]
+    if include_workspace_in_notifications():
+        body_parts.append(f"目录: {cwd}")
+    if message and include_message_excerpt_in_notifications() and notification_body_max_chars() > 0:
+        body_parts.extend(["", compact(message, notification_body_max_chars())])
+    event["notification_title"] = f"{title}: {compact(display_name, 42)}"
     event["notification_body"] = "\n".join(body_parts)
     return event
 
@@ -842,6 +1102,85 @@ def process_zcode_file(
     return sent_count
 
 
+def process_external_file(
+    path: Path,
+    state: dict[str, Any],
+    notifier: Notifier,
+    log: Logger,
+    kind: str,
+    trigger: Any,
+) -> int:
+    files = state.setdefault("files", {})
+    rec = files.setdefault(str(path), {"offset": 0, "kind": kind})
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        log(f"cannot stat {path}: {exc}")
+        return 0
+
+    offset = int(rec.get("offset", 0))
+    if offset > size:
+        rec["offset"] = size
+        rec["size"] = size
+        rec["updated_at"] = int(time.time())
+        log(f"{kind} log shrank; baselined at EOF without replaying history: {path.name}")
+        return 0
+
+    sent_count = 0
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            while True:
+                line_offset = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    break
+                try:
+                    record = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    rec["offset"] = handle.tell()
+                    continue
+
+                event = trigger(path, line_offset, record)
+                rec["offset"] = handle.tell()
+                if not event:
+                    continue
+
+                stale, age, max_age = is_stale_event(event)
+                if stale:
+                    skipped = int(rec.get("stale_events_skipped", 0) or 0) + 1
+                    rec["stale_events_skipped"] = skipped
+                    if skipped <= 3 or skipped in {10, 50, 100, 250, 500} or skipped % 1000 == 0:
+                        log(
+                            f"skipped stale {event['event_type']} for {event.get('session_id')} "
+                            f"from {path.name} (age={age:.0f}s, max={max_age:.0f}s)"
+                        )
+                    continue
+
+                stable_id = str(event.get("stable_id") or "")
+                if not stable_id:
+                    stable_source = f"{kind}:{path}:{line_offset}:{event.get('event_type')}:{event.get('timestamp')}"
+                    stable_id = hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24]
+                if stable_id in state.setdefault("sent", {}):
+                    continue
+
+                if notifier.send(event["notification_title"], event["notification_body"], event):
+                    state["sent"][stable_id] = int(time.time())
+                    sent_count += 1
+                    log(f"sent {event['event_type']} for {event.get('session_id')} from {path.name}")
+                else:
+                    log(f"failed to send {event['event_type']} for {event.get('session_id')} from {path.name}")
+    except OSError as exc:
+        log(f"cannot read {path}: {exc}")
+    finally:
+        rec["size"] = size
+        rec["kind"] = kind
+        rec["updated_at"] = int(time.time())
+    return sent_count
+
+
 def baseline_existing_files(state: dict[str, Any], roots: list[Path], log: Logger) -> None:
     files = state.setdefault("files", {})
     count = 0
@@ -875,6 +1214,26 @@ def baseline_existing_zcode_files(state: dict[str, Any], root: Path, log: Logger
     log(f"initialized ZCode baseline at EOF for {count} log files", always_stdout=True)
 
 
+def baseline_external_files(
+    state: dict[str, Any],
+    paths: list[Path],
+    initialized_key: str,
+    kind: str,
+    log: Logger,
+) -> None:
+    files = state.setdefault("files", {})
+    count = 0
+    for path in paths:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        files[str(path)] = {"offset": size, "size": size, "updated_at": int(time.time()), "kind": kind}
+        count += 1
+    state[initialized_key] = True
+    log(f"initialized {kind} baseline at EOF for {count} event files", always_stdout=True)
+
+
 def build_roots(args: argparse.Namespace) -> list[Path]:
     roots = [expand_path(value) for value in (args.sessions_root or [DEFAULT_SESSIONS_ROOT])]
     include_archived = args.include_archived or os.getenv("CODEX_WATCH_INCLUDE_ARCHIVED") in {"1", "true", "True"}
@@ -884,13 +1243,39 @@ def build_roots(args: argparse.Namespace) -> list[Path]:
 
 
 def build_zcode_log_root(args: argparse.Namespace) -> Path:
-    return expand_path(args.zcode_log_root or os.getenv("ZCODE_WATCH_LOG_ROOT", DEFAULT_ZCODE_LOG_ROOT))
+    return expand_path(getattr(args, "zcode_log_root", None) or os.getenv("ZCODE_WATCH_LOG_ROOT", DEFAULT_ZCODE_LOG_ROOT))
 
 
 def zcode_watch_enabled(args: argparse.Namespace) -> bool:
-    if args.disable_zcode:
+    if getattr(args, "disable_zcode", False):
         return False
     return os.getenv("ZCODE_WATCH_ENABLED", "1") not in {"0", "false", "False"}
+
+
+def build_kimi_sessions_root(args: argparse.Namespace) -> Path:
+    return expand_path(
+        getattr(args, "kimi_sessions_root", None)
+        or os.getenv("KIMI_WATCH_SESSIONS_ROOT", DEFAULT_KIMI_SESSIONS_ROOT)
+    )
+
+
+def kimi_watch_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "disable_kimi", False):
+        return False
+    return env_flag("KIMI_WATCH_ENABLED", True)
+
+
+def build_grok_sessions_root(args: argparse.Namespace) -> Path:
+    return expand_path(
+        getattr(args, "grok_sessions_root", None)
+        or os.getenv("GROK_WATCH_SESSIONS_ROOT", DEFAULT_GROK_SESSIONS_ROOT)
+    )
+
+
+def grok_watch_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "disable_grok", False):
+        return False
+    return env_flag("GROK_WATCH_ENABLED", True)
 
 
 def parse_extra_event_types() -> set[str]:
@@ -929,6 +1314,34 @@ def send_zcode_test_notification(args: argparse.Namespace, log: Logger) -> int:
         "ntfy_tags": os.getenv("ZCODE_NTFY_TAGS", "zap,computer"),
     }
     ok = notifier.send("ZCode 测试提醒", "这是一条 ZCode 测试提醒。收到它说明 ZCode 分组和图标配置可用。", event)
+    return 0 if ok else 1
+
+
+def send_external_test_notification(
+    args: argparse.Namespace,
+    log: Logger,
+    tool_name: str,
+    event_prefix: str,
+) -> int:
+    notifier = Notifier(args.dry_run, log)
+    env_prefix = event_prefix.upper()
+    event = {
+        "event_type": f"{event_prefix}_test",
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "local_time": dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "session_id": "test",
+        "cwd": str(Path.cwd()),
+        "message": f"{tool_name} Watch Notifier test",
+        "bark_group": os.getenv(f"{env_prefix}_BARK_GROUP", tool_name),
+        "bark_icon": os.getenv(f"{env_prefix}_BARK_ICON", ""),
+        "ntfy_url": os.getenv(f"{env_prefix}_NTFY_URL", ""),
+        "ntfy_tags": os.getenv(f"{env_prefix}_NTFY_TAGS", "robot,computer"),
+    }
+    ok = notifier.send(
+        f"{tool_name} 测试提醒",
+        f"这是一条 {tool_name} 测试提醒。收到它说明分组和图标配置可用。",
+        event,
+    )
     return 0 if ok else 1
 
 
@@ -973,6 +1386,8 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     log_path = expand_path(args.log)
     roots = build_roots(args)
     zcode_root = build_zcode_log_root(args)
+    kimi_root = build_kimi_sessions_root(args)
+    grok_root = build_grok_sessions_root(args)
     notifier = Notifier(False, Logger(None))
 
     print("Codex Watch Notifier doctor")
@@ -981,8 +1396,15 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     print_check("config file", env_path.exists(), "chmod 600 recommended" if env_path.exists() else "run installer")
     print_check("notification channels", bool(notifier.channels), ",".join(notifier.channels) or "none configured")
     print_check("Bark configured", bool(os.getenv("BARK_URL") or os.getenv("BARK_KEY")), "BARK_URL/BARK_KEY")
-    ntfy_configured = bool(os.getenv("NTFY_URL") or os.getenv("CODEX_NTFY_URL") or os.getenv("ZCODE_NTFY_URL"))
-    ntfy_detail = os.getenv("NTFY_URL") or os.getenv("CODEX_NTFY_URL") or os.getenv("ZCODE_NTFY_URL") or "NTFY_URL"
+    ntfy_detail = next(
+        (
+            os.getenv(name)
+            for name in ("NTFY_URL", "CODEX_NTFY_URL", "ZCODE_NTFY_URL", "KIMI_NTFY_URL", "GROK_NTFY_URL")
+            if os.getenv(name)
+        ),
+        "NTFY_URL",
+    )
+    ntfy_configured = ntfy_detail != "NTFY_URL"
     if str(ntfy_detail).startswith("https://ntfy.sh/") and len(str(ntfy_detail).rstrip("/").rsplit("/", 1)[-1]) < 12:
         ntfy_detail = f"{ntfy_detail} (public topic should be long and random)"
     print_check("ntfy configured", ntfy_configured, str(ntfy_detail))
@@ -994,6 +1416,18 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     if zcode_watch_enabled(args):
         print_check("ZCode log root", zcode_root.exists(), str(zcode_root))
         print_check("ZCode log files", count_paths(zcode_log_files(zcode_root)) > 0, f"{count_paths(zcode_log_files(zcode_root))} file(s)")
+    kimi_policy = "enabled" if env_flag("KIMI_WATCH_NOTIFY_SUBAGENTS", False) else "main agent only"
+    print(f"Kimi subagent notifications: {kimi_policy}")
+    print_check("Kimi watch enabled", kimi_watch_enabled(args), f"root={kimi_root}")
+    if kimi_watch_enabled(args):
+        print_check("Kimi sessions root", kimi_root.exists(), str(kimi_root))
+        print_check("Kimi wire files", count_paths(kimi_wire_files(kimi_root)) > 0, f"{count_paths(kimi_wire_files(kimi_root))} file(s)")
+    grok_policy = "enabled" if env_flag("GROK_WATCH_NOTIFY_SUBAGENTS", False) else "main sessions only"
+    print(f"Grok child-session notifications: {grok_policy}")
+    print_check("Grok watch enabled", grok_watch_enabled(args), f"root={grok_root}")
+    if grok_watch_enabled(args):
+        print_check("Grok sessions root", grok_root.exists(), str(grok_root))
+        print_check("Grok event files", count_paths(grok_event_files(grok_root)) > 0, f"{count_paths(grok_event_files(grok_root))} file(s)")
     print_check("state file", state_path.exists(), str(state_path))
     print_check("log file", log_path.exists(), str(log_path))
     if platform.system() == "Darwin":
@@ -1038,10 +1472,16 @@ def main() -> int:
     parser.add_argument("--include-archived", action="store_true", help="Also scan ~/.codex/archived_sessions.")
     parser.add_argument("--zcode-log-root", help="Root containing ZCode zcode-*.jsonl log files.")
     parser.add_argument("--disable-zcode", action="store_true", help="Disable ZCode log notifications.")
+    parser.add_argument("--kimi-sessions-root", help="Root containing Kimi Code session wire.jsonl files.")
+    parser.add_argument("--disable-kimi", action="store_true", help="Disable Kimi Code notifications.")
+    parser.add_argument("--grok-sessions-root", help="Root containing Grok Build session events.jsonl files.")
+    parser.add_argument("--disable-grok", action="store_true", help="Disable Grok Build notifications.")
     parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them.")
     parser.add_argument("--verbose", action="store_true", help="Also print log lines to stdout.")
     parser.add_argument("--test", action="store_true", help="Send one test notification and exit.")
     parser.add_argument("--test-zcode", action="store_true", help="Send one ZCode test notification and exit.")
+    parser.add_argument("--test-kimi", action="store_true", help="Send one Kimi Code test notification and exit.")
+    parser.add_argument("--test-grok", action="store_true", help="Send one Grok Build test notification and exit.")
     parser.add_argument("--doctor", action="store_true", help="Check configuration, log roots, and LaunchAgent status.")
     parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
     args = parser.parse_args()
@@ -1053,6 +1493,10 @@ def main() -> int:
         return send_test_notification(args, log)
     if args.test_zcode:
         return send_zcode_test_notification(args, log)
+    if args.test_kimi:
+        return send_external_test_notification(args, log, "Kimi Code", "kimi")
+    if args.test_grok:
+        return send_external_test_notification(args, log, "Grok Build", "grok")
     if args.doctor:
         return doctor(args, log)
     if args.replay_file:
@@ -1061,6 +1505,10 @@ def main() -> int:
     roots = build_roots(args)
     zcode_enabled = zcode_watch_enabled(args)
     zcode_root = build_zcode_log_root(args)
+    kimi_enabled = kimi_watch_enabled(args)
+    kimi_root = build_kimi_sessions_root(args)
+    grok_enabled = grok_watch_enabled(args)
+    grok_root = build_grok_sessions_root(args)
     state_path = expand_path(args.state)
     state = load_state(state_path)
     did_baseline = False
@@ -1075,6 +1523,30 @@ def main() -> int:
             did_baseline = True
         else:
             state["zcode_initialized"] = True
+    if kimi_enabled:
+        if not state.get("kimi_initialized") and not args.process_existing:
+            baseline_external_files(
+                state,
+                kimi_wire_files(kimi_root, include_subagents=True),
+                "kimi_initialized",
+                "Kimi Code",
+                log,
+            )
+            did_baseline = True
+        else:
+            state["kimi_initialized"] = True
+    if grok_enabled:
+        if not state.get("grok_initialized") and not args.process_existing:
+            baseline_external_files(
+                state,
+                grok_event_files(grok_root),
+                "grok_initialized",
+                "Grok Build",
+                log,
+            )
+            did_baseline = True
+        else:
+            state["grok_initialized"] = True
     if did_baseline:
         save_state(state_path, state)
         if args.once:
@@ -1085,6 +1557,10 @@ def main() -> int:
     log(f"watching {', '.join(str(root) for root in roots)} with channels={notifier.channels}", always_stdout=True)
     if zcode_enabled:
         log(f"watching ZCode {zcode_root} with channels={notifier.channels}", always_stdout=True)
+    if kimi_enabled:
+        log(f"watching Kimi Code {kimi_root} with channels={notifier.channels}", always_stdout=True)
+    if grok_enabled:
+        log(f"watching Grok Build {grok_root} with channels={notifier.channels}", always_stdout=True)
 
     while True:
         for path in rollout_files(roots):
@@ -1102,6 +1578,18 @@ def main() -> int:
                     state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time()), "kind": "zcode"}
                     log(f"new ZCode log discovered: {path}")
                 process_zcode_file(path, state, notifier, log)
+        if kimi_enabled:
+            for path in kimi_wire_files(kimi_root):
+                if str(path) not in state.setdefault("files", {}):
+                    state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time()), "kind": "Kimi Code"}
+                    log(f"new Kimi Code session discovered: {path}")
+                process_external_file(path, state, notifier, log, "Kimi Code", trigger_from_kimi_record)
+        if grok_enabled:
+            for path in grok_event_files(grok_root):
+                if str(path) not in state.setdefault("files", {}):
+                    state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time()), "kind": "Grok Build"}
+                    log(f"new Grok Build session discovered: {path}")
+                process_external_file(path, state, notifier, log, "Grok Build", trigger_from_grok_record)
         save_state(state_path, state)
         if args.once:
             return 0

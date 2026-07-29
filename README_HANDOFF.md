@@ -2,7 +2,7 @@
 
 This folder contains a Bark/ntfy notifier for local AI coding agents.
 
-Goal: when a local Codex or ZCode task completes, stops, needs attention, or aborts, send a push to the user's devices. Bark is recommended for iPhone and Apple Watch. Public `ntfy.sh` is the current Android-friendly channel for Android phones and wearable notification forwarding.
+Goal: when a local Codex, ZCode, Kimi Code, or Grok Build task completes, stops, needs attention, or aborts, send a push to the user's devices. Bark is recommended for iPhone and Apple Watch. Public `ntfy.sh` is the current Android-friendly channel for Android phones and wearable notification forwarding.
 
 ## Platform Plan
 
@@ -29,7 +29,9 @@ For coworkers, publish three release artifacts and ask them to download the one 
 - `env.example`: template config. Copy it to `~/.codex-watch-notifier/env` and fill in a private Bark URL/key, ntfy topic URL, or webhook.
 - Optional Bark icon/group: set `CODEX_BARK_ICON` and `CODEX_BARK_GROUP`. This repo includes `assets/codex-icon-large-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png`.
 - ZCode Bark settings: set `ZCODE_BARK_ICON` and `ZCODE_BARK_GROUP`. This repo includes `assets/zcode-icon-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/zcode-icon-v1.png`. ZCode notifications watch `~/.zcode/cli/log/zcode-*.jsonl`.
-- ntfy settings: set `NTFY_URL=https://ntfy.sh/<long-random-topic>`. Optional per-tool overrides are `CODEX_NTFY_URL` and `ZCODE_NTFY_URL`. Public ntfy.sh topics are shared secrets; never use short or guessable topic names.
+- Kimi Code watches `~/.kimi-code/sessions/**/agents/main/wire.jsonl`. Its child agents are silent unless `KIMI_WATCH_NOTIFY_SUBAGENTS=1`.
+- Grok Build watches `~/.grok/sessions/**/events.jsonl`. Sessions with `parent_session_id` are silent unless `GROK_WATCH_NOTIFY_SUBAGENTS=1`.
+- ntfy settings: set `NTFY_URL=https://ntfy.sh/<long-random-topic>`. Optional per-tool overrides are `CODEX_NTFY_URL`, `ZCODE_NTFY_URL`, `KIMI_NTFY_URL`, and `GROK_NTFY_URL`. Public ntfy.sh topics are shared secrets; never use short or guessable topic names.
 
 ## What It Monitors
 
@@ -53,6 +55,8 @@ Triggers:
 - `event_msg.payload.type == "task_complete"`
 - `event_msg.payload.type == "turn_aborted"`
 - ZCode `message == "ZCode Protocol background turn completed"` from `~/.zcode/cli/log/zcode-*.jsonl`
+- Kimi Code `context.append_loop_event.event.type == "step.end"` with `finishReason == "end_turn"`
+- Grok Build `type == "turn_ended"` with `outcome` equal to `completed`, `error`, or `cancelled`
 
 Thread title:
 
@@ -122,6 +126,9 @@ Send one test notification through every configured channel:
 
 ```bash
 ./codex-watch-notifier.zsh --test
+./codex-watch-notifier.zsh --test-zcode
+./codex-watch-notifier.zsh --test-kimi
+./codex-watch-notifier.zsh --test-grok
 ```
 
 Expected: the configured Bark or ntfy client receives `Codex 测试提醒`. For Apple Watch, if the iPhone is locked and the Apple Watch is worn/unlocked, the watch should vibrate. For Android wearables, behavior depends on the phone's notification forwarding settings.
@@ -156,7 +163,7 @@ Run diagnostics:
 ./codex-watch-notifier.zsh --doctor
 ```
 
-The doctor command checks the config file, Bark/ntfy setup, Codex/ZCode log roots, state file, notifier log, LaunchAgent state on macOS, and current privacy settings.
+The doctor command checks the config file, Bark/ntfy setup, all supported tool log roots, state file, notifier log, LaunchAgent state on macOS, and current privacy settings.
 
 ## Verify Real Codex Completion
 

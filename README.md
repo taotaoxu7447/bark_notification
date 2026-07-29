@@ -22,11 +22,12 @@
 ## 已支持能力
 
 - **通知通道**：Bark 和 ntfy。iPhone / Apple Watch 推荐 Bark；Android 手机和手环通知转发推荐公共 `ntfy.sh`。
-- **已适配工具**：Codex App / Codex CLI、ZCode。
-- **分组和标签**：Bark 使用 `group` 和 `icon` 区分 Codex/ZCode；ntfy 使用 topic 和 tags 区分来源。
+- **已适配工具**：Codex App / Codex CLI、ZCode、Kimi Code、Grok Build。
+- **主任务优先**：Codex、Kimi Code 和 Grok Build 默认过滤子智能体或子会话事件，只提醒主任务。
+- **分组和标签**：Bark 使用 `group` 和 `icon` 区分工具；ntfy 使用 topic 和 tags 区分来源。
 - **三端安装**：macOS LaunchAgent、Ubuntu systemd user service、Windows Task Scheduler。
 - **诊断命令**：`--doctor` 检查配置、日志目录、状态文件、后台服务和隐私设置。
-- **测试命令**：`--test` 发送 Codex 测试通知，`--test-zcode` 发送 ZCode 测试通知。
+- **测试命令**：`--test`、`--test-zcode`、`--test-kimi`、`--test-grok` 分别测试四种工具的通知。
 - **隐私开关**：可以关闭工作目录和消息摘要，避免把敏感内容推送到手机。
 - **历史抑制**：首次启动会建立基线，默认不会把旧日志里的历史任务重新推送一遍。
 
@@ -36,7 +37,7 @@
 
 这个工具适合下面这种工作流：
 
-1. 在电脑上让 Codex、ZCode 或其他 AI 编程助手跑长任务。
+1. 在电脑上让 Codex、ZCode、Kimi Code、Grok Build 或其他 AI 编程助手跑长任务。
 2. 人离开电脑，或切换去做别的事。
 3. AI 任务完成、卡住或需要确认时，手机、手表或其他通知客户端设备收到提醒。
 4. 回到对应电脑继续处理。
@@ -96,6 +97,8 @@ $EDITOR ~/.codex-watch-notifier/env
 ./codex-watch-notifier.zsh --doctor
 ./codex-watch-notifier.zsh --test
 ./codex-watch-notifier.zsh --test-zcode
+./codex-watch-notifier.zsh --test-kimi
+./codex-watch-notifier.zsh --test-grok
 ```
 
 第一次执行安装脚本会复制程序和生成配置文件。编辑 `~/.codex-watch-notifier/env` 填入 Bark 或 ntfy 配置后，再执行一次安装脚本来重载后台服务。
@@ -117,6 +120,8 @@ $EDITOR ~/.codex-watch-notifier/env
 python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --doctor
 python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --test
 python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --test-zcode
+python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --test-kimi
+python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --test-grok
 ```
 
 常用排查：
@@ -143,6 +148,8 @@ notepad $env:USERPROFILE\.codex-watch-notifier\env
 py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --doctor
 py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --test
 py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --test-zcode
+py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --test-kimi
+py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --test-grok
 ```
 
 常用排查：
@@ -177,6 +184,10 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 | `CODEX_BARK_ICON` | Codex 通知图标 URL |
 | `ZCODE_BARK_GROUP` | ZCode 通知分组，默认 `ZCode` |
 | `ZCODE_BARK_ICON` | ZCode 通知图标 URL |
+| `KIMI_BARK_GROUP` | Kimi Code 通知分组，默认 `Kimi Code` |
+| `KIMI_BARK_ICON` | Kimi Code 通知图标 URL；默认留空，使用 Bark 默认图标 |
+| `GROK_BARK_GROUP` | Grok Build 通知分组，默认 `Grok Build` |
+| `GROK_BARK_ICON` | Grok Build 通知图标 URL；默认留空，使用 Bark 默认图标 |
 | `NTFY_URL` | ntfy 推送地址，例如 `https://ntfy.sh/<long-random-topic>` |
 | `NTFY_TOKEN` | ntfy 认证 token；公共 `ntfy.sh` 通常留空 |
 | `NTFY_PRIORITY` | ntfy 优先级，默认 `default` |
@@ -185,10 +196,20 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 | `CODEX_NTFY_TAGS` | Codex 专用 ntfy 标签 |
 | `ZCODE_NTFY_URL` | ZCode 专用 ntfy URL；留空则使用 `NTFY_URL` |
 | `ZCODE_NTFY_TAGS` | ZCode 专用 ntfy 标签 |
+| `KIMI_NTFY_URL` | Kimi Code 专用 ntfy URL；留空则使用 `NTFY_URL` |
+| `KIMI_NTFY_TAGS` | Kimi Code 专用 ntfy 标签 |
+| `GROK_NTFY_URL` | Grok Build 专用 ntfy URL；留空则使用 `NTFY_URL` |
+| `GROK_NTFY_TAGS` | Grok Build 专用 ntfy 标签 |
 | `CODEX_WATCH_POLL_INTERVAL` | 轮询间隔，默认 2 秒 |
 | `CODEX_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Codex 子智能体事件，默认 `0`，只提醒主会话 |
 | `ZCODE_WATCH_ENABLED` | 是否启用 ZCode，默认 `1` |
 | `ZCODE_WATCH_LOG_ROOT` | ZCode 日志目录，默认 `~/.zcode/cli/log` |
+| `KIMI_WATCH_ENABLED` | 是否启用 Kimi Code，默认 `1` |
+| `KIMI_WATCH_SESSIONS_ROOT` | Kimi Code 会话目录，默认 `~/.kimi-code/sessions` |
+| `KIMI_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Kimi 子智能体，默认 `0` |
+| `GROK_WATCH_ENABLED` | 是否启用 Grok Build，默认 `1` |
+| `GROK_WATCH_SESSIONS_ROOT` | Grok Build 会话目录，默认 `~/.grok/sessions` |
+| `GROK_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Grok 子会话，默认 `0` |
 | `NOTIFY_INCLUDE_WORKSPACE` | 是否在通知里显示工作目录，默认 `1` |
 | `NOTIFY_INCLUDE_MESSAGE` | 是否在通知里显示消息摘要，默认 `1` |
 | `NOTIFY_BODY_MAX_CHARS` | 通知正文最大长度，默认 `1100` |
@@ -207,9 +228,12 @@ NOTIFY_BODY_MAX_CHARS=0
 
 - Codex watcher 监听 `~/.codex/sessions` 下的 `rollout-*.jsonl`。
 - ZCode watcher 监听 `~/.zcode/cli/log` 下的 `zcode-*.jsonl`。
+- Kimi Code watcher 监听 `~/.kimi-code/sessions` 下主智能体的 `agents/main/wire.jsonl`，只在 `step.end` 且 `finishReason=end_turn` 时提醒，不把工具调用步骤当成完成。
+- Grok Build watcher 监听 `~/.grok/sessions` 下的 `events.jsonl`，识别 `turn_ended` 的 `completed`、`error` 和 `cancelled` 结果。
 - watcher 会记录每个文件已经处理到的位置，状态存在 `~/.codex-watch-notifier/state.json`。
 - 第一次启动默认只建立基线，不回放旧历史。
 - Codex 5.6 创建的子智能体 rollout 默认静默，只提醒主会话最终完成、等待人工或中止；排障时可设置 `CODEX_WATCH_NOTIFY_SUBAGENTS=1` 恢复全部提醒。
+- Kimi Code 的非 `main` agent 和带 `parent_session_id` 的 Grok 子会话也默认静默，可分别通过对应的 `*_NOTIFY_SUBAGENTS=1` 临时开启。
 - 检测到完成、停止、等待人工或异常事件后，会组装统一通知，再交给 Bark、ntfy 或其他发送层。
 
 如果你要让 AI 帮你维护这个项目，可以直接把本节和下一节给它看。核心约束是：不要提交个人密钥，不要默认回放旧历史，不要绕过现有 Bark / ntfy 发送层。
@@ -257,7 +281,7 @@ NOTIFY_BODY_MAX_CHARS=0
 - 只推送明确的完成、失败、等待人工或中断事件。
 - 不把 API key、Bark key、ntfy topic、公司内部 token 写进仓库。
 - 通知正文必须受 `NOTIFY_INCLUDE_WORKSPACE`、`NOTIFY_INCLUDE_MESSAGE`、`NOTIFY_BODY_MAX_CHARS` 控制。
-- 新工具默认不要破坏 Codex 和 ZCode 已有行为。
+- 新工具默认不要破坏 Codex、ZCode、Kimi Code 和 Grok Build 已有行为。
 - Windows、Ubuntu、macOS 至少要能优雅地跳过不存在的日志目录。
 
 ### 提交前检查
@@ -267,6 +291,8 @@ python3 -m py_compile codex_watch_notifier.py
 python3 codex_watch_notifier.py --doctor
 python3 codex_watch_notifier.py --test
 python3 codex_watch_notifier.py --test-zcode
+python3 codex_watch_notifier.py --test-kimi
+python3 codex_watch_notifier.py --test-grok
 ./build_packages.zsh internal-test
 ```
 

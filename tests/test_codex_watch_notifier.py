@@ -184,5 +184,241 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("Codex subagent notifications: main sessions only", output.getvalue())
 
 
+class KimiWatcherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def write_session(self, agent_id: str = "main", agent_type: str = "main") -> Path:
+        session_dir = self.root / "wd_project" / "session_kimi-123"
+        wire_path = session_dir / "agents" / agent_id / "wire.jsonl"
+        wire_path.parent.mkdir(parents=True)
+        state = {
+            "title": "Kimi 测试任务",
+            "workDir": "/tmp/kimi-project",
+            "agents": {
+                agent_id: {
+                    "type": agent_type,
+                    "parentAgentId": None if agent_type == "main" else "main",
+                }
+            },
+        }
+        (session_dir / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        message_record = {
+            "type": "context.append_loop_event",
+            "time": "2026-07-29T00:00:00Z",
+            "event": {
+                "type": "content.part",
+                "turnId": "turn-7",
+                "step": 2,
+                "part": {"type": "text", "text": "Kimi 任务已完成。"},
+            },
+        }
+        end_record = {
+            "type": "context.append_loop_event",
+            "time": "2026-07-29T00:00:01Z",
+            "event": {
+                "type": "step.end",
+                "turnId": "turn-7",
+                "step": 2,
+                "finishReason": "end_turn",
+            },
+        }
+        with wire_path.open("w", encoding="utf-8") as handle:
+            for record in (message_record, end_record):
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return wire_path
+
+    def test_main_end_turn_creates_notification(self) -> None:
+        path = self.write_session()
+        record = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+
+        event = notifier.trigger_from_kimi_record(path, path.stat().st_size, record)
+
+        self.assertIsNotNone(event)
+        self.assertEqual("kimi_turn_completed", event["event_type"])
+        self.assertEqual("Kimi Code", event["bark_group"])
+        self.assertEqual("Kimi 测试任务", event["session_title"])
+        self.assertIn("Kimi 任务已完成", event["message"])
+
+    def test_tool_use_step_is_ignored(self) -> None:
+        path = self.write_session()
+        record = {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "step.end",
+                "turnId": "turn-7",
+                "step": 1,
+                "finishReason": "tool_use",
+            },
+        }
+
+        event = notifier.trigger_from_kimi_record(path, 1, record)
+
+        self.assertIsNone(event)
+
+    def test_subagent_is_silent_by_default_and_can_be_enabled(self) -> None:
+        path = self.write_session(agent_id="agent-0", agent_type="subagent")
+        record = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+
+        with mock.patch.dict(os.environ, {"KIMI_WATCH_NOTIFY_SUBAGENTS": "0"}):
+            silent_event = notifier.trigger_from_kimi_record(path, path.stat().st_size, record)
+        with mock.patch.dict(os.environ, {"KIMI_WATCH_NOTIFY_SUBAGENTS": "1"}):
+            enabled_event = notifier.trigger_from_kimi_record(path, path.stat().st_size, record)
+
+        self.assertIsNone(silent_event)
+        self.assertIsNotNone(enabled_event)
+
+    def test_incremental_processor_sends_end_turn_once(self) -> None:
+        path = self.write_session()
+        state = {"files": {}, "sent": {}}
+        sent_events = []
+
+        class RecordingNotifier:
+            def send(self, title: str, body: str, event: dict) -> bool:
+                del title, body
+                sent_events.append(event)
+                return True
+
+        with mock.patch.dict(os.environ, {"CODEX_WATCH_MAX_EVENT_AGE_SECONDS": "0"}):
+            notifier.process_external_file(
+                path,
+                state,
+                RecordingNotifier(),
+                notifier.Logger(None),
+                "Kimi Code",
+                notifier.trigger_from_kimi_record,
+            )
+            notifier.process_external_file(
+                path,
+                state,
+                RecordingNotifier(),
+                notifier.Logger(None),
+                "Kimi Code",
+                notifier.trigger_from_kimi_record,
+            )
+
+        self.assertEqual(1, len(sent_events))
+        self.assertEqual(path.stat().st_size, state["files"][str(path)]["offset"])
+
+
+class GrokWatcherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def write_session(self, parent_session_id: str = "") -> Path:
+        session_dir = self.root / "%2Ftmp%2Fgrok-project" / "grok-session-123"
+        session_dir.mkdir(parents=True)
+        summary = {
+            "info": {"id": "grok-session-123", "cwd": "/tmp/grok-project"},
+            "generated_title": "Grok 测试任务",
+            "session_summary": "Grok 测试任务",
+        }
+        if parent_session_id:
+            summary["parent_session_id"] = parent_session_id
+        (session_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+        assistant_message = {
+            "type": "assistant",
+            "content": "Grok 任务已完成。",
+        }
+        (session_dir / "chat_history.jsonl").write_text(
+            json.dumps(assistant_message, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        events_path = session_dir / "events.jsonl"
+        events_path.write_text(
+            json.dumps(
+                {
+                    "type": "turn_ended",
+                    "outcome": "completed",
+                    "ts": "2026-07-29T00:00:01Z",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return events_path
+
+    def test_main_completed_turn_creates_notification(self) -> None:
+        path = self.write_session()
+        record = json.loads(path.read_text(encoding="utf-8").strip())
+
+        event = notifier.trigger_from_grok_record(path, 0, record)
+
+        self.assertIsNotNone(event)
+        self.assertEqual("grok_turn_completed", event["event_type"])
+        self.assertEqual("Grok Build", event["bark_group"])
+        self.assertEqual("Grok 测试任务", event["session_title"])
+        self.assertIn("Grok 任务已完成", event["message"])
+
+    def test_error_and_cancelled_outcomes_create_attention_events(self) -> None:
+        path = self.write_session()
+
+        error_event = notifier.trigger_from_grok_record(
+            path,
+            1,
+            {"type": "turn_ended", "outcome": "error", "ts": "2026-07-29T00:00:01Z"},
+        )
+        cancelled_event = notifier.trigger_from_grok_record(
+            path,
+            2,
+            {"type": "turn_ended", "outcome": "cancelled", "ts": "2026-07-29T00:00:02Z"},
+        )
+
+        self.assertEqual("需要处理", error_event["status"])
+        self.assertEqual("已取消", cancelled_event["status"])
+
+    def test_child_session_is_silent_by_default_and_can_be_enabled(self) -> None:
+        path = self.write_session(parent_session_id="parent-session")
+        record = json.loads(path.read_text(encoding="utf-8").strip())
+
+        with mock.patch.dict(os.environ, {"GROK_WATCH_NOTIFY_SUBAGENTS": "0"}):
+            silent_event = notifier.trigger_from_grok_record(path, 0, record)
+        with mock.patch.dict(os.environ, {"GROK_WATCH_NOTIFY_SUBAGENTS": "1"}):
+            enabled_event = notifier.trigger_from_grok_record(path, 0, record)
+
+        self.assertIsNone(silent_event)
+        self.assertIsNotNone(enabled_event)
+
+    def test_incremental_processor_sends_completed_turn_once(self) -> None:
+        path = self.write_session()
+        state = {"files": {}, "sent": {}}
+        sent_events = []
+
+        class RecordingNotifier:
+            def send(self, title: str, body: str, event: dict) -> bool:
+                del title, body
+                sent_events.append(event)
+                return True
+
+        with mock.patch.dict(os.environ, {"CODEX_WATCH_MAX_EVENT_AGE_SECONDS": "0"}):
+            notifier.process_external_file(
+                path,
+                state,
+                RecordingNotifier(),
+                notifier.Logger(None),
+                "Grok Build",
+                notifier.trigger_from_grok_record,
+            )
+            notifier.process_external_file(
+                path,
+                state,
+                RecordingNotifier(),
+                notifier.Logger(None),
+                "Grok Build",
+                notifier.trigger_from_grok_record,
+            )
+
+        self.assertEqual(1, len(sent_events))
+        self.assertEqual(path.stat().st_size, state["files"][str(path)]["offset"])
+
+
 if __name__ == "__main__":
     unittest.main()
