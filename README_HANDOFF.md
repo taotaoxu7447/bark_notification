@@ -198,6 +198,10 @@ NOTIFY_BODY_MAX_CHARS=0
 
 Keep these enabled only when the extra context is useful and acceptable for your team.
 
+Delivery retries are deliberately bounded. One event is sent at most twice, with a persisted delay before the second attempt. Bark receives the same stable `id` on both attempts so a retry updates or collapses the same notification where supported. Exhausted deliveries are recorded for `--doctor`; they are never retried in a loop.
+
+The long-running watcher and `--once`/`--replay-file` processing hold an OS-backed lock next to the state file. A second process exits without sending, so an installer restart or manual command cannot multiply the two-attempt allowance.
+
 ## Uninstall
 
 ```bash
@@ -210,5 +214,6 @@ This removes only the LaunchAgent plist. Config and logs remain in `~/.codex-wat
 
 - Do not print, commit, or share the Bark URL, Bark key, or ntfy topic URL; they are push tokens.
 - Do not remove first-run EOF baselining; otherwise the target Mac may receive many old Codex completion pushes.
+- Do not raise the hard two-attempt delivery cap or restore immediate retry loops; avoiding repeated phone alerts is a product requirement.
 - Keep `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` enabled unless you explicitly want old rewritten rollout history to be replayed.
 - If this Mac stores Codex rollout files somewhere other than `~/.codex/sessions`, find the actual `rollout-*.jsonl` location and set `--sessions-root` by adapting the LaunchAgent/wrapper.

@@ -201,6 +201,8 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 | `GROK_NTFY_URL` | Grok Build 专用 ntfy URL；留空则使用 `NTFY_URL` |
 | `GROK_NTFY_TAGS` | Grok Build 专用 ntfy 标签 |
 | `CODEX_WATCH_POLL_INTERVAL` | 轮询间隔，默认 2 秒 |
+| `NOTIFY_DELIVERY_MAX_ATTEMPTS` | 同一事件的自动投递总次数，默认且硬上限为 `2`；设为 `1` 可关闭自动补投 |
+| `NOTIFY_DELIVERY_RETRY_DELAY_SECONDS` | 第二次投递前的等待时间，默认 `60` 秒、最低 `30` 秒 |
 | `CODEX_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Codex 子智能体事件，默认 `0`，只提醒主会话 |
 | `ZCODE_WATCH_ENABLED` | 是否启用 ZCode，默认 `1` |
 | `ZCODE_WATCH_LOG_ROOT` | ZCode 日志目录，默认 `~/.zcode/cli/log` |
@@ -231,7 +233,10 @@ NOTIFY_BODY_MAX_CHARS=0
 - Kimi Code watcher 监听 `~/.kimi-code/sessions` 下主智能体的 `agents/main/wire.jsonl`，只在 `step.end` 且 `finishReason=end_turn` 时提醒，不把工具调用步骤当成完成。
 - Grok Build watcher 监听 `~/.grok/sessions` 下的 `events.jsonl`，识别 `turn_ended` 的 `completed`、`error` 和 `cancelled` 结果。
 - watcher 会记录每个文件已经处理到的位置，状态存在 `~/.codex-watch-notifier/state.json`。
+- watcher 会对状态文件持有系统级单实例锁；旧服务未退出时，新实例会直接退出且不发送，避免两个进程各自重复投递。
 - 第一次启动默认只建立基线，不回放旧历史。
+- 每个事件最多自动投递两次；第一次完全失败后至少等待 30 秒再补投一次，计数会先写入状态文件，服务重启也不会重置。两次都失败时停止自动发送并在 `--doctor` 中留下记录，避免无限重试造成通知轰炸。
+- Bark 通知使用事件的稳定 ID；补投时复用同一 Bark `id`，让支持该能力的 Bark 客户端和服务端折叠或更新同一条通知。它是第二层防重复保护，不替代本地状态去重。
 - Codex 5.6 创建的子智能体 rollout 默认静默，只提醒主会话最终完成、等待人工或中止；排障时可设置 `CODEX_WATCH_NOTIFY_SUBAGENTS=1` 恢复全部提醒。
 - Kimi Code 的非 `main` agent 和带 `parent_session_id` 的 Grok 子会话也默认静默，可分别通过对应的 `*_NOTIFY_SUBAGENTS=1` 临时开启。
 - 检测到完成、停止、等待人工或异常事件后，会组装统一通知，再交给 Bark、ntfy 或其他发送层。

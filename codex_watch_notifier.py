@@ -11,7 +11,7 @@ import platform
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 import urllib.parse
 import urllib.request
 
@@ -31,7 +31,14 @@ DEFAULT_GROK_BARK_ICON = (
     "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/grok-icon-v1.png"
 )
 DEFAULT_MAX_EVENT_AGE_SECONDS = 3600
+STATE_VERSION = 2
 MAX_SENT_KEYS = 3000
+DEFAULT_DELIVERY_MAX_ATTEMPTS = 2
+HARD_MAX_DELIVERY_ATTEMPTS = 2
+DEFAULT_DELIVERY_RETRY_DELAY_SECONDS = 60
+MIN_DELIVERY_RETRY_DELAY_SECONDS = 30
+MAX_DELIVERY_RETRY_DELAY_SECONDS = 86400
+MAX_EXHAUSTED_DELIVERIES = 500
 
 
 def expand_path(value: str) -> Path:
@@ -60,14 +67,13 @@ def default_env_path() -> Path:
     return expand_path(os.getenv("CODEX_WATCH_ENV", os.getenv("CODEX_WATCH_CONFIG_DIR", "~/.codex-watch-notifier") + "/env"))
 
 
-def utc_to_local(value: str | None) -> str:
-    if not value:
+def utc_to_local(value: Any) -> str:
+    if value is None or value == "":
         return dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    try:
-        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    except ValueError:
-        return value
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return str(value)
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def compact(text: str, limit: int = 900) -> str:
@@ -108,6 +114,16 @@ def notify_subagents_enabled() -> bool:
 
 def notification_body_max_chars() -> int:
     return max(env_int("NOTIFY_BODY_MAX_CHARS", 1100), 0)
+
+
+def delivery_max_attempts() -> int:
+    configured = env_int("NOTIFY_DELIVERY_MAX_ATTEMPTS", DEFAULT_DELIVERY_MAX_ATTEMPTS)
+    return min(max(configured, 1), HARD_MAX_DELIVERY_ATTEMPTS)
+
+
+def delivery_retry_delay_seconds() -> int:
+    configured = env_int("NOTIFY_DELIVERY_RETRY_DELAY_SECONDS", DEFAULT_DELIVERY_RETRY_DELAY_SECONDS)
+    return min(max(configured, MIN_DELIVERY_RETRY_DELAY_SECONDS), MAX_DELIVERY_RETRY_DELAY_SECONDS)
 
 
 def parse_timestamp(value: Any) -> dt.datetime | None:
@@ -189,6 +205,81 @@ class Logger:
                 handle.write(line + "\n")
 
 
+class InstanceLockBusy(RuntimeError):
+    pass
+
+
+class SingleInstanceLock:
+    """Hold an OS-backed lock for one state file without relying on stale PID files."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.handle: Any = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+
+        self.handle = handle
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{os.getpid()}\n".encode("ascii"))
+            handle.flush()
+        except OSError:
+            # The kernel lock is authoritative; PID text is diagnostic only.
+            pass
+        return True
+
+    def release(self) -> None:
+        handle = self.handle
+        if handle is None:
+            return
+        self.handle = None
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def __enter__(self) -> SingleInstanceLock:
+        if not self.acquire():
+            raise InstanceLockBusy(str(self.path))
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        del exc_type, exc, traceback
+        self.release()
+
+
 class Notifier:
     def __init__(self, dry_run: bool, log: Logger) -> None:
         self.dry_run = dry_run
@@ -221,6 +312,7 @@ class Notifier:
         return channels
 
     def send(self, title: str, body: str, event: dict[str, Any]) -> bool:
+        """Run one fan-out round; persistent retry timing is owned by the file processor."""
         if self.dry_run:
             print("\n--- dry-run notification ---", flush=True)
             print(title, flush=True)
@@ -249,23 +341,7 @@ class Notifier:
                 elif channel == "macos":
                     ok = self._send_macos(title, body) or ok
             except Exception as exc:  # noqa: BLE001 - log all channel failures and keep other channels alive.
-                self.log(f"channel {channel} failed: {exc}; retrying once")
-                time.sleep(1)
-                try:
-                    if channel == "bark":
-                        ok = self._send_bark(title, body, event) or ok
-                    elif channel == "ntfy":
-                        ok = self._send_ntfy(title, body, event) or ok
-                    elif channel == "generic_webhook":
-                        ok = self._send_generic_webhook(title, body, event) or ok
-                    elif channel == "wecom":
-                        ok = self._send_wecom(title, body) or ok
-                    elif channel == "command":
-                        ok = self._send_command(title, body, event) or ok
-                    elif channel == "macos":
-                        ok = self._send_macos(title, body) or ok
-                except Exception as retry_exc:  # noqa: BLE001
-                    self.log(f"channel {channel} retry failed: {retry_exc}")
+                self.log(f"channel {channel} failed: {exc}")
         return ok
 
     def _http_post(
@@ -309,6 +385,11 @@ class Notifier:
             "group": group,
             "level": os.getenv("BARK_LEVEL", "timeSensitive"),
         }
+        stable_id = str(event.get("stable_id") or "").strip()
+        if stable_id:
+            # Bark maps this stable string to APNs CollapseID and its archive primary key.
+            # A delayed retry therefore updates/collapses the same visible notification.
+            payload["id"] = f"agent-watch-{stable_id}"
         if "bark_icon" in event:
             icon = str(event.get("bark_icon") or "").strip()
         else:
@@ -396,26 +477,217 @@ class Notifier:
 
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"version": 1, "initialized": False, "files": {}, "sent": {}}
+        return {
+            "version": STATE_VERSION,
+            "initialized": False,
+            "files": {},
+            "sent": {},
+            "delivery_attempts": {},
+            "delivery_stats": {},
+        }
     with path.open("r", encoding="utf-8") as handle:
         state = json.load(handle)
-    state.setdefault("version", 1)
+    try:
+        state["version"] = max(int(state.get("version", 1)), STATE_VERSION)
+    except (TypeError, ValueError):
+        state["version"] = STATE_VERSION
     state.setdefault("initialized", False)
     state.setdefault("files", {})
     state.setdefault("sent", {})
+    state.setdefault("delivery_attempts", {})
+    state.setdefault("delivery_stats", {})
     return state
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    state["version"] = STATE_VERSION
     sent = state.get("sent", {})
     if len(sent) > MAX_SENT_KEYS:
         state["sent"] = dict(sorted(sent.items(), key=lambda item: item[1])[-MAX_SENT_KEYS:])
+    delivery_attempts = state.setdefault("delivery_attempts", {})
+    exhausted = [
+        (stable_id, entry)
+        for stable_id, entry in delivery_attempts.items()
+        if isinstance(entry, dict) and entry.get("status") == "exhausted"
+    ]
+    if len(exhausted) > MAX_EXHAUSTED_DELIVERIES:
+        exhausted.sort(key=lambda item: int(item[1].get("exhausted_at", 0) or 0))
+        remove_count = len(exhausted) - MAX_EXHAUSTED_DELIVERIES
+        for stable_id, _entry in exhausted[:remove_count]:
+            delivery_attempts.pop(stable_id, None)
+        stats = state.setdefault("delivery_stats", {})
+        stats["pruned_exhausted_total"] = int(stats.get("pruned_exhausted_total", 0) or 0) + remove_count
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
     tmp.replace(path)
+
+
+def delivery_attempts_for_state(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    attempts = state.setdefault("delivery_attempts", {})
+    if not isinstance(attempts, dict):
+        attempts = {}
+        state["delivery_attempts"] = attempts
+    return attempts
+
+
+def has_active_delivery_at(state: dict[str, Any], path: Path, line_offset: int) -> bool:
+    expected_path = str(path)
+    for entry in delivery_attempts_for_state(state).values():
+        if not isinstance(entry, dict) or entry.get("status") not in {"attempting", "retry_wait"}:
+            continue
+        try:
+            entry_offset = int(entry.get("line_offset", -1))
+        except (TypeError, ValueError):
+            entry_offset = -1
+        if entry.get("log_path") == expected_path and entry_offset == line_offset:
+            return True
+    return False
+
+
+def delivery_checkpoint(checkpoint: Callable[[], None] | None) -> None:
+    if checkpoint is not None:
+        checkpoint()
+
+
+def mark_delivery_exhausted(
+    state: dict[str, Any],
+    stable_id: str,
+    entry: dict[str, Any],
+    now: int,
+    result: str,
+) -> None:
+    was_exhausted = entry.get("status") == "exhausted"
+    entry.update(
+        {
+            "status": "exhausted",
+            "next_retry_at": None,
+            "exhausted_at": now,
+            "last_result": result,
+        }
+    )
+    delivery_attempts_for_state(state)[stable_id] = entry
+    if not was_exhausted:
+        stats = state.setdefault("delivery_stats", {})
+        stats["exhausted_total"] = int(stats.get("exhausted_total", 0) or 0) + 1
+
+
+def deliver_event_with_bounded_retry(
+    *,
+    state: dict[str, Any],
+    rec: dict[str, Any],
+    notifier: Notifier,
+    log: Logger,
+    event: dict[str, Any],
+    stable_id: str,
+    source: str,
+    path: Path,
+    line_offset: int,
+    line_end: int,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
+    """Deliver once or schedule one delayed retry without ever exceeding two rounds."""
+    now = int(time.time())
+    max_attempts = delivery_max_attempts()
+    retry_delay = delivery_retry_delay_seconds()
+    attempts_by_id = delivery_attempts_for_state(state)
+    raw_entry = attempts_by_id.get(stable_id)
+    entry = raw_entry if isinstance(raw_entry, dict) else {}
+    attempts = max(int(entry.get("attempts", 0) or 0), 0)
+    status = str(entry.get("status") or "")
+
+    if status == "exhausted":
+        rec["offset"] = line_end
+        return "exhausted"
+
+    if status == "attempting":
+        if attempts >= max_attempts:
+            mark_delivery_exhausted(state, stable_id, entry, now, "outcome_unknown_after_restart")
+            rec["offset"] = line_end
+            delivery_checkpoint(checkpoint)
+            log(f"delivery exhausted without another send for {source} {stable_id} after an interrupted attempt")
+            return "exhausted"
+        next_retry_at = max(
+            int(entry.get("next_retry_at", 0) or 0),
+            int(entry.get("last_attempt_at", now) or now) + retry_delay,
+        )
+        if now < next_retry_at:
+            entry["status"] = "retry_wait"
+            entry["next_retry_at"] = next_retry_at
+            attempts_by_id[stable_id] = entry
+            rec["offset"] = line_offset
+            delivery_checkpoint(checkpoint)
+            return "waiting"
+
+    if status == "retry_wait":
+        next_retry_at = int(entry.get("next_retry_at", 0) or 0)
+        if now < next_retry_at:
+            rec["offset"] = line_offset
+            return "waiting"
+
+    if attempts >= max_attempts:
+        mark_delivery_exhausted(state, stable_id, entry, now, "attempt_limit_reached")
+        rec["offset"] = line_end
+        delivery_checkpoint(checkpoint)
+        return "exhausted"
+
+    attempt_number = attempts + 1
+    session_id = str(event.get("thread_id") or event.get("session_id") or "")
+    entry.update(
+        {
+            "status": "attempting",
+            "attempts": attempt_number,
+            "first_attempt_at": int(entry.get("first_attempt_at", now) or now),
+            "last_attempt_at": now,
+            "next_retry_at": None,
+            "last_result": "attempting",
+            "source": source,
+            "event_type": str(event.get("event_type") or ""),
+            "session_id": session_id,
+            "log_path": str(path),
+            "line_offset": line_offset,
+        }
+    )
+    attempts_by_id[stable_id] = entry
+    rec["offset"] = line_offset
+    event["stable_id"] = stable_id
+
+    # Write-ahead is deliberate: a crash cannot reset the retry allowance and create a notification storm.
+    delivery_checkpoint(checkpoint)
+    try:
+        sent = bool(notifier.send(event["notification_title"], event["notification_body"], event))
+    except Exception as exc:  # noqa: BLE001 - a notifier failure consumes this bounded attempt.
+        log(f"notifier raised for {source} {stable_id}: {exc}")
+        sent = False
+    finished_at = int(time.time())
+
+    if sent:
+        state.setdefault("sent", {})[stable_id] = finished_at
+        attempts_by_id.pop(stable_id, None)
+        rec["offset"] = line_end
+        delivery_checkpoint(checkpoint)
+        return "sent"
+
+    entry["last_result"] = "all_channels_failed"
+    if attempt_number < max_attempts:
+        entry["status"] = "retry_wait"
+        entry["next_retry_at"] = finished_at + retry_delay
+        attempts_by_id[stable_id] = entry
+        rec["offset"] = line_offset
+        delivery_checkpoint(checkpoint)
+        log(
+            f"delivery failed for {source} {stable_id}; "
+            f"one final retry scheduled in {retry_delay}s (attempt {attempt_number}/{max_attempts})"
+        )
+        return "retry_scheduled"
+
+    mark_delivery_exhausted(state, stable_id, entry, finished_at, "all_channels_failed")
+    rec["offset"] = line_end
+    delivery_checkpoint(checkpoint)
+    log(f"delivery exhausted for {source} {stable_id} after {attempt_number} attempts; no more automatic sends")
+    return "exhausted"
 
 
 def rollout_files(roots: list[Path]) -> list[Path]:
@@ -721,6 +993,23 @@ def trigger_from_zcode_record(path: Path, offset: int, record: dict[str, Any]) -
     return event
 
 
+def zcode_event_stable_id(event: dict[str, Any], path: Path, line_offset: int) -> str:
+    session_id = str(event.get("session_id") or "")
+    query_id = str(event.get("query_id") or "")
+    input_id = str(event.get("input_id") or "")
+    event_type = str(event.get("event_type") or "")
+    timestamp = str(event.get("timestamp") or "")
+    if query_id:
+        source = f"zcode:{session_id}:{event_type}:query:{query_id}"
+    elif input_id:
+        source = f"zcode:{session_id}:{event_type}:input:{input_id}"
+    elif session_id or timestamp:
+        source = f"zcode:{session_id}:{event_type}:time:{timestamp}"
+    else:
+        source = f"zcode:{path}:{line_offset}:{event_type}"
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+
+
 def load_kimi_session_meta(path: Path) -> dict[str, Any]:
     try:
         session_dir = path.parents[2]
@@ -809,7 +1098,7 @@ def trigger_from_kimi_record(path: Path, offset: int, record: dict[str, Any]) ->
     session_title = str(meta.get("session_title") or "")
     display_name = session_title or (Path(cwd).name if cwd != "(unknown workspace)" else session_id[:12])
     timestamp = record.get("time") or loop_event.get("time")
-    local_time = utc_to_local(str(timestamp) if timestamp else None)
+    local_time = utc_to_local(timestamp)
     stable_source = f"kimi:{session_id}:{meta.get('agent_id')}:{turn_id}:{loop_event.get('step')}"
     event = {
         "event_type": "kimi_turn_completed",
@@ -913,8 +1202,11 @@ def trigger_from_grok_record(path: Path, offset: int, record: dict[str, Any]) ->
     session_title = str(meta.get("session_title") or "")
     display_name = session_title or (Path(cwd).name if cwd != "(unknown workspace)" else session_id[:12])
     timestamp = record.get("ts") or record.get("timestamp")
-    local_time = utc_to_local(str(timestamp) if timestamp else None)
-    stable_source = f"grok:{session_id}:{outcome}:{timestamp}:{offset}"
+    local_time = utc_to_local(timestamp)
+    if timestamp:
+        stable_source = f"grok:{session_id}:{outcome}:{timestamp}"
+    else:
+        stable_source = f"grok:{session_id}:{outcome}:{path}:{offset}"
     event = {
         "event_type": event_type,
         "timestamp": timestamp,
@@ -955,6 +1247,7 @@ def process_file(
     notifier: Notifier,
     extra_types: set[str],
     log: Logger,
+    checkpoint: Callable[[], None] | None = None,
 ) -> int:
     files = state.setdefault("files", {})
     key = str(path)
@@ -974,7 +1267,13 @@ def process_file(
     if subagent_suppressed and not rec.get("subagent_suppression_logged"):
         rec["subagent_suppression_logged"] = True
         log(f"subagent notifications suppressed for {meta.get('thread_id') or path.stem} from {path.name}")
-    if previous_head_hash and current_head_hash and current_head_hash != previous_head_hash and offset > 0:
+    if (
+        previous_head_hash
+        and current_head_hash
+        and current_head_hash != previous_head_hash
+        and offset > 0
+        and not has_active_delivery_at(state, path, offset)
+    ):
         rec["offset"] = size
         rec["size"] = size
         rec["head_hash"] = current_head_hash
@@ -1000,17 +1299,19 @@ def process_file(
                     break
                 if not line.endswith(b"\n"):
                     break
+                line_end = handle.tell()
                 try:
                     record = json.loads(line.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
-                    rec["offset"] = handle.tell()
+                    rec["offset"] = line_end
                     continue
 
                 event = trigger_from_record(path, line_offset, record, extra_types, meta)
-                rec["offset"] = handle.tell()
                 if not event:
+                    rec["offset"] = line_end
                     continue
 
+                stable_id = codex_event_stable_id(event)
                 stale, age, max_age = is_stale_event(event)
                 if stale:
                     skipped = int(rec.get("stale_events_skipped", 0) or 0) + 1
@@ -1021,20 +1322,36 @@ def process_file(
                             f"{event['event_type']} for {event['thread_id']} from {path.name} "
                             f"(age={age:.0f}s, max={max_age:.0f}s)"
                         )
+                    delivery_attempts_for_state(state).pop(stable_id, None)
+                    rec["offset"] = line_end
                     continue
 
-                stable_id = codex_event_stable_id(event)
                 if stable_id in state.setdefault("sent", {}):
+                    delivery_attempts_for_state(state).pop(stable_id, None)
+                    rec["offset"] = line_end
                     continue
 
-                title = event["notification_title"]
-                body = event["notification_body"]
-                if notifier.send(title, body, event):
-                    state["sent"][stable_id] = int(time.time())
+                # Keep rewrite metadata in the same write-ahead checkpoint as the delivery attempt.
+                rec["size"] = size
+                rec["head_hash"] = current_head_hash or file_head_hash(path)
+                outcome = deliver_event_with_bounded_retry(
+                    state=state,
+                    rec=rec,
+                    notifier=notifier,
+                    log=log,
+                    event=event,
+                    stable_id=stable_id,
+                    source="codex",
+                    path=path,
+                    line_offset=line_offset,
+                    line_end=line_end,
+                    checkpoint=checkpoint,
+                )
+                if outcome == "sent":
                     sent_count += 1
                     log(f"sent {event['event_type']} for {event['thread_id']} from {path.name}")
-                else:
-                    log(f"failed to send {event['event_type']} for {event['thread_id']} from {path.name}")
+                elif outcome in {"waiting", "retry_scheduled"}:
+                    break
     except OSError as exc:
         log(f"cannot read {path}: {exc}")
     finally:
@@ -1049,6 +1366,7 @@ def process_zcode_file(
     state: dict[str, Any],
     notifier: Notifier,
     log: Logger,
+    checkpoint: Callable[[], None] | None = None,
 ) -> int:
     files = state.setdefault("files", {})
     key = str(path)
@@ -1074,32 +1392,42 @@ def process_zcode_file(
                     break
                 if not line.endswith(b"\n"):
                     break
+                line_end = handle.tell()
                 try:
                     record = json.loads(line.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
-                    rec["offset"] = handle.tell()
+                    rec["offset"] = line_end
                     continue
 
                 event = trigger_from_zcode_record(path, line_offset, record)
-                rec["offset"] = handle.tell()
                 if not event:
+                    rec["offset"] = line_end
                     continue
 
-                stable_id_src = (
-                    f"{path}:{line_offset}:{event['event_type']}:{event.get('query_id') or event.get('timestamp')}"
-                )
-                stable_id = hashlib.sha256(stable_id_src.encode("utf-8")).hexdigest()[:24]
+                stable_id = zcode_event_stable_id(event, path, line_offset)
                 if stable_id in state.setdefault("sent", {}):
+                    delivery_attempts_for_state(state).pop(stable_id, None)
+                    rec["offset"] = line_end
                     continue
 
-                title = event["notification_title"]
-                body = event["notification_body"]
-                if notifier.send(title, body, event):
-                    state["sent"][stable_id] = int(time.time())
+                outcome = deliver_event_with_bounded_retry(
+                    state=state,
+                    rec=rec,
+                    notifier=notifier,
+                    log=log,
+                    event=event,
+                    stable_id=stable_id,
+                    source="zcode",
+                    path=path,
+                    line_offset=line_offset,
+                    line_end=line_end,
+                    checkpoint=checkpoint,
+                )
+                if outcome == "sent":
                     sent_count += 1
                     log(f"sent {event['event_type']} for {event['session_id']} from {path.name}")
-                else:
-                    log(f"failed to send {event['event_type']} for {event['session_id']} from {path.name}")
+                elif outcome in {"waiting", "retry_scheduled"}:
+                    break
     except OSError as exc:
         log(f"cannot read {path}: {exc}")
     finally:
@@ -1115,6 +1443,7 @@ def process_external_file(
     log: Logger,
     kind: str,
     trigger: Any,
+    checkpoint: Callable[[], None] | None = None,
 ) -> int:
     files = state.setdefault("files", {})
     rec = files.setdefault(str(path), {"offset": 0, "kind": kind})
@@ -1143,17 +1472,22 @@ def process_external_file(
                     break
                 if not line.endswith(b"\n"):
                     break
+                line_end = handle.tell()
                 try:
                     record = json.loads(line.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
-                    rec["offset"] = handle.tell()
+                    rec["offset"] = line_end
                     continue
 
                 event = trigger(path, line_offset, record)
-                rec["offset"] = handle.tell()
                 if not event:
+                    rec["offset"] = line_end
                     continue
 
+                stable_id = str(event.get("stable_id") or "")
+                if not stable_id:
+                    stable_source = f"{kind}:{path}:{line_offset}:{event.get('event_type')}:{event.get('timestamp')}"
+                    stable_id = hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24]
                 stale, age, max_age = is_stale_event(event)
                 if stale:
                     skipped = int(rec.get("stale_events_skipped", 0) or 0) + 1
@@ -1163,21 +1497,33 @@ def process_external_file(
                             f"skipped stale {event['event_type']} for {event.get('session_id')} "
                             f"from {path.name} (age={age:.0f}s, max={max_age:.0f}s)"
                         )
+                    delivery_attempts_for_state(state).pop(stable_id, None)
+                    rec["offset"] = line_end
                     continue
 
-                stable_id = str(event.get("stable_id") or "")
-                if not stable_id:
-                    stable_source = f"{kind}:{path}:{line_offset}:{event.get('event_type')}:{event.get('timestamp')}"
-                    stable_id = hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24]
                 if stable_id in state.setdefault("sent", {}):
+                    delivery_attempts_for_state(state).pop(stable_id, None)
+                    rec["offset"] = line_end
                     continue
 
-                if notifier.send(event["notification_title"], event["notification_body"], event):
-                    state["sent"][stable_id] = int(time.time())
+                outcome = deliver_event_with_bounded_retry(
+                    state=state,
+                    rec=rec,
+                    notifier=notifier,
+                    log=log,
+                    event=event,
+                    stable_id=stable_id,
+                    source=kind.lower().replace(" ", "_"),
+                    path=path,
+                    line_offset=line_offset,
+                    line_end=line_end,
+                    checkpoint=checkpoint,
+                )
+                if outcome == "sent":
                     sent_count += 1
                     log(f"sent {event['event_type']} for {event.get('session_id')} from {path.name}")
-                else:
-                    log(f"failed to send {event['event_type']} for {event.get('session_id')} from {path.name}")
+                elif outcome in {"waiting", "retry_scheduled"}:
+                    break
     except OSError as exc:
         log(f"cannot read {path}: {exc}")
     finally:
@@ -1439,6 +1785,32 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
         print_check("Grok sessions root", grok_root.exists(), str(grok_root))
         print_check("Grok event files", count_paths(grok_event_files(grok_root)) > 0, f"{count_paths(grok_event_files(grok_root))} file(s)")
     print_check("state file", state_path.exists(), str(state_path))
+    delivery_state: dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            delivery_state = load_state(state_path)
+        except (OSError, json.JSONDecodeError):
+            delivery_state = {}
+    delivery_entries = delivery_state.get("delivery_attempts", {})
+    if not isinstance(delivery_entries, dict):
+        delivery_entries = {}
+    waiting_count = sum(
+        1
+        for entry in delivery_entries.values()
+        if isinstance(entry, dict) and entry.get("status") in {"attempting", "retry_wait"}
+    )
+    exhausted_count = sum(
+        1
+        for entry in delivery_entries.values()
+        if isinstance(entry, dict) and entry.get("status") == "exhausted"
+    )
+    print(
+        "Delivery policy: "
+        f"max_attempts={delivery_max_attempts()} retry_delay={delivery_retry_delay_seconds()}s "
+        "(hard cap prevents repeated alerts)"
+    )
+    print_check("pending delivery retries", waiting_count == 0, f"{waiting_count} waiting")
+    print_check("exhausted deliveries", exhausted_count == 0, f"{exhausted_count} recorded")
     print_check("log file", log_path.exists(), str(log_path))
     if platform.system() == "Darwin":
         print_check("LaunchAgent", launch_agent_state() == "running", launch_agent_state())
@@ -1470,48 +1842,7 @@ def replay_file(args: argparse.Namespace, log: Logger) -> int:
     return 0
 
 
-def main() -> int:
-    load_env_file(default_env_path())
-    parser = argparse.ArgumentParser(description="Notify when Codex rollout sessions complete or stop.")
-    parser.add_argument("--sessions-root", action="append", help="Root containing rollout-*.jsonl files.")
-    parser.add_argument("--state", default=os.getenv("CODEX_WATCH_STATE", DEFAULT_STATE), help="State JSON path.")
-    parser.add_argument("--log", default=os.getenv("CODEX_WATCH_LOG", DEFAULT_LOG), help="Log file path.")
-    parser.add_argument("--poll-interval", type=float, default=float(os.getenv("CODEX_WATCH_POLL_INTERVAL", "2")))
-    parser.add_argument("--once", action="store_true", help="Process currently appended data once and exit.")
-    parser.add_argument("--process-existing", action="store_true", help="Do not baseline old files on first run.")
-    parser.add_argument("--include-archived", action="store_true", help="Also scan ~/.codex/archived_sessions.")
-    parser.add_argument("--zcode-log-root", help="Root containing ZCode zcode-*.jsonl log files.")
-    parser.add_argument("--disable-zcode", action="store_true", help="Disable ZCode log notifications.")
-    parser.add_argument("--kimi-sessions-root", help="Root containing Kimi Code session wire.jsonl files.")
-    parser.add_argument("--disable-kimi", action="store_true", help="Disable Kimi Code notifications.")
-    parser.add_argument("--grok-sessions-root", help="Root containing Grok Build session events.jsonl files.")
-    parser.add_argument("--disable-grok", action="store_true", help="Disable Grok Build notifications.")
-    parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them.")
-    parser.add_argument("--verbose", action="store_true", help="Also print log lines to stdout.")
-    parser.add_argument("--test", action="store_true", help="Send one test notification and exit.")
-    parser.add_argument("--test-zcode", action="store_true", help="Send one ZCode test notification and exit.")
-    parser.add_argument("--test-kimi", action="store_true", help="Send one Kimi Code test notification and exit.")
-    parser.add_argument("--test-grok", action="store_true", help="Send one Grok Build test notification and exit.")
-    parser.add_argument("--doctor", action="store_true", help="Check configuration, log roots, and LaunchAgent status.")
-    parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
-    args = parser.parse_args()
-
-    log_path = None if args.dry_run else expand_path(args.log)
-    log = Logger(log_path, verbose=args.verbose or args.dry_run)
-
-    if args.test:
-        return send_test_notification(args, log)
-    if args.test_zcode:
-        return send_zcode_test_notification(args, log)
-    if args.test_kimi:
-        return send_external_test_notification(args, log, "Kimi Code", "kimi")
-    if args.test_grok:
-        return send_external_test_notification(args, log, "Grok Build", "grok")
-    if args.doctor:
-        return doctor(args, log)
-    if args.replay_file:
-        return replay_file(args, log)
-
+def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
     roots = build_roots(args)
     zcode_enabled = zcode_watch_enabled(args)
     zcode_root = build_zcode_log_root(args)
@@ -1519,8 +1850,11 @@ def main() -> int:
     kimi_root = build_kimi_sessions_root(args)
     grok_enabled = grok_watch_enabled(args)
     grok_root = build_grok_sessions_root(args)
-    state_path = expand_path(args.state)
     state = load_state(state_path)
+
+    def checkpoint() -> None:
+        save_state(state_path, state)
+
     did_baseline = False
     if not state.get("initialized") and not args.process_existing:
         baseline_existing_files(state, roots, log)
@@ -1581,29 +1915,96 @@ def main() -> int:
                     "new_file_at": int(time.time()),
                 }
                 log(f"new rollout discovered: {path}")
-            process_file(path, state, notifier, extra_types, log)
+            process_file(path, state, notifier, extra_types, log, checkpoint)
         if zcode_enabled:
             for path in zcode_log_files(zcode_root):
                 if str(path) not in state.setdefault("files", {}):
                     state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time()), "kind": "zcode"}
                     log(f"new ZCode log discovered: {path}")
-                process_zcode_file(path, state, notifier, log)
+                process_zcode_file(path, state, notifier, log, checkpoint)
         if kimi_enabled:
             for path in kimi_wire_files(kimi_root):
                 if str(path) not in state.setdefault("files", {}):
                     state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time()), "kind": "Kimi Code"}
                     log(f"new Kimi Code session discovered: {path}")
-                process_external_file(path, state, notifier, log, "Kimi Code", trigger_from_kimi_record)
+                process_external_file(
+                    path,
+                    state,
+                    notifier,
+                    log,
+                    "Kimi Code",
+                    trigger_from_kimi_record,
+                    checkpoint,
+                )
         if grok_enabled:
             for path in grok_event_files(grok_root):
                 if str(path) not in state.setdefault("files", {}):
                     state["files"][str(path)] = {"offset": 0, "new_file_at": int(time.time()), "kind": "Grok Build"}
                     log(f"new Grok Build session discovered: {path}")
-                process_external_file(path, state, notifier, log, "Grok Build", trigger_from_grok_record)
+                process_external_file(
+                    path,
+                    state,
+                    notifier,
+                    log,
+                    "Grok Build",
+                    trigger_from_grok_record,
+                    checkpoint,
+                )
         save_state(state_path, state)
         if args.once:
             return 0
         time.sleep(max(args.poll_interval, 0.5))
+
+
+def main() -> int:
+    load_env_file(default_env_path())
+    parser = argparse.ArgumentParser(description="Notify when Codex rollout sessions complete or stop.")
+    parser.add_argument("--sessions-root", action="append", help="Root containing rollout-*.jsonl files.")
+    parser.add_argument("--state", default=os.getenv("CODEX_WATCH_STATE", DEFAULT_STATE), help="State JSON path.")
+    parser.add_argument("--log", default=os.getenv("CODEX_WATCH_LOG", DEFAULT_LOG), help="Log file path.")
+    parser.add_argument("--poll-interval", type=float, default=float(os.getenv("CODEX_WATCH_POLL_INTERVAL", "2")))
+    parser.add_argument("--once", action="store_true", help="Process currently appended data once and exit.")
+    parser.add_argument("--process-existing", action="store_true", help="Do not baseline old files on first run.")
+    parser.add_argument("--include-archived", action="store_true", help="Also scan ~/.codex/archived_sessions.")
+    parser.add_argument("--zcode-log-root", help="Root containing ZCode zcode-*.jsonl log files.")
+    parser.add_argument("--disable-zcode", action="store_true", help="Disable ZCode log notifications.")
+    parser.add_argument("--kimi-sessions-root", help="Root containing Kimi Code session wire.jsonl files.")
+    parser.add_argument("--disable-kimi", action="store_true", help="Disable Kimi Code notifications.")
+    parser.add_argument("--grok-sessions-root", help="Root containing Grok Build session events.jsonl files.")
+    parser.add_argument("--disable-grok", action="store_true", help="Disable Grok Build notifications.")
+    parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them.")
+    parser.add_argument("--verbose", action="store_true", help="Also print log lines to stdout.")
+    parser.add_argument("--test", action="store_true", help="Send one test notification and exit.")
+    parser.add_argument("--test-zcode", action="store_true", help="Send one ZCode test notification and exit.")
+    parser.add_argument("--test-kimi", action="store_true", help="Send one Kimi Code test notification and exit.")
+    parser.add_argument("--test-grok", action="store_true", help="Send one Grok Build test notification and exit.")
+    parser.add_argument("--doctor", action="store_true", help="Check configuration, log roots, and LaunchAgent status.")
+    parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
+    args = parser.parse_args()
+
+    log_path = None if args.dry_run else expand_path(args.log)
+    log = Logger(log_path, verbose=args.verbose or args.dry_run)
+
+    if args.test:
+        return send_test_notification(args, log)
+    if args.test_zcode:
+        return send_zcode_test_notification(args, log)
+    if args.test_kimi:
+        return send_external_test_notification(args, log, "Kimi Code", "kimi")
+    if args.test_grok:
+        return send_external_test_notification(args, log, "Grok Build", "grok")
+    if args.doctor:
+        return doctor(args, log)
+    state_path = expand_path(args.state)
+    lock_path = expand_path(os.getenv("CODEX_WATCH_LOCK", str(state_path) + ".lock"))
+    try:
+        with SingleInstanceLock(lock_path):
+            if args.replay_file:
+                return replay_file(args, log)
+            return run_watcher(args, log, state_path)
+    except InstanceLockBusy:
+        log(f"another notifier already holds {lock_path}; exiting without sending", always_stdout=True)
+        return 75
 
 
 if __name__ == "__main__":
