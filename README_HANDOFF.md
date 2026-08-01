@@ -2,7 +2,7 @@
 
 This folder contains a Bark/ntfy notifier for local AI coding agents.
 
-Goal: when a local Codex, ZCode, Kimi Code, or Grok Build task completes, stops, needs attention, or aborts, send a push to the user's devices. Bark is recommended for iPhone and Apple Watch. Public `ntfy.sh` is the current Android-friendly channel for Android phones and wearable notification forwarding.
+Goal: when a local Codex, ZCode, Kimi Code, or Grok Build task completes, stops, needs attention, or aborts, send a push to the user's devices. Bark is recommended for iPhone and Apple Watch. The project self-hosted ntfy service is the Android-friendly channel for Android phones and wearable notification forwarding.
 
 ## Platform Plan
 
@@ -26,13 +26,13 @@ For coworkers, publish three release artifacts and ask them to download the one 
 - `codex-watch-notifier.zsh`: wrapper that loads `~/.codex-watch-notifier/env`.
 - `install_launch_agent.zsh`: installs runtime copies into `~/.codex-watch-notifier/bin` and starts a user LaunchAgent.
 - `uninstall_launch_agent.zsh`: stops/removes the LaunchAgent.
-- `env.example`: template config. Copy it to `~/.codex-watch-notifier/env` and fill in a private Bark URL/key, ntfy topic URL, or webhook.
+- `env.example`: template config. It includes the public official ntfy endpoint; copy it to `~/.codex-watch-notifier/env` and fill in a private Bark URL/key, ntfy publisher token, or webhook.
 - Optional Bark icon/group: set `CODEX_BARK_ICON` and `CODEX_BARK_GROUP`. This repo includes `assets/codex-icon-large-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png`.
 - ZCode Bark settings: set `ZCODE_BARK_ICON` and `ZCODE_BARK_GROUP`. This repo includes `assets/zcode-icon-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/zcode-icon-v1.png`. ZCode notifications watch `~/.zcode/cli/log/zcode-*.jsonl`.
 - Kimi Code and Grok Build use `assets/kimi-icon-v1.png` and `assets/grok-icon-v1.png` as their default Bark icons. Override them with `KIMI_BARK_ICON` or `GROK_BARK_ICON`.
 - Kimi Code watches `~/.kimi-code/sessions/**/agents/main/wire.jsonl`. Its child agents are silent unless `KIMI_WATCH_NOTIFY_SUBAGENTS=1`.
 - Grok Build watches `~/.grok/sessions/**/events.jsonl`. Sessions with `parent_session_id` are silent unless `GROK_WATCH_NOTIFY_SUBAGENTS=1`.
-- ntfy settings: set `NTFY_URL=https://ntfy.sh/<long-random-topic>`. Optional per-tool overrides are `CODEX_NTFY_URL`, `ZCODE_NTFY_URL`, `KIMI_NTFY_URL`, and `GROK_NTFY_URL`. Public ntfy.sh topics are shared secrets; never use short or guessable topic names.
+- ntfy settings: the official endpoint is `NTFY_URL=https://64.90.8.184:9444/agent-watch`. Optional per-tool overrides are `CODEX_NTFY_URL`, `ZCODE_NTFY_URL`, `KIMI_NTFY_URL`, and `GROK_NTFY_URL`. The endpoint/topic is public metadata, while `NTFY_TOKEN` remains private. The server defaults to deny-all and separates write-only publishers from read-only subscribers.
 
 ## What It Monitors
 
@@ -212,7 +212,7 @@ This removes only the LaunchAgent plist. Config and logs remain in `~/.codex-wat
 
 ## Important Notes
 
-- Do not print, commit, or share the Bark URL, Bark key, or ntfy topic URL; they are push tokens.
+- Do not print, commit, or share the Bark URL, Bark key, ntfy token, account password, or authentication database. The official self-hosted ntfy URL/topic is intentionally public.
 - Do not remove first-run EOF baselining; otherwise the target Mac may receive many old Codex completion pushes.
 - Do not raise the hard two-attempt delivery cap or restore immediate retry loops; avoiding repeated phone alerts is a product requirement.
 - Keep `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` enabled unless you explicitly want old rewritten rollout history to be replayed.

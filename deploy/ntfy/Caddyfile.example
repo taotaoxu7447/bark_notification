@@ -1,0 +1,8 @@
+# Append this isolated site block to /etc/caddy/Caddyfile on HK_VPS.
+# Port 443 belongs to sing-box and port 9443 serves the existing subscription site.
+# The persistent nftables policy must allow TCP/UDP 9444; never expose 2586.
+https://64.90.8.184:9444 {
+	header -Server
+	tls /etc/letsencrypt/live/64.90.8.184/fullchain.pem /etc/letsencrypt/live/64.90.8.184/privkey.pem
+	reverse_proxy 127.0.0.1:2586
+}

@@ -1,0 +1,28 @@
+# Public metadata; safe to commit. Credentials and password hashes do not belong here.
+base-url: "https://64.90.8.184:9444"
+listen-http: "127.0.0.1:2586"
+
+# Keep a short offline-delivery window and remove deleted SQLite content eagerly.
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "6h"
+cache-startup-queries: |
+  pragma journal_mode = WAL;
+  pragma synchronous = normal;
+  pragma secure_delete = ON;
+
+auth-file: "/var/lib/ntfy/user.db"
+auth-default-access: "deny-all"
+
+behind-proxy: true
+proxy-forwarded-header: "X-Forwarded-For"
+proxy-trusted-hosts: "127.0.0.1,::1"
+
+# The Android app uses the API directly; no public web console is required.
+web-root: "disable"
+enable-signup: false
+enable-login: false
+require-login: false
+
+message-size-limit: "4k"
+visitor-subscription-limit: 100
+log-level: "info"

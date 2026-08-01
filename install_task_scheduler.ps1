@@ -12,7 +12,7 @@ New-Item -ItemType Directory -Force -Path $ConfigDir, $RuntimeDir | Out-Null
 if (-not (Test-Path $EnvFile)) {
     Copy-Item (Join-Path $ScriptDir "env.example") $EnvFile
     Write-Host "Created $EnvFile"
-    Write-Host "Edit it and set BARK_URL or BARK_KEY, then run this installer again."
+    Write-Host "Edit it and set BARK_URL/BARK_KEY or the private NTFY_TOKEN, then run this installer again."
     exit 0
 }
 

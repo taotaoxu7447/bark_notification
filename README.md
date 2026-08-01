@@ -21,7 +21,7 @@
 
 ## 已支持能力
 
-- **通知通道**：Bark 和 ntfy。iPhone / Apple Watch 推荐 Bark；Android 手机和手环通知转发推荐公共 `ntfy.sh`。
+- **通知通道**：Bark 和 ntfy。iPhone / Apple Watch 推荐 Bark；Android 手机和手环通知转发推荐项目自建 ntfy。
 - **已适配工具**：Codex App / Codex CLI、ZCode、Kimi Code、Grok Build。
 - **主任务优先**：Codex、Kimi Code 和 Grok Build 默认过滤子智能体或子会话事件，只提醒主任务。
 - **分组和标签**：Bark 使用 `group` 和 `icon` 区分工具；ntfy 使用 topic 和 tags 区分来源。
@@ -64,19 +64,23 @@ BARK_KEY=<your-key>
 ### Android / 手环：ntfy
 
 1. 在 Android 手机上安装 ntfy 客户端。
-2. 订阅一个长随机 topic，例如 `agent-xutao-9f3a7c2e8b1d`。
-3. 确认 Android 通知权限、锁屏通知和手环通知转发已经打开。
-4. 在电脑配置文件里填写公共 ntfy.sh URL：
+2. 添加项目自建服务器 `https://64.90.8.184:9444`。
+3. 使用管理员私下提供的只读订阅账号登录，并订阅 `agent-watch`。
+4. 确认 Android 通知权限、锁屏通知、后台运行和手环通知转发已经打开。
+5. 在电脑配置文件里保留正式地址，并填入管理员私下提供的只写 publisher token：
 
 ```bash
-NTFY_URL=https://ntfy.sh/<long-random-topic>
+NTFY_URL=https://64.90.8.184:9444/agent-watch
+NTFY_TOKEN=<publisher-token>
 NTFY_PRIORITY=default
 NTFY_TAGS=computer,robot
 ```
 
-公共 `ntfy.sh` 的 topic 要当成密钥使用。不要用 `codex`、`work`、`ai` 这种短 topic；别人只要知道 topic，就可能订阅或发送消息。
+正式 URL 和 topic 是项目公开元数据，因此会直接保存在本仓库；它们本身不是授权凭据。服务端默认拒绝匿名访问，发送账号只有该 topic 的写权限，订阅账号只有读权限。`NTFY_TOKEN`、账号密码和服务端认证数据库仍然是密钥，绝不能提交到 GitHub。
 
-不要把真实的 Bark URL、Bark key、ntfy topic、webhook 地址提交到 GitHub。它们属于个人密钥。
+旧安装不会被安装脚本覆盖私有 env，需要手动更新 `~/.codex-watch-notifier/env` 中的 `NTFY_URL` 和 `NTFY_TOKEN`。如果改用公共 `ntfy.sh`，topic 仍要当成共享密钥并使用长随机值。
+
+不要把真实的 Bark URL、Bark key、ntfy token、账号密码或 webhook 地址提交到 GitHub。它们属于个人密钥。
 
 ## 新电脑安装
 
@@ -188,8 +192,8 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 | `KIMI_BARK_ICON` | Kimi Code 通知图标 URL；默认使用仓库内的 Kimi 官方 App 图案适配版 |
 | `GROK_BARK_GROUP` | Grok Build 通知分组，默认 `Grok Build` |
 | `GROK_BARK_ICON` | Grok Build 通知图标 URL；默认使用仓库内的 Grok 官方 App 图案适配版 |
-| `NTFY_URL` | ntfy 推送地址，例如 `https://ntfy.sh/<long-random-topic>` |
-| `NTFY_TOKEN` | ntfy 认证 token；公共 `ntfy.sh` 通常留空 |
+| `NTFY_URL` | ntfy 推送地址；项目默认是 `https://64.90.8.184:9444/agent-watch` |
+| `NTFY_TOKEN` | ntfy 写入 token；由管理员私下发放，绝不能提交 |
 | `NTFY_PRIORITY` | ntfy 优先级，默认 `default` |
 | `NTFY_TAGS` | ntfy 标签，例如 `computer,robot` |
 | `CODEX_NTFY_URL` | Codex 专用 ntfy URL；留空则使用 `NTFY_URL` |
@@ -284,7 +288,7 @@ NOTIFY_BODY_MAX_CHARS=0
 
 - 首次运行不推送旧历史。
 - 只推送明确的完成、失败、等待人工或中断事件。
-- 不把 API key、Bark key、ntfy topic、公司内部 token 写进仓库。
+- 不把 API key、Bark key、ntfy token、账号密码或公司内部 token 写进仓库；项目正式 ntfy URL/topic 可以公开。
 - 通知正文必须受 `NOTIFY_INCLUDE_WORKSPACE`、`NOTIFY_INCLUDE_MESSAGE`、`NOTIFY_BODY_MAX_CHARS` 控制。
 - 新工具默认不要破坏 Codex、ZCode、Kimi Code 和 Grok Build 已有行为。
 - Windows、Ubuntu、macOS 至少要能优雅地跳过不存在的日志目录。
@@ -309,7 +313,7 @@ python3 codex_watch_notifier.py --test-grok
 
 - 小步提交，一次只适配一个工具或修一个明确问题。
 - 提交信息说明用户可见变化，例如 `Add Claude Code CLI watcher`。
-- 不提交 `~/.codex-watch-notifier/env`、个人 token、真实 Bark URL、真实 ntfy topic、公司内部 webhook。
+- 不提交 `~/.codex-watch-notifier/env`、个人 token、真实 Bark URL、ntfy 账号密码、认证数据库或公司内部 webhook。
 - 修改三端安装脚本时，至少说明自己在哪个系统上验证过。
 - 如果不确定日志格式是否稳定，在 README 里把该 watcher 标成实验支持。
 
@@ -362,8 +366,9 @@ Windows：
 
 ## 当前边界
 
-- iPhone / Apple Watch 推荐 Bark；Android / 手环通知转发推荐公共 `ntfy.sh`。
-- 公共 `ntfy.sh` 只适合个人或小规模内部试用，topic 必须长随机；公司大规模推广时建议再评估自建 ntfy。
+- iPhone / Apple Watch 推荐 Bark；Android / 手环通知转发推荐项目自建 ntfy。
+- 项目自建 ntfy 的正式 URL/topic 公开，但访问必须认证；publisher 与 subscriber 凭据严格分离。
+- 当前正式 topic 是共享通知流；接入更多同事前，如果不应互相看到任务提醒，应为每位用户分配独立 topic 和最小权限 ACL。
 - 飞书、个人微信、企业微信等还没有作为正式主线启用。
 - Claude Code CLI、Trae、Cursor、VS Code Claude Code 插件等还需要同事提供本机日志样例后再适配。
 - 这个工具只做本机监听和推送，不负责启动、控制或接管 AI 编程助手。

@@ -1,0 +1,9 @@
+# Install as /etc/systemd/system/ntfy.service.d/hardening.conf.
+[Service]
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/cache/ntfy /var/lib/ntfy
+AmbientCapabilities=
+CapabilityBoundingSet=

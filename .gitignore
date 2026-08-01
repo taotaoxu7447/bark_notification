@@ -1,4 +1,9 @@
 env.preconfigured
+.env
+env
+*.secret
+*.db
+secrets/
 __pycache__/
 *.pyc
 .DS_Store
