@@ -2,6 +2,9 @@
 
 The project should ship three platform-specific internal packages. The Python monitor stays shared; each package only differs in launcher and background service setup.
 
+The Android receiver is a fourth, separately signed artifact. Its long-lived APK
+signing key is not part of the platform packages and must never enter Git.
+
 ## Shared Core
 
 All packages include:
@@ -124,3 +127,5 @@ Before each internal release:
 4. Confirm first-run baseline does not replay old Codex, ZCode, Kimi Code, or Grok Build history.
 5. Build all three package files from the same git commit.
 6. Tag the commit, for example `v0.1.0-internal`.
+7. Run `android/build_release.zsh`, verify the APK signature/application ID, and
+   publish `AgentWatch-android-<version>.apk` from the same commit.

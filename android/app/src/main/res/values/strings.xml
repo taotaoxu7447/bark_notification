@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AgentWatch</string>
+    <string name="connection_channel_name">连接状态</string>
+    <string name="connection_channel_description">保持任务提醒的 WebSocket 实时连接</string>
+    <string name="source_group_name">任务来源</string>
+    <string name="account_and_device">%1$s · %2$s</string>
+</resources>

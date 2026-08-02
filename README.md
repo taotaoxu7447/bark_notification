@@ -15,13 +15,15 @@
 醒来代码已新晴
 ```
 
-这是一个面向 AI 编程助手的本地任务提醒器。它会在本机持续监听已支持工具的日志或会话文件，当 AI 任务完成、停止、需要人工处理或异常中断时，通过 Bark 或 ntfy 推送到你的随身设备。
+这是一个面向 AI 编程助手的本地任务提醒器。它会在本机持续监听已支持工具的日志或会话文件，当 AI 任务完成、停止、需要人工处理或异常中断时，通过 Bark 或自研 Android 客户端 AgentWatch 推送到你的随身设备。
 
 项目当前优先服务内部同事使用：先让大家在自己的 macOS、Ubuntu、Windows 工作环境里稳定收到提醒；如果某个同事使用的工具还没适配，可以按本文档添加 watcher 后直接提交到主分支。
 
 ## 已支持能力
 
-- **通知通道**：Bark 和 ntfy。iPhone / Apple Watch 推荐 Bark；Android 手机和手环通知转发推荐项目自建 ntfy。
+- **通知通道**：iPhone / Apple Watch 使用 Bark；Android 使用项目自研 AgentWatch，通过自建 ntfy 的鉴权 WebSocket 实时接收。
+- **Android 一次登录**：服务器地址、topic 和连接方式已内置，用户只需用邀请代码注册一次，后续自动连接。
+- **Android 来源分组**：Codex、ZCode、Kimi Code、Grok Build 使用独立通知频道和定制图标，手机系统可分别管理。
 - **已适配工具**：Codex App / Codex CLI、ZCode、Kimi Code、Grok Build。
 - **主任务优先**：Codex、Kimi Code 和 Grok Build 默认过滤子智能体或子会话事件，只提醒主任务。
 - **分组和标签**：Bark 使用 `group` 和 `icon` 区分工具；ntfy 使用 topic 和 tags 区分来源。
@@ -31,7 +33,7 @@
 - **隐私开关**：可以关闭工作目录和消息摘要，避免把敏感内容推送到手机。
 - **历史抑制**：首次启动会建立基线，默认不会把旧日志里的历史任务重新推送一遍。
 
-代码里仍保留了通用 webhook、企业微信 webhook、命令行回调等预留入口，但当前推荐路径是 Bark。飞书、个人微信、企业定制 IM 需要确认公司环境后再决定是否启用。
+代码里仍保留了通用 webhook、企业微信 webhook、命令行回调等预留入口；当前推荐路径是 iOS 使用 Bark、Android 使用 AgentWatch。飞书、个人微信、企业定制 IM 需要确认公司环境后再决定是否启用。
 
 ## 适用场景
 
@@ -42,7 +44,7 @@
 3. AI 任务完成、卡住或需要确认时，手机、手表或其他通知客户端设备收到提醒。
 4. 回到对应电脑继续处理。
 
-它不是云端服务，不需要把代码上传到第三方。监听和判断都发生在你自己的电脑上。
+任务监听和判断都发生在你自己的电脑上，不需要上传代码。通知正文只经过你选择的 Bark 通道或项目自建的 ntfy 中继；自建 Android 路径不会把代码交给第三方任务处理服务。
 
 ## 随身设备准备
 
@@ -61,14 +63,19 @@ BARK_URL=https://api.day.app/<your-key>
 BARK_KEY=<your-key>
 ```
 
-### Android / 手环：ntfy
+### Android / 手环：AgentWatch
 
-1. 在 Android 手机上安装 ntfy 客户端。
-2. 添加项目自建服务器 `https://64.90.8.184:9444`。
-3. 使用管理员私下提供的只读订阅账号登录，并订阅 `agent-watch`。
-4. 确认 Android 通知权限、锁屏通知、后台运行和手环通知转发已经打开。
-5. 在 ColorOS 等带额外后台管控的系统上，把 ntfy 的“耗电管理”设为“完全允许后台行为”；仅加入电池优化白名单仍可能被系统冻结。按客户端提示启用 WebSocket，并确认常驻通知显示已订阅实时推送主题。
-6. 在电脑配置文件里保留正式地址，并填入管理员私下提供的只写 publisher token：
+1. 安装 GitHub Release 中的 `AgentWatch-android-<version>.apk`，打开后允许通知。
+2. 新用户输入管理员私下提供的邀请代码、账号和至少 12 位密码，点“注册并连接”；已有账号直接登录。服务器地址和 WebSocket topic 已内置，不需要手工添加订阅。
+3. 确认首页显示“已连接”，再按页面按钮把自启动和耗电管理设为“完全允许后台行为”。这些 Android 系统确认必须由用户亲自完成。
+4. 如果需要手环或手表震动，在手机的穿戴设备 App 中允许转发 AgentWatch 通知；手环本身不需要安装 AgentWatch。
+5. “端到端测试”只投递到发起测试的当前设备，不会让同 topic 的其他手机一起响；服务器只记录短期送达事件 ID，不保存通知正文。
+
+如果手机以前还订阅了同一 topic 的官方 ntfy 客户端，请先停用旧订阅，否则两个不同 App 会各显示一条通知；单个 App 内部的去重无法替另一个 App 消除通知。
+
+当前 `0.1.x` 使用一个受 ACL 保护的共享广播 topic：所有获邀账号都能收到该 topic 的完整通知正文。因此它只适合彼此完全互信、原本就应该共享这些任务提醒的团队。若不同用户必须隔离正文，应先升级为 per-user topic/ACL，再发放邀请代码。
+
+电脑端仍需保留正式发送地址，并填入管理员私下提供的只写 publisher token：
 
 ```bash
 NTFY_URL=https://64.90.8.184:9444/agent-watch
@@ -79,7 +86,7 @@ NTFY_TAGS=computer,robot
 
 正式 URL 和 topic 是项目公开元数据，因此会直接保存在本仓库；它们本身不是授权凭据。服务端默认拒绝匿名访问，发送账号只有该 topic 的写权限，订阅账号只有读权限。`NTFY_TOKEN`、账号密码和服务端认证数据库仍然是密钥，绝不能提交到 GitHub。
 
-旧安装不会被安装脚本覆盖私有 env，需要手动更新 `~/.codex-watch-notifier/env` 中的 `NTFY_URL` 和 `NTFY_TOKEN`。如果改用公共 `ntfy.sh`，topic 仍要当成共享密钥并使用长随机值。
+AgentWatch 的 Android 源码、构建和签名说明见 [`android/README.md`](android/README.md)，注册服务部署说明见 [`deploy/agentwatch-registration/README.md`](deploy/agentwatch-registration/README.md)。旧电脑安装不会被安装脚本覆盖私有 env，需要手动更新 `~/.codex-watch-notifier/env` 中的 `NTFY_URL` 和 `NTFY_TOKEN`。
 
 不要把真实的 Bark URL、Bark key、ntfy token、账号密码或 webhook 地址提交到 GitHub。它们属于个人密钥。
 
@@ -197,6 +204,7 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 | `NTFY_TOKEN` | ntfy 写入 token；由管理员私下发放，绝不能提交 |
 | `NTFY_PRIORITY` | ntfy 优先级，默认 `default` |
 | `NTFY_TAGS` | ntfy 标签，例如 `computer,robot` |
+| `AGENT_WATCH_PUBLISHER_ID` | 可选的发送电脑稳定标识；留空时首次启动会在本机生成，不是密钥 |
 | `CODEX_NTFY_URL` | Codex 专用 ntfy URL；留空则使用 `NTFY_URL` |
 | `CODEX_NTFY_TAGS` | Codex 专用 ntfy 标签 |
 | `ZCODE_NTFY_URL` | ZCode 专用 ntfy URL；留空则使用 `NTFY_URL` |
@@ -241,6 +249,7 @@ NOTIFY_BODY_MAX_CHARS=0
 - watcher 会对状态文件持有系统级单实例锁；旧服务未退出时，新实例会直接退出且不发送，避免两个进程各自重复投递。
 - 第一次启动默认只建立基线，不回放旧历史。
 - 每个事件最多自动投递两次；第一次完全失败后至少等待 30 秒再补投一次，计数会先写入状态文件，服务重启也不会重置。两次都失败时停止自动发送并在 `--doctor` 中留下记录，避免无限重试造成通知轰炸。
+- ntfy 投递会携带稳定 `X-Sequence-ID` 和 `source_*` 标签。Android 即使收到发送端的第二次补投，也只会更新同一系统通知，不会再次响铃；断线续传重放的同秒副本也由持久事件键吸收。
 - Bark 通知使用事件的稳定 ID；补投时复用同一 Bark `id`，让支持该能力的 Bark 客户端和服务端折叠或更新同一条通知。它是第二层防重复保护，不替代本地状态去重。
 - Codex 5.6 创建的子智能体 rollout 默认静默，只提醒主会话最终完成、等待人工或中止；排障时可设置 `CODEX_WATCH_NOTIFY_SUBAGENTS=1` 恢复全部提醒。
 - Kimi Code 的非 `main` agent 和带 `parent_session_id` 的 Grok 子会话也默认静默，可分别通过对应的 `*_NOTIFY_SUBAGENTS=1` 临时开启。
@@ -341,7 +350,16 @@ python3 codex_watch_notifier.py --test-grok
 - `codex-watch-notifier-ubuntu-v0.1.0-internal.tar.gz`
 - `codex-watch-notifier-windows-v0.1.0-internal.zip`
 
-每次发布建议从同一个 git commit 构建三端包。
+Android 正式 APK 在 `android/` 内使用长期发布密钥单独构建：
+
+```bash
+cd android
+./build_release.zsh
+```
+
+产物是 `android/app/build/outputs/apk/release/app-release.apk`。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
+
+每次发布建议从同一个 git commit 构建三种电脑端安装包和 Android APK。
 
 ## 卸载
 
@@ -367,7 +385,7 @@ Windows：
 
 ## 当前边界
 
-- iPhone / Apple Watch 推荐 Bark；Android / 手环通知转发推荐项目自建 ntfy。
+- iPhone / Apple Watch 推荐 Bark；Android / 手环通知转发推荐 AgentWatch，底层使用项目自建 ntfy。
 - 项目自建 ntfy 的正式 URL/topic 公开，但访问必须认证；publisher 与 subscriber 凭据严格分离。
 - 当前正式 topic 是共享通知流；接入更多同事前，如果不应互相看到任务提醒，应为每位用户分配独立 topic 和最小权限 ACL。
 - 飞书、个人微信、企业微信等还没有作为正式主线启用。

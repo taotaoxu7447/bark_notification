@@ -66,6 +66,46 @@ class NotifierDeliveryContractTests(unittest.TestCase):
         payload = urllib.parse.parse_qs(encoded_payload.decode("utf-8"))
         self.assertEqual(["agent-watch-stable-123"], payload["id"])
 
+    def test_ntfy_payload_carries_stable_sequence_and_source(self) -> None:
+        environment = {
+            "NTFY_URL": "https://example.invalid/agent-watch",
+            "NTFY_TOKEN": "publisher-token",
+            "AGENT_WATCH_PUBLISHER_ID": "mac-a1b2",
+        }
+        event = {
+            "event_type": "kimi_turn_completed",
+            "stable_id": "abc123",
+            "ntfy_tags": "robot,computer",
+        }
+        with mock.patch.dict(os.environ, environment, clear=False):
+            delivery = notifier.Notifier(False, notifier.Logger(None))
+            with mock.patch.object(delivery, "_http_post", return_value=True) as http_post:
+                sent = delivery._send_ntfy("Kimi Code 已完成", "body", event)
+
+        self.assertTrue(sent)
+        url, _payload, _content_type, headers = http_post.call_args.args
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        self.assertEqual(["aw1_mac-a1b2_abc123"], [headers["X-Sequence-ID"]])
+        self.assertIn("agentwatch_v1", query["tags"][0])
+        self.assertIn("source_kimi", query["tags"][0])
+        self.assertEqual("Bearer publisher-token", headers["Authorization"])
+
+    def test_ntfy_retry_reuses_the_same_sequence_id(self) -> None:
+        event = {"event_type": "codex_task_complete", "stable_id": "same-event"}
+        with mock.patch.dict(
+            os.environ,
+            {
+                "NTFY_URL": "https://example.invalid/agent-watch",
+                "AGENT_WATCH_PUBLISHER_ID": "host-01",
+            },
+            clear=False,
+        ):
+            first = notifier.ntfy_sequence_id(event)
+            second = notifier.ntfy_sequence_id(event)
+
+        self.assertEqual("aw1_host-01_same-event", first)
+        self.assertEqual(first, second)
+
     def test_epoch_millisecond_timestamp_is_rendered_as_local_time(self) -> None:
         rendered = notifier.utc_to_local(1_785_282_889_000)
 

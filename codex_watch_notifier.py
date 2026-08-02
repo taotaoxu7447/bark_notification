@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import secrets
 import subprocess
 import sys
 import time
@@ -24,6 +25,13 @@ DEFAULT_SESSION_INDEX = "~/.codex/session_index.jsonl"
 DEFAULT_ZCODE_LOG_ROOT = "~/.zcode/cli/log"
 DEFAULT_KIMI_SESSIONS_ROOT = "~/.kimi-code/sessions"
 DEFAULT_GROK_SESSIONS_ROOT = "~/.grok/sessions"
+DEFAULT_PUBLISHER_ID_FILE = "~/.codex-watch-notifier/publisher-id"
+DEFAULT_CODEX_BARK_ICON = (
+    "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png"
+)
+DEFAULT_ZCODE_BARK_ICON = (
+    "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/zcode-icon-v1.png"
+)
 DEFAULT_KIMI_BARK_ICON = (
     "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/kimi-icon-v1.png"
 )
@@ -39,6 +47,7 @@ DEFAULT_DELIVERY_RETRY_DELAY_SECONDS = 60
 MIN_DELIVERY_RETRY_DELAY_SECONDS = 30
 MAX_DELIVERY_RETRY_DELAY_SECONDS = 86400
 MAX_EXHAUSTED_DELIVERIES = 500
+NTFY_PROTOCOL_VERSION = 1
 
 
 def expand_path(value: str) -> Path:
@@ -124,6 +133,82 @@ def delivery_max_attempts() -> int:
 def delivery_retry_delay_seconds() -> int:
     configured = env_int("NOTIFY_DELIVERY_RETRY_DELAY_SECONDS", DEFAULT_DELIVERY_RETRY_DELAY_SECONDS)
     return min(max(configured, MIN_DELIVERY_RETRY_DELAY_SECONDS), MAX_DELIVERY_RETRY_DELAY_SECONDS)
+
+
+def _safe_protocol_identifier(value: str, limit: int) -> str:
+    normalized = "".join(character.lower() for character in value if character.isalnum() or character in {"_", "-"})
+    return normalized[:limit]
+
+
+def publisher_instance_id() -> str:
+    """Return a stable, non-secret ID so different publisher machines cannot collide."""
+    configured = _safe_protocol_identifier(os.getenv("AGENT_WATCH_PUBLISHER_ID", "").strip(), 24)
+    if configured:
+        return configured
+
+    path = expand_path(os.getenv("AGENT_WATCH_PUBLISHER_ID_FILE", DEFAULT_PUBLISHER_ID_FILE))
+    try:
+        existing = _safe_protocol_identifier(path.read_text(encoding="utf-8").strip(), 24)
+        if existing:
+            return existing
+    except OSError:
+        pass
+
+    generated = secrets.token_hex(6)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(generated + "\n")
+        return generated
+    except FileExistsError:
+        try:
+            existing = _safe_protocol_identifier(path.read_text(encoding="utf-8").strip(), 24)
+            if existing:
+                return existing
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+    # A read-only home directory should not stop notifications. This fallback is
+    # stable on one account but reveals neither the hostname nor the home path.
+    fallback_source = f"{platform.node()}:{Path.home()}"
+    return hashlib.sha256(fallback_source.encode("utf-8")).hexdigest()[:12]
+
+
+def ntfy_source(event: dict[str, Any]) -> str:
+    prefix = str(event.get("event_type") or "").partition("_")[0].lower()
+    return prefix if prefix in {"codex", "zcode", "kimi", "grok"} else "codex"
+
+
+def ntfy_sequence_id(event: dict[str, Any]) -> str:
+    stable_id = _safe_protocol_identifier(str(event.get("stable_id") or ""), 40)
+    if not stable_id:
+        return ""
+    return f"aw{NTFY_PROTOCOL_VERSION}_{publisher_instance_id()}_{stable_id}"
+
+
+def ntfy_tags_with_protocol(raw_tags: str, event: dict[str, Any]) -> str:
+    tags = [part.strip() for part in raw_tags.split(",") if part.strip()]
+    protocol_tags = [f"agentwatch_v{NTFY_PROTOCOL_VERSION}", f"source_{ntfy_source(event)}"]
+    for tag in protocol_tags:
+        if tag not in tags:
+            tags.append(tag)
+    return ",".join(tags)
+
+
+def ntfy_icon(event: dict[str, Any]) -> str:
+    source = ntfy_source(event)
+    defaults = {
+        "codex": DEFAULT_CODEX_BARK_ICON,
+        "zcode": DEFAULT_ZCODE_BARK_ICON,
+        "kimi": DEFAULT_KIMI_BARK_ICON,
+        "grok": DEFAULT_GROK_BARK_ICON,
+    }
+    configured = str(event.get("bark_icon") or os.getenv(f"{source.upper()}_BARK_ICON", "") or defaults[source]).strip()
+    parsed = urllib.parse.urlparse(configured)
+    return configured if parsed.scheme in {"http", "https"} and parsed.netloc else ""
 
 
 def parse_timestamp(value: Any) -> dt.datetime | None:
@@ -422,6 +507,7 @@ class Notifier:
             or os.getenv(f"{prefix}_NTFY_TAGS", "").strip()
             or os.getenv("NTFY_TAGS", "").strip()
         )
+        tags = ntfy_tags_with_protocol(tags, event)
         query_params = {"title": title}
         if priority:
             query_params["priority"] = priority
@@ -437,6 +523,16 @@ class Notifier:
                 headers["Authorization"] = token
             else:
                 headers["Authorization"] = f"Bearer {token}"
+
+        sequence_id = ntfy_sequence_id(event)
+        if sequence_id:
+            # ntfy relays sequence_id to WebSocket subscribers. A delayed HTTP
+            # retry therefore updates the same logical event instead of ringing
+            # the Android client twice.
+            headers["X-Sequence-ID"] = sequence_id
+        icon = ntfy_icon(event)
+        if icon:
+            headers["X-Icon"] = icon
 
         return self._http_post(url, body.encode("utf-8"), "text/plain; charset=utf-8", headers)
 

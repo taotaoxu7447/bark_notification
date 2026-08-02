@@ -1,0 +1,28 @@
+# Replace the existing single reverse_proxy in the HK_VPS :9444 site with the
+# ordered `handle` blocks below. The API path is kept intact upstream.
+https://64.90.8.184:9444 {
+	header -Server
+	tls /etc/letsencrypt/live/64.90.8.184/fullchain.pem /etc/letsencrypt/live/64.90.8.184/privkey.pem
+
+	# ntfy v2.26.3 account tokens can enumerate, create, and revoke every
+	# token on their shared account. The custom WebSocket client does not use
+	# this API, so it must never be exposed for subscriber tokens.
+	handle /v1/account* {
+		respond 404
+	}
+
+	handle /agentwatch/api/v1/* {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy 127.0.0.1:2587 {
+			# Overwrite, rather than append to, any client-supplied value. The
+			# loopback API trusts this header for its per-IP rate limit.
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:2586
+	}
+}

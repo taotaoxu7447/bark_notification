@@ -9,3 +9,11 @@ __pycache__/
 .DS_Store
 dist/
 .worktrees/
+android/.gradle/
+android/.idea/
+android/local.properties
+android/**/build/
+*.jks
+*.keystore
+*.p12
+android/signing.properties

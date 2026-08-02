@@ -2,7 +2,7 @@
 
 This folder contains a Bark/ntfy notifier for local AI coding agents.
 
-Goal: when a local Codex, ZCode, Kimi Code, or Grok Build task completes, stops, needs attention, or aborts, send a push to the user's devices. Bark is recommended for iPhone and Apple Watch. The project self-hosted ntfy service is the Android-friendly channel for Android phones and wearable notification forwarding.
+Goal: when a local Codex, ZCode, Kimi Code, or Grok Build task completes, stops, needs attention, or aborts, send a push to the user's devices. Bark is recommended for iPhone and Apple Watch. Android uses the custom AgentWatch app over the project self-hosted ntfy WebSocket.
 
 ## Platform Plan
 
@@ -26,13 +26,15 @@ For coworkers, publish three release artifacts and ask them to download the one 
 - `codex-watch-notifier.zsh`: wrapper that loads `~/.codex-watch-notifier/env`.
 - `install_launch_agent.zsh`: installs runtime copies into `~/.codex-watch-notifier/bin` and starts a user LaunchAgent.
 - `uninstall_launch_agent.zsh`: stops/removes the LaunchAgent.
-- `env.example`: template config. It includes the public official ntfy endpoint; copy it to `~/.codex-watch-notifier/env` and fill in a private Bark URL/key, ntfy publisher token, or webhook.
+- `env.example`: template config. It includes the public self-hosted ntfy endpoint; copy it to `~/.codex-watch-notifier/env` and fill in a private Bark URL/key, ntfy publisher token, or webhook.
+- `android/`: custom Android receiver, persistent event dedupe/ACK outbox, source channels/icons, and release build script.
+- `deploy/agentwatch-registration/`: loopback registration/login/logout/test/ACK API plus Caddy and systemd examples.
 - Optional Bark icon/group: set `CODEX_BARK_ICON` and `CODEX_BARK_GROUP`. This repo includes `assets/codex-icon-large-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png`.
 - ZCode Bark settings: set `ZCODE_BARK_ICON` and `ZCODE_BARK_GROUP`. This repo includes `assets/zcode-icon-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/zcode-icon-v1.png`. ZCode notifications watch `~/.zcode/cli/log/zcode-*.jsonl`.
 - Kimi Code and Grok Build use `assets/kimi-icon-v1.png` and `assets/grok-icon-v1.png` as their default Bark icons. Override them with `KIMI_BARK_ICON` or `GROK_BARK_ICON`.
 - Kimi Code watches `~/.kimi-code/sessions/**/agents/main/wire.jsonl`. Its child agents are silent unless `KIMI_WATCH_NOTIFY_SUBAGENTS=1`.
 - Grok Build watches `~/.grok/sessions/**/events.jsonl`. Sessions with `parent_session_id` are silent unless `GROK_WATCH_NOTIFY_SUBAGENTS=1`.
-- ntfy settings: the official endpoint is `NTFY_URL=https://64.90.8.184:9444/agent-watch`. Optional per-tool overrides are `CODEX_NTFY_URL`, `ZCODE_NTFY_URL`, `KIMI_NTFY_URL`, and `GROK_NTFY_URL`. The endpoint/topic is public metadata, while `NTFY_TOKEN` remains private. The server defaults to deny-all and separates write-only publishers from read-only subscribers.
+- ntfy settings: the self-hosted endpoint is `NTFY_URL=https://64.90.8.184:9444/agent-watch`. Optional per-tool overrides are `CODEX_NTFY_URL`, `ZCODE_NTFY_URL`, `KIMI_NTFY_URL`, and `GROK_NTFY_URL`. The endpoint/topic is public metadata, while `NTFY_TOKEN` remains private. The server defaults to deny-all and separates write-only publishers from read-only subscribers.
 
 ## What It Monitors
 
@@ -200,6 +202,8 @@ Keep these enabled only when the extra context is useful and acceptable for your
 
 Delivery retries are deliberately bounded. One event is sent at most twice, with a persisted delay before the second attempt. Bark receives the same stable `id` on both attempts so a retry updates or collapses the same notification where supported. Exhausted deliveries are recorded for `--doctor`; they are never retried in a loop.
 
+ntfy receives a stable `X-Sequence-ID`, protocol/source tags, and a public icon URL. AgentWatch persists the event key before notifying, uses timestamp-based WebSocket resume, and maintains a metadata-only ACK outbox. A server test carries a hashed target tag so only the initiating installation displays it. Do not remove these controls: preventing duplicate audible notifications is a product requirement.
+
 The long-running watcher and `--once`/`--replay-file` processing hold an OS-backed lock next to the state file. A second process exits without sending, so an installer restart or manual command cannot multiply the two-attempt allowance.
 
 ## Uninstall
@@ -215,5 +219,6 @@ This removes only the LaunchAgent plist. Config and logs remain in `~/.codex-wat
 - Do not print, commit, or share the Bark URL, Bark key, ntfy token, account password, or authentication database. The official self-hosted ntfy URL/topic is intentionally public.
 - Do not remove first-run EOF baselining; otherwise the target Mac may receive many old Codex completion pushes.
 - Do not raise the hard two-attempt delivery cap or restore immediate retry loops; avoiding repeated phone alerts is a product requirement.
+- The current Android release is a trusted shared-broadcast design: every invited account can read the same `agent-watch` topic. Do not invite mutually untrusted users without first implementing per-user topics and ACLs.
 - Keep `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` enabled unless you explicitly want old rewritten rollout history to be replayed.
 - If this Mac stores Codex rollout files somewhere other than `~/.codex/sessions`, find the actual `rollout-*.jsonl` location and set `--sessions-root` by adapting the LaunchAgent/wrapper.

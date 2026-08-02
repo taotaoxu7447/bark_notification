@@ -1,0 +1,61 @@
+[Unit]
+Description=AgentWatch registration and acknowledgement API
+After=network.target ntfy.service
+Requires=ntfy.service
+
+[Service]
+Type=simple
+User=ntfy
+Group=ntfy
+WorkingDirectory=/opt/agentwatch-registration
+ExecStart=/usr/bin/python3 -I /opt/agentwatch-registration/server.py
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/agentwatch-registration/service.env
+
+# StateDirectory creates /var/lib/agentwatch-registration owned by ntfy.
+StateDirectory=agentwatch-registration
+StateDirectoryMode=0700
+UMask=0077
+
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+
+# The service runs as ntfy because `ntfy token add` must update ntfy's auth DB.
+# Its only writable paths are its SQLite state and the existing ntfy state.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/agentwatch-registration /var/lib/ntfy
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# This unit shares the existing ntfy Unix account. RemoveIPC must stay off so
+# stopping AgentWatch cannot remove IPC objects owned by ntfy.service.
+RemoveIPC=false
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+IPAddressDeny=any
+IPAddressAllow=localhost
+TasksMax=64
+MemoryMax=256M
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

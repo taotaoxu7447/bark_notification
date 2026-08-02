@@ -1,0 +1,7 @@
+# Deployed secrets and runtime state must never be committed from this folder.
+service.env
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.pyc
