@@ -71,7 +71,23 @@ class ProvisioningError(Exception):
 
 
 class PublishError(Exception):
-    """A sanitized ntfy publishing failure."""
+    """A sanitized ntfy publishing failure with a bounded safe category."""
+
+    CATEGORIES = frozenset({"timeout", "connection_error", "http_4xx", "http_5xx", "other"})
+
+    def __init__(self, category: str, http_status: int | None = None) -> None:
+        safe_category = category if category in self.CATEGORIES else "other"
+        safe_status = (
+            http_status
+            if isinstance(http_status, int) and 100 <= http_status <= 599
+            else None
+        )
+        self.category = safe_category
+        self.http_status = safe_status
+        message = f"ntfy upstream failure category={safe_category}"
+        if safe_status is not None:
+            message += f" http_status={safe_status}"
+        super().__init__(message)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -610,6 +626,29 @@ class NtfyPublisher:
             (parsed.scheme, parsed.netloc, f"{prefix}/{topic}", "", "")
         )
 
+    @staticmethod
+    def _http_failure(status: int) -> PublishError:
+        if 400 <= status <= 499:
+            return PublishError("http_4xx", status)
+        if 500 <= status <= 599:
+            return PublishError("http_5xx", status)
+        return PublishError("other", status)
+
+    @staticmethod
+    def _upstream_failure(exc: Exception) -> PublishError:
+        if isinstance(exc, urllib.error.HTTPError):
+            return NtfyPublisher._http_failure(int(exc.code))
+        if isinstance(exc, (TimeoutError, socket.timeout)):
+            return PublishError("timeout")
+        if isinstance(exc, urllib.error.URLError):
+            reason = exc.reason
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                return PublishError("timeout")
+            return PublishError("connection_error")
+        if isinstance(exc, (ConnectionError, OSError)):
+            return PublishError("connection_error")
+        return PublishError("other")
+
     def _publish(
         self,
         topic: str,
@@ -638,10 +677,10 @@ class NtfyPublisher:
             with self.opener(request, timeout=8.0) as response:
                 status = int(getattr(response, "status", 200))
                 response.read(4096)
-        except (OSError, urllib.error.URLError, TimeoutError) as exc:
-            raise PublishError("ntfy publish failed") from exc
+        except Exception as exc:
+            raise self._upstream_failure(exc) from exc
         if not 200 <= status < 300:
-            raise PublishError("ntfy publish returned a non-success status")
+            raise self._http_failure(status)
 
     def publish_test(self, topic: str, source: str, target: str) -> str:
         if source not in TEST_SOURCES:
@@ -770,6 +809,24 @@ class AgentWatchApplication:
         self._provisioning_lock = threading.Lock()
         self._invite_digest = hashlib.sha256(config.invite_code.encode("utf-8")).digest()
         self.logger = logging.getLogger("agentwatch-registration")
+
+    def _log_publish_failure(self, operation: str, failure: PublishError) -> None:
+        # Every value is drawn from a fixed allowlist or an integer status. Do
+        # not log the exception/cause: urllib errors can embed URLs and topics.
+        safe_operation = operation if operation in {"event", "test"} else "other"
+        if failure.http_status is None:
+            self.logger.warning(
+                "ntfy_publish_failed operation=%s category=%s",
+                safe_operation,
+                failure.category,
+            )
+        else:
+            self.logger.warning(
+                "ntfy_publish_failed operation=%s category=%s http_status=%d",
+                safe_operation,
+                failure.category,
+                failure.http_status,
+            )
 
     @staticmethod
     def _decode_object(raw: bytes, required: set[str], optional: set[str] | None = None) -> dict[str, Any]:
@@ -1359,6 +1416,7 @@ class AgentWatchApplication:
                 str(device["private_topic"]), source, target
             )
         except PublishError as exc:
+            self._log_publish_failure("test", exc)
             raise ApiError(502, "publish_failed", "Test notification could not be published") from exc
         # `sequence_id` is retained for older clients; Android treats the same
         # stable identifier as its protocol-level event_id.
@@ -1628,6 +1686,7 @@ class AgentWatchApplication:
                 priority,
             )
         except PublishError as exc:
+            self._log_publish_failure("event", exc)
             raise ApiError(502, "publish_failed", "Notification could not be published") from exc
         try:
             with closing(self.database.connect()) as connection:

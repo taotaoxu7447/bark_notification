@@ -68,10 +68,13 @@ make_pkg "codex-watch-notifier-windows-$VERSION" \
 
 (
   cd "$DIST"
-  zip -qr "codex-watch-notifier-macos-$VERSION.zip" "codex-watch-notifier-macos-$VERSION"
-  # Do not leak macOS AppleDouble (._*) metadata into the Linux package.
-  COPYFILE_DISABLE=1 tar -czf "codex-watch-notifier-ubuntu-$VERSION.tar.gz" "codex-watch-notifier-ubuntu-$VERSION"
-  zip -qr "codex-watch-notifier-windows-$VERSION.zip" "codex-watch-notifier-windows-$VERSION"
+  zip -Xqr "codex-watch-notifier-macos-$VERSION.zip" "codex-watch-notifier-macos-$VERSION"
+  # Do not leak macOS AppleDouble, ACL, flag, or extended-attribute metadata
+  # into the Linux package. GNU tar otherwise warns about LIBARCHIVE.xattr
+  # records when extracting an archive produced by macOS bsdtar.
+  COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --no-acls --no-fflags \
+    -czf "codex-watch-notifier-ubuntu-$VERSION.tar.gz" "codex-watch-notifier-ubuntu-$VERSION"
+  zip -Xqr "codex-watch-notifier-windows-$VERSION.zip" "codex-watch-notifier-windows-$VERSION"
 )
 
 echo "Built packages in $DIST"

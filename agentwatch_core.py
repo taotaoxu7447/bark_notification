@@ -10,6 +10,7 @@ fallback on Linux hosts without Secret Service.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
 import json
@@ -31,6 +32,9 @@ API_VERSION = 2
 DEFAULT_API_BASE = "https://64.90.8.184:9444/agentwatch/api/v1"
 DEFAULT_CONFIG_DIR = "~/.codex-watch-notifier"
 MACHINE_FILE_NAME = "machine.json"
+SETTINGS_FILE_NAME = "settings.json"
+DELIVERY_SETTINGS_VERSION = 1
+ALLOWED_DELIVERY_MODES = frozenset({"bark", "agentwatch", "both"})
 LINUX_TOKEN_FILE_NAME = "computer-token"
 WINDOWS_TOKEN_FILE_NAME = "computer-token.dpapi"
 KEYCHAIN_SERVICE = "io.github.taotaoxu7447.agentwatch.computer"
@@ -150,6 +154,375 @@ def save_machine_account(machine: dict[str, str], username: str, config_root: Pa
     )
 
 
+def load_delivery_mode(config_root: Path | None = None) -> str | None:
+    """Load the non-secret receiver selection without guessing a default."""
+    root = config_root or config_dir()
+    path = root / SETTINGS_FILE_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise AgentWatchError("AgentWatch settings.json is unreadable or invalid") from exc
+    if not isinstance(raw, dict) or raw.get("version") != DELIVERY_SETTINGS_VERSION:
+        raise AgentWatchError("AgentWatch settings.json has an unsupported format")
+    mode = raw.get("delivery_mode")
+    if not isinstance(mode, str) or mode not in ALLOWED_DELIVERY_MODES:
+        raise AgentWatchError("delivery_mode must be bark, agentwatch, or both")
+    return mode
+
+
+def save_delivery_mode(delivery_mode: str, config_root: Path | None = None) -> None:
+    """Persist only the non-secret receiver choice using the shared safe writer."""
+    if delivery_mode not in ALLOWED_DELIVERY_MODES:
+        raise AgentWatchError("delivery_mode must be bark, agentwatch, or both")
+    root = config_root or config_dir()
+    payload = {
+        "version": DELIVERY_SETTINGS_VERSION,
+        "delivery_mode": delivery_mode,
+    }
+    atomic_write(
+        root / SETTINGS_FILE_NAME,
+        (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+
+
+def infer_delivery_mode(bark_configured: bool, agentwatch_authenticated: bool) -> str | None:
+    """Infer an existing installation, but never guess when neither receiver exists."""
+    if bark_configured and agentwatch_authenticated:
+        return "both"
+    if bark_configured:
+        return "bark"
+    if agentwatch_authenticated:
+        return "agentwatch"
+    return None
+
+
+def resolve_delivery(
+    delivery_mode: str | None,
+    bark_configured: bool,
+    agentwatch_authenticated: bool,
+) -> dict[str, Any]:
+    """Resolve desired receiver mode into stable status and service semantics."""
+    if delivery_mode is not None and delivery_mode not in ALLOWED_DELIVERY_MODES:
+        raise AgentWatchError("delivery_mode must be bark, agentwatch, or both")
+    desired = {
+        "bark": ["bark"],
+        "agentwatch": ["agentwatch"],
+        "both": ["bark", "agentwatch"],
+    }.get(delivery_mode, [])
+    readiness = {
+        "bark": bool(bark_configured),
+        "agentwatch": bool(agentwatch_authenticated),
+    }
+    effective = [channel for channel in desired if readiness[channel]]
+    missing = [channel for channel in desired if not readiness[channel]]
+    operational = bool(effective)
+    fully_configured = bool(desired) and not missing
+    return {
+        "delivery_mode": delivery_mode,
+        "bark_configured": bool(bark_configured),
+        "agentwatch_authenticated": bool(agentwatch_authenticated),
+        "effective_channels": effective,
+        "missing_channels": missing,
+        "operational": operational,
+        "fully_configured": fully_configured,
+        "degraded": operational and not fully_configured,
+        "delivery_mode_required": delivery_mode is None,
+    }
+
+
+ERR_SEC_SUCCESS = 0
+ERR_SEC_USER_CANCELED = -128
+ERR_SEC_AUTH_FAILED = -25293
+ERR_SEC_DUPLICATE_ITEM = -25299
+ERR_SEC_ITEM_NOT_FOUND = -25300
+ERR_SEC_INTERACTION_NOT_ALLOWED = -25308
+ERR_SEC_MISSING_ENTITLEMENT = -34018
+
+
+class _MacOSStatusError(RuntimeError):
+    def __init__(self, status: int) -> None:
+        self.status = status
+        super().__init__(str(status))
+
+
+class _MacOSSecurityNative:
+    """Small ctypes binding for generic-password Keychain operations."""
+
+    def __init__(self) -> None:
+        try:
+            self.security = ctypes.CDLL(
+                "/System/Library/Frameworks/Security.framework/Security"
+            )
+            self.core_foundation = ctypes.CDLL(
+                "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+            )
+        except OSError as exc:
+            raise AgentWatchError("macOS Security.framework is unavailable") from exc
+
+        os_status = ctypes.c_int32
+        uint32 = ctypes.c_uint32
+        void_pointer = ctypes.c_void_p
+
+        self.security.SecKeychainAddGenericPassword.argtypes = [
+            void_pointer,
+            uint32,
+            ctypes.c_char_p,
+            uint32,
+            ctypes.c_char_p,
+            uint32,
+            void_pointer,
+            ctypes.POINTER(void_pointer),
+        ]
+        self.security.SecKeychainAddGenericPassword.restype = os_status
+        self.security.SecKeychainFindGenericPassword.argtypes = [
+            void_pointer,
+            uint32,
+            ctypes.c_char_p,
+            uint32,
+            ctypes.c_char_p,
+            ctypes.POINTER(uint32),
+            ctypes.POINTER(void_pointer),
+            ctypes.POINTER(void_pointer),
+        ]
+        self.security.SecKeychainFindGenericPassword.restype = os_status
+        self.security.SecKeychainItemModifyAttributesAndData.argtypes = [
+            void_pointer,
+            void_pointer,
+            uint32,
+            void_pointer,
+        ]
+        self.security.SecKeychainItemModifyAttributesAndData.restype = os_status
+        self.security.SecKeychainItemDelete.argtypes = [void_pointer]
+        self.security.SecKeychainItemDelete.restype = os_status
+        self.security.SecKeychainItemFreeContent.argtypes = [void_pointer, void_pointer]
+        self.security.SecKeychainItemFreeContent.restype = os_status
+        self.security.SecKeychainGetUserInteractionAllowed.argtypes = [
+            ctypes.POINTER(ctypes.c_ubyte)
+        ]
+        self.security.SecKeychainGetUserInteractionAllowed.restype = os_status
+        self.security.SecKeychainSetUserInteractionAllowed.argtypes = [ctypes.c_ubyte]
+        self.security.SecKeychainSetUserInteractionAllowed.restype = os_status
+        self.core_foundation.CFRelease.argtypes = [void_pointer]
+        self.core_foundation.CFRelease.restype = None
+
+    @contextmanager
+    def _without_user_interaction(self) -> Any:
+        previous = ctypes.c_ubyte(0)
+        status = int(self.security.SecKeychainGetUserInteractionAllowed(ctypes.byref(previous)))
+        if status != ERR_SEC_SUCCESS:
+            raise _MacOSStatusError(status)
+        status = int(self.security.SecKeychainSetUserInteractionAllowed(0))
+        if status != ERR_SEC_SUCCESS:
+            raise _MacOSStatusError(status)
+        try:
+            yield
+        finally:
+            restore_status = int(
+                self.security.SecKeychainSetUserInteractionAllowed(previous.value)
+            )
+            if restore_status != ERR_SEC_SUCCESS:
+                raise _MacOSStatusError(restore_status)
+
+    @staticmethod
+    def _encoded(value: str) -> bytes:
+        return value.encode("utf-8")
+
+    @staticmethod
+    def _secret_pointer(secret: bytearray) -> tuple[Any, ctypes.c_void_p]:
+        buffer = (ctypes.c_ubyte * len(secret)).from_buffer(secret)
+        return buffer, ctypes.cast(buffer, ctypes.c_void_p)
+
+    def add(self, service: str, account: str, secret: bytearray) -> int:
+        service_bytes = self._encoded(service)
+        account_bytes = self._encoded(account)
+        buffer, secret_pointer = self._secret_pointer(secret)
+        try:
+            with self._without_user_interaction():
+                status = self.security.SecKeychainAddGenericPassword(
+                    None,
+                    len(service_bytes),
+                    service_bytes,
+                    len(account_bytes),
+                    account_bytes,
+                    len(secret),
+                    secret_pointer,
+                    None,
+                )
+        except _MacOSStatusError as exc:
+            status = exc.status
+        del buffer
+        return int(status)
+
+    def read(self, service: str, account: str) -> tuple[int, bytearray | None]:
+        service_bytes = self._encoded(service)
+        account_bytes = self._encoded(account)
+        password_length = ctypes.c_uint32(0)
+        password_data = ctypes.c_void_p()
+        item = ctypes.c_void_p()
+        try:
+            with self._without_user_interaction():
+                status = int(
+                    self.security.SecKeychainFindGenericPassword(
+                        None,
+                        len(service_bytes),
+                        service_bytes,
+                        len(account_bytes),
+                        account_bytes,
+                        ctypes.byref(password_length),
+                        ctypes.byref(password_data),
+                        ctypes.byref(item),
+                    )
+                )
+        except _MacOSStatusError as exc:
+            status = exc.status
+        if status != ERR_SEC_SUCCESS:
+            # SecKeychainFindGenericPassword may have succeeded even when
+            # restoring the process interaction setting failed. Release any
+            # objects returned by that successful call before surfacing the
+            # restore error.
+            if password_data.value:
+                self.security.SecKeychainItemFreeContent(None, password_data)
+            if item.value:
+                self.core_foundation.CFRelease(item)
+            return status, None
+        try:
+            if not password_data.value and password_length.value:
+                return ERR_SEC_AUTH_FAILED, None
+            value = bytearray(ctypes.string_at(password_data, password_length.value))
+            return status, value
+        finally:
+            if password_data.value:
+                self.security.SecKeychainItemFreeContent(None, password_data)
+            if item.value:
+                self.core_foundation.CFRelease(item)
+
+    def _find_item(self, service: str, account: str) -> tuple[int, ctypes.c_void_p]:
+        service_bytes = self._encoded(service)
+        account_bytes = self._encoded(account)
+        item = ctypes.c_void_p()
+        try:
+            with self._without_user_interaction():
+                status = int(
+                    self.security.SecKeychainFindGenericPassword(
+                        None,
+                        len(service_bytes),
+                        service_bytes,
+                        len(account_bytes),
+                        account_bytes,
+                        None,
+                        None,
+                        ctypes.byref(item),
+                    )
+                )
+        except _MacOSStatusError as exc:
+            status = exc.status
+        if status != ERR_SEC_SUCCESS and item.value:
+            # As above, a failed interaction-setting restore can follow a
+            # successful lookup. The caller only owns an item on success.
+            self.core_foundation.CFRelease(item)
+            item = ctypes.c_void_p()
+        return status, item
+
+    def update(self, service: str, account: str, secret: bytearray) -> int:
+        status, item = self._find_item(service, account)
+        if status != ERR_SEC_SUCCESS:
+            return status
+        try:
+            buffer, secret_pointer = self._secret_pointer(secret)
+            try:
+                with self._without_user_interaction():
+                    status = int(
+                        self.security.SecKeychainItemModifyAttributesAndData(
+                            item,
+                            None,
+                            len(secret),
+                            secret_pointer,
+                        )
+                    )
+            except _MacOSStatusError as exc:
+                status = exc.status
+            del buffer
+            return status
+        finally:
+            if item.value:
+                self.core_foundation.CFRelease(item)
+
+    def delete(self, service: str, account: str) -> int:
+        status, item = self._find_item(service, account)
+        if status != ERR_SEC_SUCCESS:
+            return status
+        try:
+            try:
+                with self._without_user_interaction():
+                    return int(self.security.SecKeychainItemDelete(item))
+            except _MacOSStatusError as exc:
+                return exc.status
+        finally:
+            if item.value:
+                self.core_foundation.CFRelease(item)
+
+
+class MacOSKeychain:
+    """Prompt-free Keychain facade with safe OSStatus mapping."""
+
+    def __init__(self, native: Any | None = None) -> None:
+        self.native = native or _MacOSSecurityNative()
+
+    @staticmethod
+    def _raise(operation: str, status: int) -> None:
+        details = {
+            ERR_SEC_USER_CANCELED: "operation was cancelled",
+            ERR_SEC_AUTH_FAILED: "authentication failed",
+            ERR_SEC_INTERACTION_NOT_ALLOWED: "the login Keychain is locked or unavailable",
+            ERR_SEC_MISSING_ENTITLEMENT: "the process is not permitted to use Keychain",
+        }
+        detail = details.get(status, f"OSStatus {status}")
+        raise AgentWatchError(f"macOS Keychain {operation} failed: {detail}")
+
+    @staticmethod
+    def _zero(value: bytearray | None) -> None:
+        if value is None:
+            return
+        for index in range(len(value)):
+            value[index] = 0
+
+    def save(self, account: str, token: str) -> None:
+        secret = bytearray(token.encode("utf-8"))
+        try:
+            status = self.native.add(KEYCHAIN_SERVICE, account, secret)
+            if status == ERR_SEC_DUPLICATE_ITEM:
+                status = self.native.update(KEYCHAIN_SERVICE, account, secret)
+            if status != ERR_SEC_SUCCESS:
+                self._raise("save", status)
+        finally:
+            self._zero(secret)
+
+    def load(self, account: str) -> str | None:
+        status, secret = self.native.read(KEYCHAIN_SERVICE, account)
+        if status == ERR_SEC_ITEM_NOT_FOUND:
+            return None
+        if status != ERR_SEC_SUCCESS:
+            self._zero(secret)
+            self._raise("read", status)
+        if secret is None:
+            raise AgentWatchError("macOS Keychain computer token is missing")
+        try:
+            value = secret.decode("utf-8").strip()
+        except UnicodeError:
+            raise AgentWatchError("macOS Keychain computer token is invalid") from None
+        finally:
+            self._zero(secret)
+        return value or None
+
+    def delete(self, account: str) -> None:
+        status = self.native.delete(KEYCHAIN_SERVICE, account)
+        if status not in {ERR_SEC_SUCCESS, ERR_SEC_ITEM_NOT_FOUND}:
+            self._raise("delete", status)
+
+
 class _DataBlob(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
@@ -215,11 +588,18 @@ class ComputerTokenStore:
         config_root: Path | None = None,
         system_name: str | None = None,
         which: Callable[[str], str | None] = shutil.which,
+        macos_keychain: MacOSKeychain | None = None,
     ) -> None:
         self.computer_id = computer_id
         self.config_root = config_root or config_dir()
         self.system_name = system_name or platform_module.system()
         self.which = which
+        self.macos_keychain = macos_keychain
+
+    def _macos_backend(self) -> MacOSKeychain:
+        if self.macos_keychain is None:
+            self.macos_keychain = MacOSKeychain()
+        return self.macos_keychain
 
     def load(self) -> str | None:
         try:
@@ -252,13 +632,7 @@ class ComputerTokenStore:
 
     def delete(self) -> None:
         if self.system_name == "Darwin":
-            subprocess.run(
-                ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", self.computer_id],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            self._macos_backend().delete(self.computer_id)
         elif self.system_name == "Linux" and self.which("secret-tool"):
             subprocess.run(
                 ["secret-tool", "clear", "service", KEYCHAIN_SERVICE, "computer_id", self.computer_id],
@@ -285,38 +659,10 @@ class ComputerTokenStore:
         return "0600 private file"
 
     def _macos_load(self) -> str | None:
-        completed = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", self.computer_id, "-w"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        value = completed.stdout.strip() if completed.returncode == 0 else ""
-        return value or None
+        return self._macos_backend().load(self.computer_id)
 
     def _macos_save(self, token: str) -> None:
-        # With -w and no command-line value, security reads the secret from stdin.
-        completed = subprocess.run(
-            [
-                "security",
-                "add-generic-password",
-                "-U",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                self.computer_id,
-                "-w",
-            ],
-            # macOS security prompts twice when -w is the final option. Feeding
-            # the same value twice keeps it out of argv and process listings.
-            input=token + "\n" + token + "\n",
-            text=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise AgentWatchError("could not save the computer token in macOS Keychain")
+        self._macos_backend().save(self.computer_id, token)
 
     def _linux_secret_load(self) -> str | None:
         completed = subprocess.run(

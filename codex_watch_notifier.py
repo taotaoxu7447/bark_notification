@@ -16,7 +16,17 @@ from typing import Any, Callable
 import urllib.parse
 import urllib.request
 
-from agentwatch_core import AgentWatchApi, ApiError, ComputerTokenStore, load_or_create_machine, stable_event_id
+from agentwatch_core import (
+    AgentWatchApi,
+    AgentWatchError,
+    ApiError,
+    ComputerTokenStore,
+    infer_delivery_mode,
+    load_delivery_mode,
+    load_or_create_machine,
+    resolve_delivery,
+    stable_event_id,
+)
 
 
 DEFAULT_STATE = "~/.codex-watch-notifier/state.json"
@@ -377,17 +387,36 @@ class Notifier:
         self.dry_run = dry_run
         self.log = log
         self.computer = load_or_create_machine()
-        self.computer_token = ComputerTokenStore(self.computer["computer_id"]).load()
+        self.delivery_mode = load_delivery_mode()
+        self.bark_configured = bool(
+            (os.getenv("BARK_URL") or "").strip() or (os.getenv("BARK_KEY") or "").strip()
+        )
+        self.computer_token: str | None = None
+        # Bark-only operation deliberately avoids all AgentWatch credential
+        # backends. A legacy install with no settings inspects the token once so
+        # its established channel combination can be inferred.
+        if self.delivery_mode != "bark":
+            self.computer_token = ComputerTokenStore(self.computer["computer_id"]).load()
+        if self.delivery_mode is None:
+            self.delivery_mode = infer_delivery_mode(
+                self.bark_configured,
+                self.computer_token is not None,
+            )
+        self.delivery = resolve_delivery(
+            self.delivery_mode,
+            self.bark_configured,
+            self.computer_token is not None,
+        )
+        self.disabled_channels: set[str] = set()
         self.channels = self._discover_channels()
         self.completed_channels: set[str] = set()
         self.last_successful_channels: set[str] = set()
 
     def _discover_channels(self) -> list[str]:
-        channels: list[str] = []
-        if os.getenv("BARK_URL") or os.getenv("BARK_KEY"):
-            channels.append("bark")
-        if self.computer_token:
-            channels.append("agentwatch")
+        # Only selected, ready phone receivers enter the fan-out. In
+        # particular, stale Bark variables cannot make agentwatch-only send to
+        # an iPhone, and legacy ntfy variables are never a production channel.
+        channels: list[str] = list(self.delivery["effective_channels"])
         if os.getenv("CODEX_NOTIFY_WEBHOOK_URL"):
             channels.append("generic_webhook")
         if os.getenv("WECOM_WEBHOOK_URL") or os.getenv("WECHAT_WORK_WEBHOOK"):
@@ -414,14 +443,19 @@ class Notifier:
             print("--- end notification ---\n", flush=True)
             return True
 
-        if not self.channels:
-            self.log("no private notification channel configured; run agentwatch login")
+        active_channels = [channel for channel in self.channels if channel not in self.disabled_channels]
+        if not active_channels:
+            if self.delivery_mode is None:
+                self.log("no receiver mode selected; run agentwatch install --delivery bark|agentwatch|both")
+            else:
+                missing = ",".join(self.delivery["missing_channels"]) or "selected receiver"
+                self.log(f"no selected phone receiver is ready: {missing}")
             return False
 
         previously_completed = set(self.completed_channels)
         self.last_successful_channels = set()
         channel_results: dict[str, bool] = {}
-        for channel in self.channels:
+        for channel in active_channels:
             if channel in previously_completed:
                 channel_results[channel] = True
                 continue
@@ -452,8 +486,18 @@ class Notifier:
             for channel, succeeded in channel_results.items()
             if succeeded and channel not in previously_completed
         }
-        external_channels = [channel for channel in self.channels if channel not in {"macos", "dry_run"}]
-        required_channels = external_channels or list(self.channels)
+        active_after_round = [
+            channel for channel in self.channels if channel not in self.disabled_channels
+        ]
+        active_phone_channels = [
+            channel for channel in active_after_round if channel in {"bark", "agentwatch"}
+        ]
+        if self.delivery_mode in {"bark", "agentwatch", "both"} and not active_phone_channels:
+            return False
+        external_channels = [
+            channel for channel in active_after_round if channel not in {"macos", "dry_run"}
+        ]
+        required_channels = external_channels or active_after_round
         # A local macOS banner must never conceal a failed phone delivery. Each
         # successful channel is persisted by the caller and skipped on retry,
         # so the second round sends only channels that actually failed.
@@ -531,9 +575,22 @@ class Notifier:
             )
         except ApiError as exc:
             if exc.status == 401:
-                ComputerTokenStore(self.computer["computer_id"]).delete()
                 self.computer_token = None
+                self.disabled_channels.add("agentwatch")
+                self.delivery = resolve_delivery(
+                    self.delivery_mode,
+                    self.bark_configured,
+                    False,
+                )
+                try:
+                    ComputerTokenStore(self.computer["computer_id"]).delete()
+                except AgentWatchError as delete_exc:
+                    self.log(f"could not remove revoked AgentWatch credential: {delete_exc}")
                 self.log("AgentWatch computer token was revoked; run agentwatch login again")
+                # A revoked credential is terminal, not a transient delivery
+                # failure. In `both`, send() now evaluates the surviving Bark
+                # channel and finishes this event without a duplicate retry.
+                return False
             raise
         return True
 
@@ -1916,13 +1973,27 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     print(f"Platform: {platform.system()} {platform.release()}")
     print(f"Config: {env_path}")
     print_check("config file", env_path.exists(), "chmod 600 recommended" if env_path.exists() else "run installer")
-    print_check("notification channels", bool(notifier.channels), ",".join(notifier.channels) or "none configured")
-    print_check("Bark configured", bool(os.getenv("BARK_URL") or os.getenv("BARK_KEY")), "BARK_URL/BARK_KEY")
     print_check(
-        "AgentWatch computer login",
-        notifier.computer_token is not None,
-        f"computer_id={notifier.computer['computer_id']}",
+        "receiver mode selected",
+        notifier.delivery_mode is not None,
+        notifier.delivery_mode or "run agentwatch install --delivery bark|agentwatch|both",
     )
+    print_check("notification channels", bool(notifier.channels), ",".join(notifier.channels) or "none configured")
+    if notifier.delivery_mode in {"bark", "both"}:
+        print_check("Bark configured", notifier.bark_configured, "BARK_URL/BARK_KEY")
+    if notifier.delivery_mode in {"agentwatch", "both"}:
+        print_check(
+            "AgentWatch computer login",
+            notifier.computer_token is not None,
+            f"computer_id={notifier.computer['computer_id']}",
+        )
+    if notifier.delivery.get("degraded"):
+        print_check(
+            "receiver configuration complete",
+            False,
+            "working via " + ",".join(notifier.delivery["effective_channels"])
+            + "; missing " + ",".join(notifier.delivery["missing_channels"]),
+        )
     legacy_ntfy = any(
         os.getenv(name)
         for name in ("NTFY_URL", "NTFY_TOKEN", "CODEX_NTFY_URL", "ZCODE_NTFY_URL", "KIMI_NTFY_URL", "GROK_NTFY_URL")

@@ -26,9 +26,10 @@
 - **Android 来源分组**：Codex、ZCode、Kimi Code、Grok Build 使用独立通知频道和定制图标，手机系统可分别管理。
 - **已适配工具**：Codex App / Codex CLI、ZCode、Kimi Code、Grok Build。
 - **主任务优先**：Codex、Kimi Code 和 Grok Build 默认过滤子智能体或子会话事件，只提醒主任务。
-- **账号独享通道**：每台电脑登录后只得到当前账号的 computer token；发布 API 从 token 推导目标，电脑不能指定 topic 或其他用户。
+- **AgentWatch 账号独享通道**：采用 Android 通道的电脑登录后只得到当前账号的 computer token；发布 API 从 token 推导目标，电脑不能指定 topic 或其他用户。Bark-only 不需要这次登录。
+- **三种桌面投递模式**：`bark` 面向 iPhone / Apple Watch，`agentwatch` 面向 Android，`both` 让两条通道独立共存。
 - **三端安装**：macOS LaunchAgent、Ubuntu systemd user service、Windows Task Scheduler。
-- **统一 CLI**：macOS、Ubuntu、Windows 都提供 `install/login/status/doctor/update/logout/uninstall` 和 `--json`。
+- **统一 CLI**：macOS、Ubuntu、Windows 都提供 `install/login/status/doctor/update/logout/uninstall` 和 `--json`；安装入口使用 `install --delivery bark|agentwatch|both`。
 - **测试命令**：`--test`、`--test-zcode`、`--test-kimi`、`--test-grok` 分别测试四种工具的通知。
 - **隐私开关**：可以关闭工作目录和消息摘要，避免把敏感内容推送到手机。
 - **历史抑制**：首次启动会建立基线，默认不会把旧日志里的历史任务重新推送一遍。
@@ -44,7 +45,27 @@
 3. AI 任务完成、卡住或需要确认时，手机、手表或其他通知客户端设备收到提醒。
 4. 回到对应电脑继续处理。
 
-任务监听和判断都发生在你自己的电脑上，不需要上传代码。通知正文只经过你选择的个人 Bark 通道或项目自建中继；电脑通过账号绑定的 `/publish` 接口发送，无法读取手机消息，也无法选择其他用户的通道。
+任务监听和判断都发生在你自己的电脑上，不需要上传代码。通知正文只经过你选择的个人 Bark 通道或项目自建中继：Bark 模式使用用户自己的 Bark 地址，AgentWatch 模式才通过账号绑定的 `/publish` 接口发送；电脑无法读取手机消息，也无法选择其他 AgentWatch 用户的通道。
+
+## 先选择接收设备和桌面投递模式
+
+桌面端有三种相互独立的投递选择。安装前，人工用户应先确认自己的接收设备；由 AI 安装时，AI 必须先询问，或根据用户已经明确提供的设备信息作出判断，不能默认要求所有人注册 AgentWatch。
+
+| 模式 | 接收设备 | 手机端准备 | 电脑端凭据 |
+| --- | --- | --- | --- |
+| `bark` | iPhone / Apple Watch | 只安装 Bark；不安装、不注册、不登录 AgentWatch | 安全保存 Bark 首页的个人推送地址或 key |
+| `agentwatch` | Android / Android 穿戴设备转发 | 安装自研 AgentWatch App，并注册或登录账号 | 使用同一 AgentWatch 账号登录，保存只写 computer token |
+| `both` | 同时使用上述两类设备 | 分别完成 Bark 和 Android AgentWatch 准备 | 两条通道独立配置；即使尚未完成 Android 账号登录，已配置的 Bark 仍应照常运行 |
+
+CLI 使用以下明确的安装契约：
+
+```text
+agentwatch install --delivery bark
+agentwatch install --delivery agentwatch
+agentwatch install --delivery both
+```
+
+这是投递模式选择，不是测试命令。`install`、`update` 和 `doctor` 都不得自动发送测试通知。`doctor` 只诊断，不会替用户启动或重启后台服务。不要编造或依赖 `configure-bark` 命令；Bark 个人地址应由用户本人安全写入电脑的私有配置或安全输入流程。
 
 ## 随身设备准备
 
@@ -55,6 +76,8 @@
 3. 复制 Bark 首页显示的推送地址或 key。
 4. 如果使用 Apple Watch，保持 iPhone 和 Apple Watch 的系统通知同步设置正常。Bark 通知会按 iOS / watchOS 的规则转发到手表。
 
+iPhone / Apple Watch 用户只需要 Bark，不需要安装 AgentWatch App，也不需要注册或登录 AgentWatch 账号。电脑仍然必须得到这台 iPhone 的 Bark 首页个人推送地址或 key 才能发送通知；这是把个人 Bark 凭据安全配置到电脑，不是与 AgentWatch 账号配对。
+
 配置时可以二选一：
 
 ```bash
@@ -62,6 +85,8 @@ BARK_URL=https://api.day.app/<your-key>
 # 或
 BARK_KEY=<your-key>
 ```
+
+Bark 完整推送地址本身包含 key，同样属于密钥。不要把真实值发到 AI 对话、写进命令行参数、日志或 Git；由用户本人写入权限受限的 `~/.codex-watch-notifier/env`，AI 只能准备空白配置和检查文件权限，不能读取或回显该值。临时在当前 shell 中 `export BARK_URL=...` 或 `export BARK_KEY=...` 不算后台配置，后台 watcher 只读取持久的私有 `env` 文件。用户保存文件后必须运行 `~/.local/bin/agentwatch update`，让 CLI 重新协调并启动或重启后台服务，然后再运行 `doctor --json`。AgentWatch 密码同样不得进入 AI 对话或 argv，只能由用户在 CLI 隐藏提示中输入。
 
 ### Android / 手环：AgentWatch
 
@@ -89,13 +114,16 @@ AgentWatch 的 Android 源码、构建和签名说明见 [`android/README.md`](a
 
 也可以直接 clone 仓库后在仓库根目录执行下面的命令。
 
-人工安装会在完成文件复制后直接提示账号和隐藏密码。密码只用于一次 HTTPS 登录，不会保存；登录成功后只保存当前电脑的 computer token，也不会自动发送测试通知。
+先按接收设备选择 `bark`、`agentwatch` 或 `both`。`bark` 不会要求 AgentWatch 账号；`agentwatch` 才需要用户本人输入账号和隐藏密码；`both` 中两条通道互不阻塞。AgentWatch 密码只用于一次 HTTPS 登录，不会保存，登录成功后只保存当前电脑的 computer token。任何模式的安装、`update` 和 `doctor` 都不会自动发送测试通知。
 
 ### macOS
 
 ```bash
-./install_launch_agent.zsh
-~/.local/bin/agentwatch doctor
+./install_launch_agent.zsh --delivery bark
+# 或 --delivery agentwatch / --delivery both
+# bark/both：用户私下写好 ~/.codex-watch-notifier/env 后执行
+~/.local/bin/agentwatch update
+~/.local/bin/agentwatch doctor --json
 ```
 
 常用排查：
@@ -109,8 +137,11 @@ launchctl print gui/$(id -u)/com.xutao.codex-watch-notifier
 
 ```bash
 chmod +x install_systemd_user.sh uninstall_systemd_user.sh
-./install_systemd_user.sh
-~/.local/bin/agentwatch doctor
+./install_systemd_user.sh --delivery bark
+# 或 --delivery agentwatch / --delivery both
+# bark/both：用户私下写好 ~/.codex-watch-notifier/env 后执行
+~/.local/bin/agentwatch update
+~/.local/bin/agentwatch doctor --json
 ```
 
 常用排查：
@@ -131,8 +162,11 @@ loginctl enable-linger "$USER"
 在解压后的包目录里打开 PowerShell：
 
 ```powershell
-.\install_task_scheduler.ps1
-& "$env:USERPROFILE\.local\bin\agentwatch.cmd" doctor
+.\install_task_scheduler.ps1 --delivery bark
+# 或 --delivery agentwatch / --delivery both
+# bark/both：用户私下写好持久 env 后执行
+& "$env:USERPROFILE\.local\bin\agentwatch.cmd" update
+& "$env:USERPROFILE\.local\bin\agentwatch.cmd" doctor --json
 ```
 
 常用排查：
@@ -142,6 +176,8 @@ Get-ScheduledTask -TaskName CodexWatchNotifier
 Get-Content $env:USERPROFILE\.codex-watch-notifier\codex-watch-notifier.log -Wait
 ```
 
+任务计划程序显示 `Ready` 只代表任务已注册、正在等待触发，不代表 watcher 当前正在运行。应以 `agentwatch doctor --json` 的 `checks.service_running` 和运行日志为准；`doctor` 本身不会启动任务或发送测试。
+
 Windows 路径可以写在 env 文件里，例如：
 
 ```text
@@ -150,18 +186,18 @@ CODEX_WATCH_STATE=C:\Users\<name>\.codex-watch-notifier\state.json
 
 ### 让 AI 安装
 
-AI 使用同一套安装器，但必须采用非交互模式，例如：
+AI 必须先询问或判断接收设备，再映射到 `agentwatch install --delivery bark|agentwatch|both`。安装器采用非交互方式完成不含密钥的文件和服务安装，例如：
 
 ```bash
-./install_launch_agent.zsh --json --no-login
+./install_launch_agent.zsh --delivery both --json --no-login
 ```
 
-看到 `login_required=true` 后，AI 应暂停，让用户亲自在终端运行 `~/.local/bin/agentwatch login` 并输入隐藏密码；用户确认完成后，AI 再运行 `agentwatch doctor --json`。完整约束见 [`AI_INSTALL.md`](AI_INSTALL.md)。
+`agentwatch` 或 `both` 模式看到 `login_required=true` 后，AI 应暂停，让用户亲自在终端运行 `~/.local/bin/agentwatch login` 并输入隐藏密码。`bark` 模式不得要求 AgentWatch 登录；AI 应让用户本人把 Bark 首页个人推送地址或 key 写入电脑持久私有配置，且不得通过聊天或 argv 传递。临时 shell `export` 不算后台配置。用户只需确认 secret 已经保存，不应把值反馈给 AI；随后由 AI 运行 `~/.local/bin/agentwatch update` 重新协调后台，再运行只读的 `agentwatch doctor --json`。`both` 尚未完成 Android 登录时，update 仍应让 Bark 独立运行。`doctor` 不会启动服务或自动测试通知。完整约束见 [`AI_INSTALL.md`](AI_INSTALL.md)。
 
 统一命令：
 
 ```text
-agentwatch install
+agentwatch install --delivery bark|agentwatch|both
 agentwatch login
 agentwatch status
 agentwatch doctor
@@ -324,14 +360,14 @@ python3 codex_watch_notifier.py --test-grok
 在 macOS 仓库根目录执行：
 
 ```bash
-./build_packages.zsh v0.1.0-internal
+./build_packages.zsh v0.2.0
 ```
 
 产物会输出到 `dist/`：
 
-- `codex-watch-notifier-macos-v0.1.0-internal.zip`
-- `codex-watch-notifier-ubuntu-v0.1.0-internal.tar.gz`
-- `codex-watch-notifier-windows-v0.1.0-internal.zip`
+- `codex-watch-notifier-macos-v0.2.0.zip`
+- `codex-watch-notifier-ubuntu-v0.2.0.tar.gz`
+- `codex-watch-notifier-windows-v0.2.0.zip`
 
 Android 正式 APK 在 `android/` 内使用长期发布密钥单独构建：
 
@@ -340,7 +376,7 @@ cd android
 ./build_release.zsh
 ```
 
-产物是 `android/app/build/outputs/apk/release/app-release.apk`。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
+本地产物是 `android/app/build/outputs/apk/release/app-release.apk`，v0.2.0 Release 发布名为 `AgentWatch-android-v0.2.0.apk`。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
 
 每次发布建议从同一个 git commit 构建三种电脑端安装包和 Android APK。
 

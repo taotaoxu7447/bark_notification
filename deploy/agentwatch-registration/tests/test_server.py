@@ -88,8 +88,12 @@ class FakePublisher:
         self.targets: list[str] = []
         self.topics: list[str] = []
         self.events: list[dict[str, object]] = []
+        self.test_failure: server.PublishError | None = None
+        self.event_failure: server.PublishError | None = None
 
     def publish_test(self, topic: str, source: str, target: str) -> str:
+        if self.test_failure is not None:
+            raise self.test_failure
         self.calls += 1
         self.topics.append(topic)
         self.sources.append(source)
@@ -105,6 +109,8 @@ class FakePublisher:
         message: bytes,
         priority: str,
     ) -> None:
+        if self.event_failure is not None:
+            raise self.event_failure
         self.calls += 1
         self.topics.append(topic)
         self.events.append(
@@ -395,6 +401,7 @@ class ApiTestCase(unittest.TestCase):
             "/publish", publish, str(alice_computer["computer_token"])
         )
         self.assertEqual(202, status)
+
         self.assertEqual(publish["event_id"], response["event_id"])
         self.assertEqual(alice["ntfy_topic"], self.publisher.topics[-1])
         envelope = json.loads(self.publisher.events[-1]["message"])
@@ -439,6 +446,56 @@ class ApiTestCase(unittest.TestCase):
             str(alice_computer["computer_token"]),
         )
         self.assertEqual(202, status)
+
+    def test_publish_failures_log_only_safe_classification_and_keep_502_contract(self) -> None:
+        mobile = self.register()
+        computer = self.computer_login()
+        publish = {
+            "event_id": "sensitive-event-id-123",
+            "source": "codex",
+            "title": "SENSITIVE_TITLE_DO_NOT_LOG",
+            "body": "SENSITIVE_BODY_DO_NOT_LOG",
+        }
+        self.publisher.event_failure = server.PublishError("http_5xx", 503)
+        with self.assertLogs("agentwatch-registration", level="WARNING") as event_logs:
+            status, response = self.request(
+                "/publish", publish, str(computer["computer_token"])
+            )
+
+        self.assertEqual(502, status)
+        self.assertEqual(
+            {"error": "publish_failed", "message": "Notification could not be published"},
+            response,
+        )
+        event_log = "\n".join(event_logs.output)
+        self.assertIn("operation=event category=http_5xx http_status=503", event_log)
+
+        self.publisher.test_failure = server.PublishError("timeout")
+        with self.assertLogs("agentwatch-registration", level="WARNING") as test_logs:
+            status, response = self.request(
+                "/test", {"source": "codex"}, str(mobile["app_token"])
+            )
+
+        self.assertEqual(502, status)
+        self.assertEqual(
+            {"error": "publish_failed", "message": "Test notification could not be published"},
+            response,
+        )
+        test_log = "\n".join(test_logs.output)
+        self.assertIn("operation=test category=timeout", test_log)
+        combined = event_log + "\n" + test_log
+        for sensitive in (
+            str(mobile["ntfy_topic"]),
+            str(mobile["app_token"]),
+            str(computer["computer_token"]),
+            "alice.example",
+            publish["event_id"],
+            publish["title"],
+            publish["body"],
+            "tk_" + "p" * 29,
+            json.dumps(publish),
+        ):
+            self.assertNotIn(str(sensitive), combined)
 
     def test_computer_token_is_hashed_expires_logs_out_and_rotates(self) -> None:
         self.register()
@@ -1038,6 +1095,102 @@ class NtfyPublisherTest(unittest.TestCase):
         self.assertEqual("agentwatch_v2,source_kimi", query["tags"][0])
         self.assertEqual("high", query["priority"][0])
         self.assertEqual(message, request.data)
+
+    def test_upstream_failures_use_only_bounded_safe_classifications(self) -> None:
+        sensitive_exception = "SENSITIVE_EXCEPTION_DO_NOT_LOG"
+        sensitive_url = "http://127.0.0.1:2586/SENSITIVE_LEGACY_PATH"
+        publisher_token = "tk_" + "s" * 29
+        topic = "aw-" + "b" * 32
+        event_id = "sensitive-event-id-456"
+        title = "SENSITIVE_UPSTREAM_TITLE"
+        message = b"SENSITIVE_UPSTREAM_BODY"
+
+        class StatusResponse:
+            def __init__(self, status: int) -> None:
+                self.status = status
+
+            def __enter__(self) -> "StatusResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                return b"SENSITIVE_UPSTREAM_RESPONSE"
+
+        def raising(error: Exception):
+            def opener(_request: urllib.request.Request, timeout: float) -> StatusResponse:
+                del timeout
+                raise error
+
+            return opener
+
+        def response(status: int):
+            def opener(_request: urllib.request.Request, timeout: float) -> StatusResponse:
+                del timeout
+                return StatusResponse(status)
+
+            return opener
+
+        cases = (
+            (
+                "timeout",
+                raising(urllib.error.URLError(TimeoutError(sensitive_exception))),
+                "timeout",
+                None,
+            ),
+            (
+                "connection_error",
+                raising(urllib.error.URLError(OSError(sensitive_exception))),
+                "connection_error",
+                None,
+            ),
+            (
+                "http_4xx",
+                raising(
+                    urllib.error.HTTPError(
+                        sensitive_url,
+                        403,
+                        sensitive_exception,
+                        {},
+                        io.BytesIO(b"SENSITIVE_HTTP_BODY"),
+                    )
+                ),
+                "http_4xx",
+                403,
+            ),
+            ("http_5xx", response(503), "http_5xx", 503),
+            ("other", raising(RuntimeError(sensitive_exception)), "other", None),
+        )
+        for name, opener, expected_category, expected_status in cases:
+            with self.subTest(name=name):
+                publisher = server.NtfyPublisher(sensitive_url, publisher_token, opener)
+                with self.assertRaises(server.PublishError) as raised:
+                    publisher.publish_event(
+                        topic,
+                        event_id,
+                        "codex",
+                        title,
+                        message,
+                        "default",
+                    )
+                failure = raised.exception
+                self.assertEqual(expected_category, failure.category)
+                self.assertEqual(expected_status, failure.http_status)
+                rendered = str(failure)
+                self.assertIn(f"category={expected_category}", rendered)
+                for sensitive in (
+                    sensitive_exception,
+                    sensitive_url,
+                    publisher_token,
+                    topic,
+                    event_id,
+                    title,
+                    message.decode("ascii"),
+                    "SENSITIVE_HTTP_BODY",
+                    "SENSITIVE_UPSTREAM_RESPONSE",
+                ):
+                    self.assertNotIn(sensitive, rendered)
 
 
 class SecurityPrimitiveTest(unittest.TestCase):

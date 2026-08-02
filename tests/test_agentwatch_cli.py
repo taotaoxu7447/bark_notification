@@ -31,6 +31,34 @@ class FakeResponse:
         return self.payload
 
 
+class FakeMacSecurityNative:
+    def __init__(self) -> None:
+        self.add_status = agentwatch_core.ERR_SEC_SUCCESS
+        self.update_status = agentwatch_core.ERR_SEC_SUCCESS
+        self.read_status = agentwatch_core.ERR_SEC_ITEM_NOT_FOUND
+        self.delete_status = agentwatch_core.ERR_SEC_SUCCESS
+        self.read_secret: bytearray | None = None
+        self.add_calls: list[tuple[str, str, bytearray]] = []
+        self.update_calls: list[tuple[str, str, bytearray]] = []
+        self.delete_calls: list[tuple[str, str]] = []
+
+    def add(self, service: str, account: str, secret: bytearray) -> int:
+        self.add_calls.append((service, account, secret))
+        return self.add_status
+
+    def update(self, service: str, account: str, secret: bytearray) -> int:
+        self.update_calls.append((service, account, secret))
+        return self.update_status
+
+    def read(self, service: str, account: str) -> tuple[int, bytearray | None]:
+        del service, account
+        return self.read_status, self.read_secret
+
+    def delete(self, service: str, account: str) -> int:
+        self.delete_calls.append((service, account))
+        return self.delete_status
+
+
 class MachineIdentityTests(unittest.TestCase):
     def test_machine_identity_is_stable_and_private(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -61,17 +89,62 @@ class CredentialStoreTests(unittest.TestCase):
             store.delete()
             self.assertIsNone(store.load())
 
-    def test_macos_keychain_secret_uses_stdin_not_process_arguments(self) -> None:
-        completed = mock.Mock(returncode=0, stderr="")
-        with mock.patch.object(agentwatch_core.subprocess, "run", return_value=completed) as run:
-            store = agentwatch_core.ComputerTokenStore("computer-1", Path("/tmp/unused"), system_name="Darwin")
-            store.save("secret-computer-token")
+    def test_macos_keychain_native_add_and_update_zero_temporary_secret(self) -> None:
+        native = FakeMacSecurityNative()
+        keychain = agentwatch_core.MacOSKeychain(native)
+        with mock.patch.object(agentwatch_core.subprocess, "run") as subprocess_run:
+            keychain.save("computer-1", "first-secret-token")
+        subprocess_run.assert_not_called()
+        self.assertEqual(1, len(native.add_calls))
+        self.assertEqual([], native.update_calls)
+        self.assertTrue(all(value == 0 for value in native.add_calls[0][2]))
 
-        args, kwargs = run.call_args
-        self.assertNotIn("secret-computer-token", args[0])
-        self.assertEqual("-w", args[0][-1])
-        self.assertEqual("secret-computer-token\nsecret-computer-token\n", kwargs["input"])
-        self.assertIs(kwargs["stdout"], agentwatch_core.subprocess.DEVNULL)
+        native.add_status = agentwatch_core.ERR_SEC_DUPLICATE_ITEM
+        keychain.save("computer-1", "updated-secret-token")
+        self.assertEqual(1, len(native.update_calls))
+        self.assertTrue(all(value == 0 for value in native.update_calls[0][2]))
+
+    def test_macos_keychain_native_read_and_delete(self) -> None:
+        native = FakeMacSecurityNative()
+        keychain = agentwatch_core.MacOSKeychain(native)
+        native.read_status = agentwatch_core.ERR_SEC_SUCCESS
+        native.read_secret = bytearray(b"loaded-computer-token")
+
+        self.assertEqual("loaded-computer-token", keychain.load("computer-1"))
+        self.assertTrue(all(value == 0 for value in native.read_secret))
+        keychain.delete("computer-1")
+        self.assertEqual([(agentwatch_core.KEYCHAIN_SERVICE, "computer-1")], native.delete_calls)
+
+        native.delete_status = agentwatch_core.ERR_SEC_ITEM_NOT_FOUND
+        keychain.delete("computer-1")
+
+    def test_macos_keychain_error_mapping_never_contains_token(self) -> None:
+        native = FakeMacSecurityNative()
+        native.add_status = agentwatch_core.ERR_SEC_INTERACTION_NOT_ALLOWED
+        keychain = agentwatch_core.MacOSKeychain(native)
+        token = "must-never-appear-in-error"
+
+        with self.assertRaises(agentwatch_core.AgentWatchError) as caught:
+            keychain.save("computer-1", token)
+
+        self.assertIn("locked or unavailable", str(caught.exception))
+        self.assertNotIn(token, str(caught.exception))
+
+    def test_computer_token_store_uses_injected_macos_keychain(self) -> None:
+        keychain = mock.Mock()
+        keychain.load.return_value = "stored-token"
+        store = agentwatch_core.ComputerTokenStore(
+            "computer-1",
+            Path("/tmp/unused"),
+            system_name="Darwin",
+            macos_keychain=keychain,
+        )
+
+        store.save("new-token")
+        self.assertEqual("stored-token", store.load())
+        store.delete()
+        keychain.save.assert_called_once_with("computer-1", "new-token")
+        keychain.delete.assert_called_once_with("computer-1")
 
     def test_linux_secret_service_failure_falls_back_and_can_reload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -315,6 +388,48 @@ class CliSafetyTests(unittest.TestCase):
                 agentwatch._login("alice", paths, service)
             getpass_prompt.assert_not_called()
 
+    def test_login_keyboard_interrupt_after_server_token_revokes_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            service = mock.Mock()
+            store = mock.Mock()
+            store.save.side_effect = KeyboardInterrupt()
+            api = mock.Mock()
+            api.login.return_value = {"computer_token": "fresh-token", "username": "alice"}
+            api.logout.return_value = {"ok": True}
+            with mock.patch.object(agentwatch.sys.stdin, "isatty", return_value=True), mock.patch.object(
+                agentwatch.getpass, "getpass", return_value="account-password"
+            ), mock.patch.object(agentwatch, "AgentWatchApi", return_value=api), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), self.assertRaises(KeyboardInterrupt):
+                agentwatch._login("alice", paths, service)
+
+            api.logout.assert_called_once_with("fresh-token")
+            store.delete.assert_called_once_with()
+            service.stop.assert_called_once_with()
+
+    def test_login_cleanup_preserves_local_token_when_server_revoke_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            service = mock.Mock()
+            store = mock.Mock()
+            service.start.side_effect = agentwatch_core.AgentWatchError("service failed")
+            api = mock.Mock()
+            api.login.return_value = {"computer_token": "fresh-token", "username": "alice"}
+            api.logout.side_effect = agentwatch_core.AgentWatchError("network unavailable")
+            with mock.patch.object(agentwatch.sys.stdin, "isatty", return_value=True), mock.patch.object(
+                agentwatch.getpass, "getpass", return_value="account-password"
+            ), mock.patch.object(agentwatch, "AgentWatchApi", return_value=api), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), self.assertRaises(agentwatch_core.AgentWatchError):
+                agentwatch._login("alice", paths, service)
+
+            api.logout.assert_called_once_with("fresh-token")
+            store.delete.assert_not_called()
+            service.stop.assert_called_once_with()
+
     def test_json_option_works_before_or_after_command(self) -> None:
         parser = agentwatch.build_parser()
         self.assertTrue(parser.parse_args(["--json", "status"]).json)
@@ -431,6 +546,487 @@ class CliSafetyTests(unittest.TestCase):
             store.delete.assert_called_once_with()
             service.stop.assert_called_once_with()
             self.assertTrue(json.loads(output.getvalue())["server_revoked"])
+
+
+class DeliveryModeTests(unittest.TestCase):
+    def test_settings_round_trip_is_atomic_private_and_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            agentwatch_core.save_delivery_mode("both", root)
+
+            settings = root / "settings.json"
+            self.assertEqual("both", agentwatch_core.load_delivery_mode(root))
+            self.assertEqual(0o600, stat.S_IMODE(settings.stat().st_mode))
+            self.assertEqual(
+                {"version": 1, "delivery_mode": "both"},
+                json.loads(settings.read_text(encoding="utf-8")),
+            )
+            self.assertEqual([], list(root.glob(".settings.json.*")))
+            with self.assertRaises(agentwatch_core.AgentWatchError):
+                agentwatch_core.save_delivery_mode("ntfy", root)
+
+    def test_resolver_reports_operational_degraded_both(self) -> None:
+        state = agentwatch_core.resolve_delivery("both", True, False)
+
+        self.assertEqual(["bark"], state["effective_channels"])
+        self.assertEqual(["agentwatch"], state["missing_channels"])
+        self.assertTrue(state["operational"])
+        self.assertFalse(state["fully_configured"])
+        self.assertTrue(state["degraded"])
+
+    def test_bark_only_notifier_never_reads_agentwatch_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            agentwatch_core.save_delivery_mode("bark", root)
+            environment = {
+                "AGENTWATCH_CONFIG_DIR": str(root),
+                "BARK_URL": "https://example.invalid/bark",
+                "CODEX_WATCH_MACOS_NOTIFICATION": "0",
+            }
+            machine = {"computer_id": "computer-1", "computer_name": "test", "platform": "macos"}
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                notifier, "load_or_create_machine", return_value=machine
+            ), mock.patch.object(notifier, "ComputerTokenStore") as token_store:
+                delivery = notifier.Notifier(False, notifier.Logger(None))
+
+            token_store.assert_not_called()
+            self.assertEqual(["bark"], delivery.channels)
+            self.assertTrue(delivery.delivery["fully_configured"])
+
+    def test_both_without_android_login_runs_bark_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            agentwatch_core.save_delivery_mode("both", root)
+            environment = {
+                "AGENTWATCH_CONFIG_DIR": str(root),
+                "BARK_URL": "https://example.invalid/bark",
+                "CODEX_WATCH_MACOS_NOTIFICATION": "0",
+            }
+            machine = {"computer_id": "computer-1", "computer_name": "test", "platform": "macos"}
+            store = mock.Mock()
+            store.load.return_value = None
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                notifier, "load_or_create_machine", return_value=machine
+            ), mock.patch.object(notifier, "ComputerTokenStore", return_value=store):
+                delivery = notifier.Notifier(False, notifier.Logger(None))
+                with mock.patch.object(delivery, "_send_bark", return_value=True) as bark_send:
+                    sent = delivery.send("title", "body", {"event_type": "codex_task_complete"})
+
+            self.assertTrue(sent)
+            self.assertEqual(["bark"], delivery.channels)
+            self.assertTrue(delivery.delivery["degraded"])
+            bark_send.assert_called_once()
+
+    def test_agentwatch_only_ignores_stale_bark_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            agentwatch_core.save_delivery_mode("agentwatch", root)
+            environment = {
+                "AGENTWATCH_CONFIG_DIR": str(root),
+                "BARK_URL": "https://example.invalid/stale-bark",
+                "CODEX_WATCH_MACOS_NOTIFICATION": "0",
+            }
+            machine = {"computer_id": "computer-1", "computer_name": "test", "platform": "macos"}
+            store = mock.Mock()
+            store.load.return_value = "private-token"
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                notifier, "load_or_create_machine", return_value=machine
+            ), mock.patch.object(notifier, "ComputerTokenStore", return_value=store):
+                delivery = notifier.Notifier(False, notifier.Logger(None))
+
+            self.assertEqual(["agentwatch"], delivery.channels)
+            self.assertNotIn("bark", delivery.channels)
+
+    def test_revoked_agentwatch_in_both_finishes_via_bark_without_retry_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            agentwatch_core.save_delivery_mode("both", root)
+            environment = {
+                "AGENTWATCH_CONFIG_DIR": str(root),
+                "BARK_URL": "https://example.invalid/bark",
+                "CODEX_WATCH_MACOS_NOTIFICATION": "0",
+            }
+            machine = {"computer_id": "computer-1", "computer_name": "test", "platform": "macos"}
+            store = mock.Mock()
+            store.load.return_value = "revoked-token"
+            api = mock.Mock()
+            api.publish.side_effect = agentwatch_core.ApiError(401, "unauthorized", "revoked")
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                notifier, "load_or_create_machine", return_value=machine
+            ), mock.patch.object(notifier, "ComputerTokenStore", return_value=store), mock.patch.object(
+                notifier, "AgentWatchApi", return_value=api
+            ):
+                delivery = notifier.Notifier(False, notifier.Logger(None))
+                with mock.patch.object(delivery, "_send_bark", return_value=True) as bark_send:
+                    first = delivery.send("title", "body", {"event_type": "codex_task_complete"})
+                    second = delivery.send("title 2", "body 2", {"event_type": "codex_task_complete"})
+
+            self.assertTrue(first)
+            self.assertTrue(second)
+            self.assertIn("agentwatch", delivery.disabled_channels)
+            self.assertEqual(1, api.publish.call_count)
+            self.assertEqual(2, bark_send.call_count)
+            store.delete.assert_called_once_with()
+
+    def test_headless_install_without_inferable_mode_requires_explicit_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            service = mock.Mock()
+            service.installed.return_value = False
+            service.state.return_value = "stopped"
+            store = mock.Mock()
+            store.load.return_value = None
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True), mock.patch.object(
+                agentwatch, "InstallPaths", return_value=paths
+            ), mock.patch.object(agentwatch, "ServiceManager", return_value=service), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["install", "--json"])
+
+            self.assertEqual(1, result)
+            self.assertEqual("delivery_mode_required", json.loads(output.getvalue())["error"])
+            service.install.assert_not_called()
+
+    def test_explicit_bark_install_starts_without_login_or_keychain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            (paths.config / "env").write_text("BARK_URL=https://example.invalid/bark\n", encoding="utf-8")
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "active"
+            store = mock.Mock()
+            store.backend_name.return_value = "test"
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True), mock.patch.object(
+                agentwatch, "InstallPaths", return_value=paths
+            ), mock.patch.object(agentwatch, "ServiceManager", return_value=service), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(agentwatch, "install_runtime"), mock.patch.object(
+                agentwatch, "_login"
+            ) as login, mock.patch("sys.stdout", output):
+                result = agentwatch.main(["install", "--delivery", "bark", "--json"])
+
+            self.assertEqual(0, result)
+            service.install.assert_called_once_with(should_start=True)
+            store.load.assert_not_called()
+            login.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertEqual("bark", payload["delivery_mode"])
+            self.assertTrue(payload["operational"])
+
+    def test_bark_two_stage_install_then_update_starts_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "stopped"
+            store = mock.Mock()
+            store.backend_name.return_value = "test"
+            install_output = io.StringIO()
+            human_output = io.StringIO()
+            update_output = io.StringIO()
+            with mock.patch.dict(
+                os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True
+            ), mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(
+                agentwatch, "install_runtime"
+            ):
+                with mock.patch("sys.stdout", install_output):
+                    installed = agentwatch.main(
+                        ["install", "--delivery", "bark", "--json", "--no-login"]
+                    )
+
+                self.assertEqual(0, installed)
+                service.install.assert_called_once_with(should_start=False)
+                first_payload = json.loads(install_output.getvalue())
+                self.assertFalse(first_payload["operational"])
+                self.assertTrue(first_payload["bark_configuration_required"])
+                self.assertIn("agentwatch update", first_payload["message"])
+
+                service.reset_mock()
+                with mock.patch("sys.stdout", human_output):
+                    human_install = agentwatch.main(
+                        ["install", "--delivery", "bark", "--no-login"]
+                    )
+                self.assertEqual(0, human_install)
+                service.install.assert_called_once_with(should_start=False)
+                self.assertIn("agentwatch update", human_output.getvalue())
+
+                (paths.config / "env").write_text(
+                    "BARK_URL=https://example.invalid/private-bark\n", encoding="utf-8"
+                )
+                service.reset_mock()
+                service.state.return_value = "active"
+                with mock.patch("sys.stdout", update_output):
+                    updated = agentwatch.main(["update", "--json"])
+
+            self.assertEqual(0, updated)
+            service.install.assert_called_once_with(should_start=True)
+            second_payload = json.loads(update_output.getvalue())
+            self.assertTrue(second_payload["operational"])
+            self.assertEqual(["bark"], second_payload["effective_channels"])
+            store.load.assert_not_called()
+
+    def test_both_two_stage_install_then_update_runs_bark_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "stopped"
+            store = mock.Mock()
+            store.load.return_value = None
+            store.backend_name.return_value = "test"
+            install_output = io.StringIO()
+            update_output = io.StringIO()
+            with mock.patch.dict(
+                os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True
+            ), mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(
+                agentwatch, "install_runtime"
+            ):
+                with mock.patch("sys.stdout", install_output):
+                    installed = agentwatch.main(
+                        ["install", "--delivery", "both", "--json", "--no-login"]
+                    )
+
+                self.assertEqual(0, installed)
+                service.install.assert_called_once_with(should_start=False)
+                first_payload = json.loads(install_output.getvalue())
+                self.assertFalse(first_payload["operational"])
+                self.assertTrue(first_payload["login_required"])
+                self.assertTrue(first_payload["bark_configuration_required"])
+                self.assertIn("agentwatch login", first_payload["message"])
+                self.assertIn("agentwatch update", first_payload["message"])
+
+                (paths.config / "env").write_text(
+                    "BARK_KEY=private-bark-key\n", encoding="utf-8"
+                )
+                service.reset_mock()
+                service.state.return_value = "active"
+                with mock.patch("sys.stdout", update_output):
+                    updated = agentwatch.main(["update", "--json"])
+
+            self.assertEqual(0, updated)
+            service.install.assert_called_once_with(should_start=True)
+            second_payload = json.loads(update_output.getvalue())
+            self.assertTrue(second_payload["operational"])
+            self.assertTrue(second_payload["degraded"])
+            self.assertTrue(second_payload["login_required"])
+            self.assertEqual(["bark"], second_payload["effective_channels"])
+
+    def test_both_agentwatch_only_update_restarts_to_pick_up_new_bark(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "active"
+            store = mock.Mock()
+            store.load.return_value = "computer-token"
+            store.backend_name.return_value = "test"
+            install_output = io.StringIO()
+            update_output = io.StringIO()
+            with mock.patch.dict(
+                os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True
+            ), mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(
+                agentwatch, "install_runtime"
+            ):
+                with mock.patch("sys.stdout", install_output):
+                    installed = agentwatch.main(
+                        ["install", "--delivery", "both", "--json", "--no-login"]
+                    )
+
+                self.assertEqual(0, installed)
+                service.install.assert_called_once_with(should_start=True)
+                first_payload = json.loads(install_output.getvalue())
+                self.assertEqual(["agentwatch"], first_payload["effective_channels"])
+                self.assertTrue(first_payload["bark_configuration_required"])
+                self.assertIn("agentwatch update", first_payload["message"])
+
+                (paths.config / "env").write_text(
+                    "BARK_URL=https://example.invalid/private-bark\n", encoding="utf-8"
+                )
+                service.reset_mock()
+                with mock.patch("sys.stdout", update_output):
+                    updated = agentwatch.main(["update", "--json"])
+
+            self.assertEqual(0, updated)
+            service.install.assert_called_once_with(should_start=True)
+            second_payload = json.loads(update_output.getvalue())
+            self.assertTrue(second_payload["fully_configured"])
+            self.assertEqual(["bark", "agentwatch"], second_payload["effective_channels"])
+
+    def test_shell_receiver_values_do_not_mark_daemon_operational(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "stopped"
+            store = mock.Mock()
+            store.backend_name.return_value = "test"
+            output = io.StringIO()
+            shell_environment = {
+                "AGENTWATCH_CONFIG_DIR": str(paths.config),
+                "BARK_URL": "https://example.invalid/shell-only",
+                "BARK_KEY": "shell-only-key",
+                "NTFY_URL": "https://example.invalid/legacy-shell-only",
+            }
+            with mock.patch.dict(os.environ, shell_environment, clear=True), mock.patch.object(
+                agentwatch, "InstallPaths", return_value=paths
+            ), mock.patch.object(agentwatch, "ServiceManager", return_value=service), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(agentwatch, "install_runtime"), mock.patch("sys.stdout", output):
+                result = agentwatch.main(
+                    ["install", "--delivery", "bark", "--json", "--no-login"]
+                )
+
+            self.assertEqual(0, result)
+            service.install.assert_called_once_with(should_start=False)
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["bark_configured"])
+            self.assertFalse(payload["operational"])
+            self.assertFalse(payload["legacy_ntfy_ignored"])
+
+    def test_windows_ready_task_is_not_reported_as_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            paths.runtime.mkdir(parents=True)
+            for filename in agentwatch.RUNTIME_FILES[:3]:
+                (paths.runtime / filename).write_text("# test\n", encoding="utf-8")
+            (paths.config / "env").write_text(
+                "BARK_URL=https://example.invalid/private-bark\n", encoding="utf-8"
+            )
+            agentwatch_core.save_delivery_mode("bark", paths.config)
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "ready"
+            store = mock.Mock()
+            store.backend_name.return_value = "test"
+            status_output = io.StringIO()
+            doctor_output = io.StringIO()
+            with mock.patch.dict(
+                os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True
+            ), mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(agentwatch, "ComputerTokenStore", return_value=store):
+                with mock.patch("sys.stdout", status_output):
+                    status_result = agentwatch.main(["status", "--json"])
+                with mock.patch("sys.stdout", doctor_output):
+                    doctor_result = agentwatch.main(["doctor", "--json"])
+
+            self.assertNotIn("ready", agentwatch.RUNNING_SERVICE_STATES)
+            self.assertEqual(1, status_result)
+            self.assertTrue(json.loads(status_output.getvalue())["operational"])
+            self.assertEqual(1, doctor_result)
+            doctor_payload = json.loads(doctor_output.getvalue())
+            self.assertFalse(doctor_payload["checks"]["service_running"])
+            self.assertFalse(doctor_payload["ok"])
+
+    def test_logout_from_both_keeps_ready_bark_service_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            (paths.config / "env").write_text("BARK_URL=https://example.invalid/bark\n", encoding="utf-8")
+            agentwatch_core.save_delivery_mode("both", paths.config)
+            service = mock.Mock()
+            store = mock.Mock()
+            store.load.return_value = "computer-token"
+            api = mock.Mock()
+            api.logout.return_value = {"ok": True}
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True), mock.patch.object(
+                agentwatch, "InstallPaths", return_value=paths
+            ), mock.patch.object(agentwatch, "ServiceManager", return_value=service), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(agentwatch, "AgentWatchApi", return_value=api), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["logout", "--json"])
+
+            self.assertEqual(0, result)
+            service.start.assert_called_once_with()
+            service.stop.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertEqual(["bark"], payload["effective_channels"])
+            self.assertTrue(payload["degraded"])
+
+    def test_status_succeeds_for_running_operational_bark_without_android_login(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            (paths.config / "env").write_text("BARK_KEY=private-key\n", encoding="utf-8")
+            agentwatch_core.save_delivery_mode("bark", paths.config)
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "active"
+            store = mock.Mock()
+            store.backend_name.return_value = "test"
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True), mock.patch.object(
+                agentwatch, "InstallPaths", return_value=paths
+            ), mock.patch.object(agentwatch, "ServiceManager", return_value=service), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["status", "--json"])
+
+            self.assertEqual(0, result)
+            store.load.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["authenticated"])
+            self.assertTrue(payload["operational"])
+            self.assertTrue(payload["fully_configured"])
+
+    def test_doctor_allows_both_degraded_to_ready_bark_without_server_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            paths.runtime.mkdir(parents=True)
+            for filename in agentwatch.RUNTIME_FILES[:3]:
+                (paths.runtime / filename).write_text("# test\n", encoding="utf-8")
+            (paths.config / "env").write_text("BARK_URL=https://example.invalid/bark\n", encoding="utf-8")
+            agentwatch_core.save_delivery_mode("both", paths.config)
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "active"
+            store = mock.Mock()
+            store.load.return_value = None
+            store.backend_name.return_value = "test"
+            api = mock.Mock()
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True), mock.patch.object(
+                agentwatch, "InstallPaths", return_value=paths
+            ), mock.patch.object(agentwatch, "ServiceManager", return_value=service), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(agentwatch, "AgentWatchApi", return_value=api), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["doctor", "--json"])
+
+            self.assertEqual(0, result)
+            api.health.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["operational"])
+            self.assertTrue(payload["degraded"])
+            self.assertEqual(["agentwatch"], payload["missing_channels"])
 
 
 if __name__ == "__main__":
