@@ -10,6 +10,7 @@ __pycache__/
 dist/
 .worktrees/
 android/.gradle/
+android/.kotlin/
 android/.idea/
 android/local.properties
 android/**/build/

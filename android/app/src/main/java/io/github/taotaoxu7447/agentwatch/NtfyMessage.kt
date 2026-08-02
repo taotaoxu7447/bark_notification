@@ -35,6 +35,7 @@ data class NtfyMessage(
         ZCODE("zcode", "ZCode"),
         KIMI("kimi", "Kimi Code"),
         GROK("grok", "Grok Build"),
+        CLAUDE("claude", "Claude Code"),
         OTHER("other", "其他任务"),
     }
 
@@ -103,6 +104,7 @@ data class NtfyMessage(
                 normalized.startsWith("zcode") -> Source.ZCODE
                 normalized.startsWith("kimi") -> Source.KIMI
                 normalized.startsWith("grok") -> Source.GROK
+                normalized.startsWith("claude") -> Source.CLAUDE
                 else -> Source.OTHER
             }
         }

@@ -74,6 +74,83 @@ class MachineIdentityTests(unittest.TestCase):
             self.assertEqual("macos", first["platform"])
             self.assertEqual(0, stat.S_IMODE((root / "machine.json").stat().st_mode) & 0o077)
 
+    def test_read_only_machine_load_does_not_create_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            self.assertIsNone(agentwatch_core.load_machine(root))
+            self.assertFalse((root / "machine.json").exists())
+
+
+class ReadOnlyStatusAndPersistentConfigTests(unittest.TestCase):
+    @staticmethod
+    def claude_status() -> dict:
+        return {
+            "enabled": False,
+            "configured": False,
+            "events_path_safe": True,
+            "active": False,
+            "policy_active": False,
+            "cli_detected": False,
+            "cli_compatible": False,
+        }
+
+    def test_status_uses_persistent_api_base_without_creating_identity_or_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            env_path = paths.config / "env"
+            env_path.write_text(
+                "AGENTWATCH_API_BASE=https://private.example.test/api/v1\n"
+                "BARK_URL=https://bark.example.test/device\n",
+                encoding="utf-8",
+            )
+            service = mock.Mock()
+            service.installed.return_value = False
+            service.state.return_value = "not loaded"
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                agentwatch, "_installed_claude_hook_status", return_value=self.claude_status()
+            ):
+                result = agentwatch._status(paths, service)
+
+            self.assertEqual("https://private.example.test/api/v1", result["api_base"])
+            self.assertEqual("bark", result["delivery_mode"])
+            self.assertEqual("", result["computer_id"])
+            self.assertFalse((paths.config / "machine.json").exists())
+            self.assertFalse((paths.config / "settings.json").exists())
+            self.assertEqual([env_path], list(paths.config.iterdir()))
+
+    def test_shell_api_base_overrides_persistent_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            (paths.config / "env").write_text(
+                "AGENTWATCH_API_BASE=https://persistent.example.test/api/v1\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTWATCH_API_BASE": "https://shell.example.test/api/v1/"},
+                clear=True,
+            ):
+                configured = agentwatch._configured_api_base(paths)
+
+            self.assertEqual("https://shell.example.test/api/v1", configured)
+
+    def test_non_utf8_persistent_env_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            (paths.config / "env").write_bytes(b"BARK_URL=https://example.test/\xff\n")
+
+            with self.assertRaises(agentwatch_core.AgentWatchError):
+                agentwatch._config_values(paths)
+
 
 class CredentialStoreTests(unittest.TestCase):
     def test_linux_fallback_uses_0600_and_round_trips(self) -> None:
@@ -240,7 +317,442 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual("https://example.test/api/v1/computers/logout", request.full_url)
         self.assertEqual({}, json.loads(request.data))
         self.assertEqual("Bearer computer-token", request.headers["Authorization"])
+        self.assertEqual("agentwatch-computer/0.3.0", request.headers["User-agent"])
         self.assertTrue(response["ok"])
+
+
+class ClaudeHookIngestorTests(unittest.TestCase):
+    def test_stop_hook_appends_only_validated_fields_to_private_spool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            transcript = root / "session.jsonl"
+            transcript.write_text("one completed turn\n", encoding="utf-8")
+            spool = root / "private" / "claude-hook-events.jsonl"
+            payload = {
+                "session_id": "session-123",
+                "prompt_id": "prompt-456",
+                "transcript_path": str(transcript),
+                "cwd": "/tmp/project",
+                "permission_mode": "default",
+                "hook_event_name": "Stop",
+                "stop_hook_active": False,
+                "last_assistant_message": "任务已完成。",
+                "background_tasks": [],
+                "session_crons": [],
+                "untrusted_extra": "must not be persisted",
+            }
+
+            with mock.patch.object(agentwatch.time, "time", return_value=123):
+                appended = agentwatch.ingest_claude_hook_event(
+                    io.StringIO(json.dumps(payload, ensure_ascii=False)),
+                    events_path=spool,
+                )
+
+            self.assertTrue(appended)
+            record = json.loads(spool.read_text(encoding="utf-8"))
+            self.assertEqual(agentwatch.CLAUDE_HOOK_SCHEMA, record["schema"])
+            self.assertEqual("Stop", record["hook_event_name"])
+            self.assertEqual("prompt-456", record["prompt_id"])
+            self.assertEqual(transcript.stat().st_size, record["transcript_size"])
+            self.assertEqual(123, record["received_at"])
+            self.assertFalse(record["stop_hook_active"])
+            self.assertFalse(record["has_background_tasks"])
+            self.assertFalse(record["has_session_crons"])
+            self.assertEqual(
+                agentwatch.hashlib.sha256("任务已完成。".encode("utf-8")).hexdigest(),
+                record["last_assistant_message_sha256"],
+            )
+            self.assertNotIn("permission_mode", record)
+            self.assertNotIn("untrusted_extra", record)
+            self.assertEqual(0, stat.S_IMODE(spool.stat().st_mode) & 0o077)
+            self.assertEqual(0, stat.S_IMODE(spool.parent.stat().st_mode) & 0o077)
+
+    def test_stop_failure_and_inflight_state_are_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            transcript = root / "session.jsonl"
+            transcript.write_text("failure\n", encoding="utf-8")
+            failure_spool = root / "failure.jsonl"
+            failure = {
+                "session_id": "session-123",
+                "prompt_id": "prompt-error",
+                "transcript_path": str(transcript),
+                "cwd": "/tmp/project",
+                "hook_event_name": "StopFailure",
+                "error": "rate_limit",
+                "error_details": "429 Too Many Requests",
+                "last_assistant_message": "API Error: Rate limit reached",
+            }
+            inflight_spool = root / "inflight.jsonl"
+            inflight = {
+                "session_id": "session-123",
+                "prompt_id": "prompt-running",
+                "transcript_path": str(transcript),
+                "cwd": "/tmp/project",
+                "hook_event_name": "Stop",
+                "last_assistant_message": "后台任务还在运行。",
+                "background_tasks": [{"id": "task-1", "status": "running"}],
+                "session_crons": [{"id": "cron-1"}],
+            }
+
+            self.assertTrue(
+                agentwatch.ingest_claude_hook_event(io.StringIO(json.dumps(failure)), events_path=failure_spool)
+            )
+            self.assertTrue(
+                agentwatch.ingest_claude_hook_event(io.StringIO(json.dumps(inflight)), events_path=inflight_spool)
+            )
+
+            failure_record = json.loads(failure_spool.read_text(encoding="utf-8"))
+            inflight_record = json.loads(inflight_spool.read_text(encoding="utf-8"))
+            self.assertEqual("rate_limit", failure_record["error"])
+            self.assertFalse(failure_record["stop_hook_active"])
+            self.assertFalse(failure_record["has_background_tasks"])
+            self.assertTrue(inflight_record["has_background_tasks"])
+            self.assertTrue(inflight_record["has_session_crons"])
+            self.assertNotIn("task-1", inflight_spool.read_text(encoding="utf-8"))
+            self.assertNotIn("cron-1", inflight_spool.read_text(encoding="utf-8"))
+
+    def test_all_official_stop_failure_error_types_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            transcript = root / "session.jsonl"
+            transcript.write_text("failure\n", encoding="utf-8")
+            official_errors = {
+                "rate_limit",
+                "overloaded",
+                "authentication_failed",
+                "oauth_org_not_allowed",
+                "billing_error",
+                "invalid_request",
+                "model_not_found",
+                "server_error",
+                "max_output_tokens",
+                "unknown",
+            }
+            self.assertEqual(official_errors, agentwatch.CLAUDE_STOP_FAILURE_ERRORS)
+            for error_name in sorted(official_errors):
+                with self.subTest(error=error_name):
+                    spool = root / f"{error_name}.jsonl"
+                    payload = {
+                        "session_id": "session-123",
+                        "prompt_id": f"prompt-{error_name}",
+                        "transcript_path": str(transcript),
+                        "cwd": "/tmp/project",
+                        "hook_event_name": "StopFailure",
+                        "error": error_name,
+                        "error_details": "official error",
+                        "last_assistant_message": "API request failed",
+                    }
+                    self.assertTrue(
+                        agentwatch.ingest_claude_hook_event(
+                            io.StringIO(json.dumps(payload)), events_path=spool
+                        )
+                    )
+                    self.assertEqual(
+                        error_name,
+                        json.loads(spool.read_text(encoding="utf-8"))["error"],
+                    )
+
+    def test_invalid_and_subagent_payloads_are_ignored_but_continuation_stop_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            spool = Path(temp_dir) / "events.jsonl"
+            base = {
+                "session_id": "session-123",
+                "transcript_path": "/tmp/session.jsonl",
+                "cwd": "/tmp/project",
+                "last_assistant_message": "done",
+            }
+            subagent = dict(base, hook_event_name="SubagentStop", agent_id="agent-1")
+            invalid_error = dict(base, hook_event_name="StopFailure", error="not-an-official-error")
+            repeated_stop = dict(base, hook_event_name="Stop", stop_hook_active=True)
+            invalid_stop_flag = dict(base, hook_event_name="Stop", stop_hook_active="true")
+
+            self.assertFalse(
+                agentwatch.ingest_claude_hook_event(io.StringIO(json.dumps(subagent)), events_path=spool)
+            )
+            self.assertFalse(
+                agentwatch.ingest_claude_hook_event(io.StringIO(json.dumps(invalid_error)), events_path=spool)
+            )
+            self.assertTrue(
+                agentwatch.ingest_claude_hook_event(io.StringIO(json.dumps(repeated_stop)), events_path=spool)
+            )
+            self.assertFalse(
+                agentwatch.ingest_claude_hook_event(io.StringIO(json.dumps(invalid_stop_flag)), events_path=spool)
+            )
+            self.assertFalse(agentwatch.ingest_claude_hook_event(io.StringIO("{"), events_path=spool))
+            record = json.loads(spool.read_text(encoding="utf-8"))
+            self.assertTrue(record["stop_hook_active"])
+            self.assertEqual("Stop", record["hook_event_name"])
+
+    def test_claude_hook_command_never_blocks_or_prints_on_invalid_input(self) -> None:
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(agentwatch.sys, "stdin", io.StringIO("{")), mock.patch(
+            "sys.stdout", output
+        ), mock.patch("sys.stderr", errors):
+            result = agentwatch.main(["claude-hook"])
+
+        self.assertEqual(0, result)
+        self.assertEqual("", output.getvalue())
+        self.assertEqual("", errors.getvalue())
+
+    def test_hook_spool_symlink_is_silently_rejected_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "important.txt"
+            target.write_text("keep intact\n", encoding="utf-8")
+            spool = root / "events.jsonl"
+            spool.symlink_to(target)
+            payload = {
+                "session_id": "session-123",
+                "prompt_id": "prompt-123",
+                "transcript_path": str(root / "session.jsonl"),
+                "cwd": "/tmp/project",
+                "hook_event_name": "Stop",
+                "stop_hook_active": False,
+                "last_assistant_message": "done",
+                "background_tasks": [],
+                "session_crons": [],
+            }
+            output = io.StringIO()
+            errors = io.StringIO()
+
+            with mock.patch.object(
+                agentwatch.sys, "stdin", io.StringIO(json.dumps(payload))
+            ), mock.patch("sys.stdout", output), mock.patch("sys.stderr", errors):
+                result = agentwatch.main(
+                    ["claude-hook", "--events-file", str(spool)]
+                )
+
+            self.assertEqual(0, result)
+            self.assertEqual("keep intact\n", target.read_text(encoding="utf-8"))
+            self.assertEqual("", output.getvalue())
+            self.assertEqual("", errors.getvalue())
+
+
+class ClaudeHookInstallerIntegrationTests(unittest.TestCase):
+    def test_install_update_and_uninstall_preserve_other_claude_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            claude_settings = paths.home / ".claude" / "settings.json"
+            claude_settings.parent.mkdir(parents=True)
+            existing = {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "rtk rewrite"}],
+                        }
+                    ]
+                },
+                "keep": {"future": True},
+            }
+            claude_settings.write_text(json.dumps(existing), encoding="utf-8")
+            service = mock.Mock()
+            service.installed.return_value = True
+            service.state.return_value = "active"
+            store = mock.Mock()
+            store.backend_name.return_value = "test"
+
+            with mock.patch.dict(
+                os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True
+            ), mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(agentwatch, "ComputerTokenStore", return_value=store), mock.patch(
+                "sys.stdout", new_callable=io.StringIO
+            ):
+                installed = agentwatch.main(
+                    ["install", "--delivery", "bark", "--json", "--no-login"]
+                )
+                updated = agentwatch.main(["update", "--json"])
+
+            self.assertEqual(0, installed)
+            self.assertEqual(0, updated)
+            configured = json.loads(claude_settings.read_text(encoding="utf-8"))
+            self.assertEqual(existing["hooks"]["PreToolUse"], configured["hooks"]["PreToolUse"])
+            self.assertEqual({"future": True}, configured["keep"])
+            for event_name in ("Stop", "StopFailure"):
+                self.assertEqual(1, len(configured["hooks"][event_name]))
+                self.assertEqual(1, len(configured["hooks"][event_name][0]["hooks"]))
+
+            with mock.patch.dict(
+                os.environ, {"AGENTWATCH_CONFIG_DIR": str(paths.config)}, clear=True
+            ), mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(agentwatch, "ComputerTokenStore", return_value=store), mock.patch(
+                "sys.stdout", new_callable=io.StringIO
+            ):
+                uninstalled = agentwatch.main(["uninstall", "--json"])
+
+            self.assertEqual(0, uninstalled)
+            remaining = json.loads(claude_settings.read_text(encoding="utf-8"))
+            self.assertEqual(existing, remaining)
+            service.uninstall.assert_called_once_with()
+
+    def test_claude_hook_command_accepts_explicit_installer_spool_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            transcript = root / "session.jsonl"
+            transcript.write_text("turn\n", encoding="utf-8")
+            spool = root / "custom-config" / "claude-hook-events.jsonl"
+            payload = {
+                "session_id": "session-123",
+                "prompt_id": "prompt-123",
+                "transcript_path": str(transcript),
+                "cwd": "/tmp/project",
+                "hook_event_name": "Stop",
+                "stop_hook_active": False,
+                "last_assistant_message": "done",
+                "background_tasks": [],
+                "session_crons": [],
+            }
+
+            handler = agentwatch.build_claude_hook_handler(
+                agentwatch.sys.executable,
+                root / "runtime" / "agentwatch.py",
+                spool,
+            )
+            # The first argument is the script path consumed by Python itself;
+            # pass the exact remaining generated args through the real parser.
+            with mock.patch.object(agentwatch.sys, "stdin", io.StringIO(json.dumps(payload))):
+                result = agentwatch.main(handler["args"][1:])
+
+            self.assertEqual(0, result)
+            self.assertEqual("prompt-123", json.loads(spool.read_text(encoding="utf-8"))["prompt_id"])
+
+    def test_registration_migrates_custom_claude_scope_without_duplicate_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            custom_config = root / "custom-claude"
+            custom_settings = custom_config / "settings.json"
+            default_settings = paths.home / ".claude" / "settings.json"
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "AGENTWATCH_CONFIG_DIR": str(paths.config),
+                    "CLAUDE_CONFIG_DIR": str(custom_config),
+                },
+                clear=True,
+            ):
+                agentwatch._configure_installed_claude_hooks(paths)
+
+            registration = paths.config / agentwatch.CLAUDE_HOOK_REGISTRATION_FILE_NAME
+            self.assertEqual(0o600, stat.S_IMODE(registration.stat().st_mode))
+            self.assertEqual(
+                str(custom_settings),
+                json.loads(registration.read_text(encoding="utf-8"))["settings_path"],
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTWATCH_CONFIG_DIR": str(paths.config)},
+                clear=True,
+            ):
+                before = agentwatch._installed_claude_hook_status(paths)
+                self.assertTrue(before["needs_reconcile"])
+                self.assertFalse(before["active"])
+                agentwatch._configure_installed_claude_hooks(paths)
+                after = agentwatch._installed_claude_hook_status(paths)
+
+            old_payload = json.loads(custom_settings.read_text(encoding="utf-8"))
+            self.assertNotIn("hooks", old_payload)
+            new_payload = json.loads(default_settings.read_text(encoding="utf-8"))
+            for event_name in ("Stop", "StopFailure"):
+                handlers = [
+                    handler
+                    for group in new_payload["hooks"][event_name]
+                    for handler in group["hooks"]
+                ]
+                self.assertEqual(1, len(handlers))
+            self.assertFalse(after["needs_reconcile"])
+            self.assertEqual(
+                str(default_settings),
+                json.loads(registration.read_text(encoding="utf-8"))["settings_path"],
+            )
+
+    def test_registration_symlink_is_rejected_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.config.mkdir(parents=True)
+            outside = root / "outside.json"
+            outside.write_text('{"keep":true}', encoding="utf-8")
+            registration = paths.config / agentwatch.CLAUDE_HOOK_REGISTRATION_FILE_NAME
+            registration.symlink_to(outside)
+
+            with self.assertRaises(agentwatch_core.AgentWatchError):
+                agentwatch._preflight_installed_claude_hooks(paths)
+
+            self.assertEqual({"keep": True}, json.loads(outside.read_text(encoding="utf-8")))
+
+    def test_status_requires_claude_version_with_full_stop_payload_support(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            agentwatch._configure_installed_claude_hooks(paths)
+
+            old_version = mock.Mock(
+                returncode=0,
+                stdout="2.1.195 (Claude Code)\n",
+                stderr="",
+            )
+            supported_version = mock.Mock(
+                returncode=0,
+                stdout="2.1.196 (Claude Code)\n",
+                stderr="",
+            )
+            with mock.patch.object(
+                agentwatch.shutil, "which", return_value="/usr/local/bin/claude"
+            ), mock.patch.object(agentwatch, "_run", return_value=old_version):
+                old_status = agentwatch._installed_claude_hook_status(paths)
+            with mock.patch.object(
+                agentwatch.shutil, "which", return_value="/usr/local/bin/claude"
+            ), mock.patch.object(agentwatch, "_run", return_value=supported_version):
+                supported_status = agentwatch._installed_claude_hook_status(paths)
+
+            self.assertTrue(old_status["configured"])
+            self.assertEqual("2.1.195", old_status["cli_version"])
+            self.assertFalse(old_status["cli_compatible"])
+            self.assertFalse(old_status["active"])
+            self.assertEqual("2.1.196", supported_status["minimum_cli_version"])
+            self.assertTrue(supported_status["cli_compatible"])
+            self.assertTrue(supported_status["active"])
+
+    def test_malformed_claude_settings_uninstall_removes_service_but_keeps_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.runtime.mkdir(parents=True)
+            paths.launcher.parent.mkdir(parents=True)
+            paths.launcher.write_text("launcher", encoding="utf-8")
+            runtime_script = paths.runtime / "agentwatch.py"
+            runtime_script.write_text("# runtime\n", encoding="utf-8")
+            settings = paths.home / ".claude" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text("{invalid", encoding="utf-8")
+            service = mock.Mock()
+            output = io.StringIO()
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTWATCH_CONFIG_DIR": str(paths.config)},
+                clear=True,
+            ), mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["uninstall", "--json"])
+
+            self.assertEqual(1, result)
+            service.uninstall.assert_called_once_with()
+            self.assertTrue(runtime_script.exists())
+            self.assertTrue(paths.launcher.exists())
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["partial"])
+            self.assertTrue(payload["runtime_preserved"])
+            self.assertEqual("claude_hook_cleanup_failed", payload["error"])
 
 
 class PrivateNotifierTests(unittest.TestCase):
@@ -507,7 +1019,29 @@ class CliSafetyTests(unittest.TestCase):
             paths = agentwatch.InstallPaths(root / "config", root / "home")
             paths.runtime.mkdir(parents=True)
             completed = mock.Mock(returncode=0, stdout="", stderr="")
-            with mock.patch.object(agentwatch, "_run", return_value=completed) as run:
+
+            def run_command(command):
+                if command[:3] == ["systemctl", "--user", "show"]:
+                    if paths.linux_unit.exists():
+                        return mock.Mock(
+                            returncode=0,
+                            stdout=(
+                                "LoadState=loaded\nActiveState=inactive\n"
+                                "UnitFileState=disabled\n"
+                            ),
+                            stderr="",
+                        )
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=(
+                            "LoadState=not-found\nActiveState=inactive\n"
+                            "UnitFileState=\n"
+                        ),
+                        stderr="",
+                    )
+                return completed
+
+            with mock.patch.object(agentwatch, "_run", side_effect=run_command) as run:
                 agentwatch.ServiceManager(paths, system_name="Linux").install(authenticated=False)
 
             commands = [call.args[0] for call in run.call_args_list]
@@ -521,11 +1055,33 @@ class CliSafetyTests(unittest.TestCase):
                 paths = agentwatch.InstallPaths(root / "config", root / "home")
                 agentwatch.install_runtime(paths, Path(agentwatch.__file__).resolve().parent)
             completed = mock.Mock(returncode=0, stdout="", stderr="")
-            with mock.patch.object(agentwatch, "_run", return_value=completed) as run:
+            registered = False
+
+            def run_command(command):
+                nonlocal registered
+                if command[0] == "powershell.exe" and "Get-ScheduledTask" in command[-1]:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=(
+                            "agentwatch:present:disabled:false\n"
+                            if registered
+                            else "agentwatch:absent\n"
+                        ),
+                        stderr="",
+                    )
+                if command[0] == "powershell.exe" and "Register-ScheduledTask" in command[-1]:
+                    registered = True
+                return completed
+
+            with mock.patch.object(agentwatch, "_run", side_effect=run_command) as run:
                 agentwatch.ServiceManager(paths, system_name="Windows").install(authenticated=False)
 
             commands = [call.args[0] for call in run.call_args_list]
-            register = next(command for command in commands if command[0] == "powershell.exe")
+            register = next(
+                command
+                for command in commands
+                if command[0] == "powershell.exe" and "Register-ScheduledTask" in command[-1]
+            )
             registration_script = register[-1]
             self.assertIn("-WindowStyle Hidden", registration_script)
             self.assertIn("-RestartCount 999", registration_script)
@@ -534,12 +1090,295 @@ class CliSafetyTests(unittest.TestCase):
             self.assertIn("task.out.log", wrapper)
             self.assertIn("task.err.log", wrapper)
 
+    def test_disabled_install_rejects_unconfirmed_stop_on_every_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            success = mock.Mock(returncode=0, stdout="", stderr="")
+            cases = {
+                "Darwin": lambda command: (
+                    mock.Mock(returncode=0, stdout="state = running\n", stderr="")
+                    if command[:2] == ["launchctl", "print"]
+                    else success
+                ),
+                "Linux": lambda command: (
+                    mock.Mock(
+                        returncode=0,
+                        stdout=(
+                            "LoadState=loaded\nActiveState=active\n"
+                            "UnitFileState=enabled\n"
+                        ),
+                        stderr="",
+                    )
+                    if command[:3] == ["systemctl", "--user", "show"]
+                    else success
+                ),
+                "Windows": lambda command: (
+                    mock.Mock(
+                        returncode=0,
+                        stdout="agentwatch:present:running:true\n",
+                        stderr="",
+                    )
+                    if command[0] == "powershell.exe"
+                    else success
+                ),
+            }
+            for system_name, run_command in cases.items():
+                with self.subTest(system_name=system_name):
+                    paths = agentwatch.InstallPaths(
+                        root / f"config-{system_name}",
+                        root / f"home-{system_name}",
+                    )
+                    paths.runtime.mkdir(parents=True)
+                    with mock.patch.object(
+                        agentwatch, "_run", side_effect=run_command
+                    ), mock.patch.object(
+                        agentwatch, "SERVICE_STATE_TIMEOUT_SECONDS", 0
+                    ), self.assertRaises(agentwatch_core.AgentWatchError):
+                        agentwatch.ServiceManager(
+                            paths, system_name=system_name
+                        ).install(should_start=False)
+
+    def test_start_requires_enabled_and_running_on_every_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            success = mock.Mock(returncode=0, stdout="", stderr="")
+            cases = {
+                "Darwin": lambda command: (
+                    mock.Mock(returncode=0, stdout="state = running\n", stderr="")
+                    if command[:2] == ["launchctl", "print"]
+                    else mock.Mock(
+                        returncode=0,
+                        stdout=(
+                            'disabled services = {\n'
+                            f'  "{agentwatch.MACOS_LABEL}" => true\n'
+                            '}\n'
+                        ),
+                        stderr="",
+                    )
+                    if command[:2] == ["launchctl", "print-disabled"]
+                    else success
+                ),
+                "Linux": lambda command: (
+                    mock.Mock(
+                        returncode=0,
+                        stdout=(
+                            "LoadState=loaded\nActiveState=active\n"
+                            "UnitFileState=disabled\n"
+                        ),
+                        stderr="",
+                    )
+                    if command[:3] == ["systemctl", "--user", "show"]
+                    else success
+                ),
+                "Windows": lambda command: (
+                    mock.Mock(
+                        returncode=0,
+                        stdout="agentwatch:present:running:false\n",
+                        stderr="",
+                    )
+                    if command[0] == "powershell.exe"
+                    else success
+                ),
+            }
+            for system_name, run_command in cases.items():
+                with self.subTest(system_name=system_name):
+                    paths = agentwatch.InstallPaths(
+                        root / f"config-{system_name}",
+                        root / f"home-{system_name}",
+                    )
+                    with mock.patch.object(
+                        agentwatch, "_run", side_effect=run_command
+                    ), mock.patch.object(
+                        agentwatch, "SERVICE_STATE_TIMEOUT_SECONDS", 0
+                    ), self.assertRaises(agentwatch_core.AgentWatchError):
+                        agentwatch.ServiceManager(
+                            paths, system_name=system_name
+                        ).start()
+
+    def test_start_bounded_poll_allows_asynchronous_windows_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            success = mock.Mock(returncode=0, stdout="", stderr="")
+            snapshots = iter(
+                [
+                    "agentwatch:present:ready:true\n",
+                    "agentwatch:present:running:true\n",
+                ]
+            )
+
+            def run_command(command):
+                if command[0] == "powershell.exe":
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=next(snapshots),
+                        stderr="",
+                    )
+                return success
+
+            with mock.patch.object(
+                agentwatch, "_run", side_effect=run_command
+            ), mock.patch.object(
+                agentwatch.time, "sleep"
+            ) as sleep:
+                agentwatch.ServiceManager(paths, system_name="Windows").start()
+
+            sleep.assert_called_once_with(agentwatch.SERVICE_STATE_POLL_SECONDS)
+
+    def _assert_uninstall_service_failure_preserves_runtime(
+        self,
+        *,
+        system_name: str,
+        run_side_effect,
+        prepare_service_definition=None,
+    ) -> tuple[dict, list[list[str]]]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.runtime.mkdir(parents=True)
+            paths.launcher.parent.mkdir(parents=True)
+            runtime_script = paths.runtime / "agentwatch.py"
+            runtime_script.write_text("# must remain\n", encoding="utf-8")
+            paths.launcher.write_text("launcher\n", encoding="utf-8")
+            if prepare_service_definition is not None:
+                prepare_service_definition(paths)
+            service = agentwatch.ServiceManager(paths, system_name=system_name)
+            output = io.StringIO()
+            with mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "_configure_installed_claude_hooks", return_value={}
+            ), mock.patch.object(
+                agentwatch, "_run", side_effect=run_side_effect
+            ) as run, mock.patch.object(
+                agentwatch, "SERVICE_STATE_TIMEOUT_SECONDS", 0
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["uninstall", "--json"])
+
+            self.assertEqual(1, result)
+            self.assertTrue(runtime_script.exists())
+            self.assertTrue(paths.launcher.exists())
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["partial"])
+            self.assertEqual("service_cleanup_failed", payload["error"])
+            self.assertFalse(payload["service_removed"])
+            self.assertTrue(payload["runtime_preserved"])
+            return payload, [call.args[0] for call in run.call_args_list]
+
+    def test_macos_uninstall_stop_failure_with_loaded_agent_preserves_runtime(self) -> None:
+        failed = mock.Mock(returncode=1, stdout="", stderr="operation failed")
+        loaded = mock.Mock(returncode=0, stdout="state = running\n", stderr="")
+
+        def run(command):
+            if command[:2] == ["launchctl", "print"]:
+                return loaded
+            return failed
+
+        def prepare(paths):
+            paths.macos_plist.parent.mkdir(parents=True)
+            paths.macos_plist.write_text("plist", encoding="utf-8")
+
+        _payload, commands = self._assert_uninstall_service_failure_preserves_runtime(
+            system_name="Darwin",
+            run_side_effect=run,
+            prepare_service_definition=prepare,
+        )
+        self.assertTrue(any(command[:2] == ["launchctl", "bootout"] for command in commands))
+        self.assertTrue(any(command[:2] == ["launchctl", "print"] for command in commands))
+
+    def test_linux_uninstall_stop_failure_with_active_unit_preserves_runtime(self) -> None:
+        failed = mock.Mock(returncode=1, stdout="", stderr="operation failed")
+        active = mock.Mock(
+            returncode=0,
+            stdout="LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n",
+            stderr="",
+        )
+
+        def run(command):
+            if command[:3] == ["systemctl", "--user", "show"]:
+                return active
+            return failed
+
+        def prepare(paths):
+            paths.linux_unit.parent.mkdir(parents=True)
+            paths.linux_unit.write_text("[Service]\n", encoding="utf-8")
+
+        _payload, commands = self._assert_uninstall_service_failure_preserves_runtime(
+            system_name="Linux",
+            run_side_effect=run,
+            prepare_service_definition=prepare,
+        )
+        self.assertIn(
+            ["systemctl", "--user", "stop", agentwatch.LINUX_UNIT], commands
+        )
+        self.assertTrue(any(command[:3] == ["systemctl", "--user", "show"] for command in commands))
+
+    def test_windows_uninstall_delete_failure_with_present_task_preserves_runtime(self) -> None:
+        success = mock.Mock(returncode=0, stdout="", stderr="")
+        delete_failed = mock.Mock(returncode=1, stdout="", stderr="access denied")
+        present = mock.Mock(
+            returncode=0,
+            stdout="agentwatch:present:ready:false\n",
+            stderr="",
+        )
+
+        def run(command):
+            if command[0] == "powershell.exe":
+                return present
+            if command[:2] == ["schtasks.exe", "/Delete"]:
+                return delete_failed
+            return success
+
+        _payload, commands = self._assert_uninstall_service_failure_preserves_runtime(
+            system_name="Windows",
+            run_side_effect=run,
+        )
+        self.assertIn(
+            ["schtasks.exe", "/Delete", "/TN", agentwatch.WINDOWS_TASK, "/F"],
+            commands,
+        )
+        self.assertGreaterEqual(
+            sum(command[0] == "powershell.exe" for command in commands), 2
+        )
+
+    def test_uninstall_combines_service_and_claude_hook_cleanup_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.runtime.mkdir(parents=True)
+            paths.launcher.parent.mkdir(parents=True)
+            runtime_script = paths.runtime / "agentwatch.py"
+            runtime_script.write_text("# must remain\n", encoding="utf-8")
+            paths.launcher.write_text("launcher\n", encoding="utf-8")
+            service = mock.Mock()
+            service.uninstall.side_effect = agentwatch_core.AgentWatchError("service remains")
+            output = io.StringIO()
+            with mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch,
+                "_configure_installed_claude_hooks",
+                side_effect=agentwatch_core.AgentWatchError("settings locked"),
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["uninstall", "--json"])
+
+            self.assertEqual(1, result)
+            self.assertTrue(runtime_script.exists())
+            self.assertTrue(paths.launcher.exists())
+            payload = json.loads(output.getvalue())
+            self.assertEqual("service_cleanup_failed", payload["error"])
+            self.assertTrue(payload["claude_hook_cleanup_failed"])
+            self.assertEqual(
+                {"service", "claude_hook"}, set(payload["cleanup_errors"])
+            )
+
     def test_logout_network_failure_keeps_local_token_for_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paths = agentwatch.InstallPaths(root / "config", root / "home")
             store = mock.Mock()
-            store.load.return_value = "still-valid-token"
+            store.load_strict.return_value = "still-valid-token"
             service = mock.Mock()
             api = mock.Mock()
             api.logout.side_effect = agentwatch_core.AgentWatchError("network unavailable")
@@ -556,12 +1395,82 @@ class CliSafetyTests(unittest.TestCase):
             service.stop.assert_not_called()
             self.assertFalse(json.loads(output.getvalue())["ok"])
 
+    def test_logout_credential_backend_outage_does_not_claim_server_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            store = mock.Mock()
+            store.load_strict.side_effect = agentwatch_core.AgentWatchError(
+                "credential backend unavailable"
+            )
+            service = mock.Mock()
+            api = mock.Mock()
+            output = io.StringIO()
+            with mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(
+                agentwatch, "AgentWatchApi", return_value=api
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["logout", "--json"])
+
+            self.assertEqual(1, result)
+            store.load_strict.assert_called_once_with()
+            store.load.assert_not_called()
+            api.logout.assert_not_called()
+            store.delete.assert_not_called()
+            service.start.assert_not_called()
+            service.stop.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload.get("server_revoked", False))
+
+    def test_logout_local_secret_clear_failure_is_partial_and_preserves_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths.runtime.mkdir(parents=True)
+            runtime_script = paths.runtime / "agentwatch.py"
+            runtime_script.write_text("# must remain\n", encoding="utf-8")
+            store = mock.Mock()
+            store.load_strict.return_value = "computer-token"
+            store.delete.side_effect = agentwatch_core.AgentWatchError(
+                "credential clear failed"
+            )
+            service = mock.Mock()
+            api = mock.Mock()
+            api.logout.return_value = {"ok": True}
+            output = io.StringIO()
+            with mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(
+                agentwatch, "AgentWatchApi", return_value=api
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["logout", "--json"])
+
+            self.assertEqual(1, result)
+            api.logout.assert_called_once_with("computer-token")
+            store.delete.assert_called_once_with()
+            self.assertTrue(runtime_script.exists())
+            service.start.assert_not_called()
+            service.stop.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["partial"])
+            self.assertTrue(payload["server_revoked"])
+            self.assertFalse(payload["local_token_deleted"])
+            self.assertTrue(payload["runtime_preserved"])
+            self.assertEqual("local_token_cleanup_failed", payload["error"])
+
     def test_logout_401_is_already_revoked_and_deletes_local_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paths = agentwatch.InstallPaths(root / "config", root / "home")
             store = mock.Mock()
-            store.load.return_value = "revoked-token"
+            store.load_strict.return_value = "revoked-token"
             service = mock.Mock()
             api = mock.Mock()
             api.logout.side_effect = agentwatch_core.ApiError(401, "unauthorized", "revoked")
@@ -577,6 +1486,31 @@ class CliSafetyTests(unittest.TestCase):
             store.delete.assert_called_once_with()
             service.stop.assert_called_once_with()
             self.assertTrue(json.loads(output.getvalue())["server_revoked"])
+
+    def test_logout_without_local_token_does_not_claim_server_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            store = mock.Mock()
+            store.load_strict.return_value = None
+            service = mock.Mock()
+            api = mock.Mock()
+            output = io.StringIO()
+            with mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "ComputerTokenStore", return_value=store
+            ), mock.patch.object(
+                agentwatch, "AgentWatchApi", return_value=api
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["logout", "--json"])
+
+            self.assertEqual(0, result)
+            api.logout.assert_not_called()
+            store.delete.assert_called_once_with()
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["server_revoke_required"])
+            self.assertFalse(payload["server_revoked"])
 
 
 class DeliveryModeTests(unittest.TestCase):
@@ -719,6 +1653,38 @@ class DeliveryModeTests(unittest.TestCase):
             self.assertEqual(1, result)
             self.assertEqual("delivery_mode_required", json.loads(output.getvalue())["error"])
             service.install.assert_not_called()
+            self.assertFalse(paths.runtime.exists())
+            self.assertFalse((paths.home / ".claude" / "settings.json").exists())
+
+    def test_invalid_claude_settings_preflight_prevents_install_and_update_runtime_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            settings = paths.home / ".claude" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text("{invalid", encoding="utf-8")
+            service = mock.Mock()
+            output = io.StringIO()
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTWATCH_CONFIG_DIR": str(paths.config)},
+                clear=True,
+            ), mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(agentwatch, "install_runtime") as install_runtime, mock.patch(
+                "sys.stdout", output
+            ):
+                install_result = agentwatch.main(
+                    ["install", "--delivery", "bark", "--json", "--no-login"]
+                )
+                update_result = agentwatch.main(["update", "--json"])
+
+            self.assertEqual(1, install_result)
+            self.assertEqual(1, update_result)
+            install_runtime.assert_not_called()
+            service.install.assert_not_called()
+            self.assertEqual("{invalid", settings.read_text(encoding="utf-8"))
 
     def test_explicit_bark_install_starts_without_login_or_keychain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -815,6 +1781,8 @@ class DeliveryModeTests(unittest.TestCase):
             service.state.return_value = "stopped"
             store = mock.Mock()
             store.load.return_value = None
+            store.load_strict.return_value = None
+            store.load_read_only.return_value = None
             store.backend_name.return_value = "test"
             install_output = io.StringIO()
             update_output = io.StringIO()
@@ -866,6 +1834,8 @@ class DeliveryModeTests(unittest.TestCase):
             service.state.return_value = "active"
             store = mock.Mock()
             store.load.return_value = "computer-token"
+            store.load_strict.return_value = "computer-token"
+            store.load_read_only.return_value = "computer-token"
             store.backend_name.return_value = "test"
             install_output = io.StringIO()
             update_output = io.StringIO()
@@ -941,7 +1911,7 @@ class DeliveryModeTests(unittest.TestCase):
             paths = agentwatch.InstallPaths(root / "config", root / "home")
             paths.config.mkdir(parents=True)
             paths.runtime.mkdir(parents=True)
-            for filename in agentwatch.RUNTIME_FILES[:3]:
+            for filename in agentwatch.RUNTIME_FILES[:-1]:
                 (paths.runtime / filename).write_text("# test\n", encoding="utf-8")
             (paths.config / "env").write_text(
                 "BARK_URL=https://example.invalid/private-bark\n", encoding="utf-8"
@@ -981,7 +1951,7 @@ class DeliveryModeTests(unittest.TestCase):
             agentwatch_core.save_delivery_mode("both", paths.config)
             service = mock.Mock()
             store = mock.Mock()
-            store.load.return_value = "computer-token"
+            store.load_strict.return_value = "computer-token"
             api = mock.Mock()
             api.logout.return_value = {"ok": True}
             output = io.StringIO()
@@ -1032,15 +2002,17 @@ class DeliveryModeTests(unittest.TestCase):
             paths = agentwatch.InstallPaths(root / "config", root / "home")
             paths.config.mkdir(parents=True)
             paths.runtime.mkdir(parents=True)
-            for filename in agentwatch.RUNTIME_FILES[:3]:
+            for filename in agentwatch.RUNTIME_FILES[:-1]:
                 (paths.runtime / filename).write_text("# test\n", encoding="utf-8")
             (paths.config / "env").write_text("BARK_URL=https://example.invalid/bark\n", encoding="utf-8")
             agentwatch_core.save_delivery_mode("both", paths.config)
+            agentwatch._configure_installed_claude_hooks(paths)
             service = mock.Mock()
             service.installed.return_value = True
             service.state.return_value = "active"
             store = mock.Mock()
             store.load.return_value = None
+            store.load_read_only.return_value = None
             store.backend_name.return_value = "test"
             api = mock.Mock()
             output = io.StringIO()

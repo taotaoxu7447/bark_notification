@@ -53,8 +53,9 @@ Android/account endpoints:
   `computer_id`, `computer_name`, `platform`, `created_at`, and `last_seen_at`.
 - `POST /computers/revoke`: `computer_id` plus App Bearer. Cross-account and
   unknown IDs both return `computer_not_found`.
-- `POST /test`: optional validated `source` plus App Bearer. Sends exactly one
-  device-targeted v2 test notification on the account's private topic.
+- `POST /test`: optional validated `source` (`codex`, `zcode`, `kimi`, `grok`,
+  `claude`, or `other`) plus App Bearer. Sends exactly one device-targeted v2
+  test notification on the account's private topic.
 - `POST /ack`: App Bearer plus `event_id` (legacy `sequence_id` accepted).
   Delivery-only rows contain device, event ID, and server time and expire after
   seven days; title and message body are never stored.
@@ -70,8 +71,9 @@ Computer endpoints:
 - `POST /computers/logout`: `{}` plus Computer Bearer. Revokes the current
   computer token. A repeated request with the old token returns 401, which a CLI
   may treat as already logged out.
-- `POST /publish`: Computer Bearer plus exactly `event_id`, `source`, `title`,
-  `body`, and optional `priority`. The server sets receipt time and publishes a
+- `POST /publish`: Computer Bearer plus exactly `event_id`, `source` (including
+  first-class `claude`), `title`, `body`, and optional `priority`. The server
+  sets receipt time and publishes a
   compact ntfy message envelope:
 
 ```json
@@ -173,8 +175,14 @@ sudo /usr/local/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddy
 sudo systemctl daemon-reload
 sudo systemctl restart agentwatch-registration.service
 curl --fail --silent --show-error https://64.90.8.184:9444/agentwatch/api/v1/health
-sudo -u ntfy -- sqlite3 /var/lib/agentwatch-registration/registration.db 'pragma user_version;'
+sudo -u ntfy -- /usr/bin/python3 -I -c \
+  'import sqlite3; db=sqlite3.connect("/var/lib/agentwatch-registration/registration.db"); print(db.execute("PRAGMA user_version").fetchone()[0]); print(db.execute("PRAGMA quick_check").fetchone()[0]); db.close()'
 ```
+
+The HK host does not require the optional `sqlite3` shell. Use Python's stdlib
+`sqlite3.Connection.backup()` for online, transactionally consistent backups
+of both `registration.db` and ntfy's `user.db`, then run `PRAGMA quick_check`
+against each backup before replacing server code.
 
 ## Controlled legacy retirement
 

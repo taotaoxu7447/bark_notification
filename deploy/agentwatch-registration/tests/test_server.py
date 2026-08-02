@@ -275,6 +275,32 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(expected_target, response["target_tag"])
         self.assertIn("global:test", self.application.limiter._events)
 
+    def test_claude_source_is_allowed_for_test_and_publish(self) -> None:
+        credentials = self.register()
+        computer = self.computer_login()
+
+        status, response = self.request(
+            "/test", {"source": "claude"}, str(credentials["app_token"])
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(response["ok"])
+        self.assertEqual(["claude"], self.publisher.sources)
+
+        payload = {
+            "event_id": "aw2_claude_event-1",
+            "source": "claude",
+            "title": "Claude Code complete",
+            "body": "The Claude Code turn is complete.",
+        }
+        status, response = self.request(
+            "/publish", payload, str(computer["computer_token"])
+        )
+        self.assertEqual(202, status)
+        self.assertEqual(payload["event_id"], response["event_id"])
+        self.assertEqual("claude", self.publisher.events[-1]["source"])
+        envelope = json.loads(self.publisher.events[-1]["message"])
+        self.assertEqual("claude", envelope["source"])
+
     def test_logout_revokes_ntfy_tokens_then_deletes_device(self) -> None:
         credentials = self.register()
         app_token = str(credentials["app_token"])
@@ -1089,12 +1115,12 @@ class NtfyPublisherTest(unittest.TestCase):
         )
         target = server.device_target_tag("device-12345678")
         topic = "aw-" + "a" * 32
-        sequence_id = publisher.publish_test(topic, "codex", target)
+        sequence_id = publisher.publish_test(topic, "claude", target)
         request = captured["request"]
         self.assertIsInstance(request, urllib.request.Request)
         self.assertEqual(f"Bearer {publisher_token}", request.get_header("Authorization"))
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
-        self.assertIn("source_codex", query["tags"][0])
+        self.assertIn("source_claude", query["tags"][0])
         self.assertNotIn("source_agentwatch_test", query["tags"][0])
         self.assertIn(target, query["tags"][0])
         self.assertEqual(sequence_id, request.get_header("X-sequence-id"))
@@ -1110,7 +1136,7 @@ class NtfyPublisherTest(unittest.TestCase):
             {
                 "schema": "agentwatch_event_v2",
                 "event_id": event_id,
-                "source": "kimi",
+                "source": "claude",
                 "title": "Done",
                 "body": "Done",
                 "computer_id": "machine-1",
@@ -1119,11 +1145,11 @@ class NtfyPublisherTest(unittest.TestCase):
             },
             separators=(",", ":"),
         ).encode()
-        publisher.publish_event(topic, event_id, "kimi", "Done", message, "high")
+        publisher.publish_event(topic, event_id, "claude", "Done", message, "high")
         request = captured["request"]
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
         self.assertEqual(event_id, request.get_header("X-sequence-id"))
-        self.assertEqual("agentwatch_v2,source_kimi", query["tags"][0])
+        self.assertEqual("agentwatch_v2,source_claude", query["tags"][0])
         self.assertEqual("high", query["priority"][0])
         self.assertEqual(message, request.data)
 

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="${0:A:h}"
 DIST="$ROOT/dist"
 VERSION="${1:-internal}"
+CLAUDE_ICON_SOURCE="android/app/src/main/res/drawable-nodpi/source_claude.png"
 
 if [[ -z "$ROOT" || -z "$DIST" || "$ROOT" == "/" || "$DIST" != "$ROOT/dist" || "$DIST" == "/" ]]; then
   echo "Refusing unsafe build output path: ROOT=$ROOT DIST=$DIST" >&2
@@ -25,6 +26,7 @@ mkdir -p "$DIST"
 COMMON=(
   agentwatch.py
   agentwatch_core.py
+  claude_hook_config.py
   codex_watch_notifier.py
   env.example
   README.md
@@ -48,6 +50,7 @@ make_pkg() {
     mkdir -p "$pkg_dir/${file:h}"
     cp "$ROOT/$file" "$pkg_dir/$file"
   done
+  cp "$ROOT/$CLAUDE_ICON_SOURCE" "$pkg_dir/assets/claude-icon-v1.png"
   for file in "$@"; do
     cp "$ROOT/$file" "$pkg_dir/$file"
   done
@@ -73,6 +76,7 @@ make_pkg "codex-watch-notifier-windows-$VERSION" \
   # into the Linux package. GNU tar otherwise warns about LIBARCHIVE.xattr
   # records when extracting an archive produced by macOS bsdtar.
   COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --no-acls --no-fflags \
+    --uid 0 --gid 0 --uname root --gname root \
     -czf "codex-watch-notifier-ubuntu-$VERSION.tar.gz" "codex-watch-notifier-ubuntu-$VERSION"
   zip -Xqr "codex-watch-notifier-windows-$VERSION.zip" "codex-watch-notifier-windows-$VERSION"
 )

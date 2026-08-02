@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import platform as platform_module
 import shutil
+import stat as stat_module
 import subprocess
 import tempfile
 from typing import Any, Callable
@@ -27,6 +28,7 @@ import uuid
 
 
 PRODUCT_NAME = "AgentWatch"
+CLIENT_USER_AGENT = "agentwatch-computer/0.3.0"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 API_VERSION = 2
 DEFAULT_API_BASE = "https://64.90.8.184:9444/agentwatch/api/v1"
@@ -36,10 +38,21 @@ SETTINGS_FILE_NAME = "settings.json"
 DELIVERY_SETTINGS_VERSION = 1
 ALLOWED_DELIVERY_MODES = frozenset({"bark", "agentwatch", "both"})
 LINUX_TOKEN_FILE_NAME = "computer-token"
+LINUX_TOKEN_BACKEND_FILE_NAME = "computer-token-backend"
+LINUX_BACKEND_SECRET_SERVICE = "secret-service"
+LINUX_BACKEND_PRIVATE_FILE = "private-file"
+LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW = "private-file-secret-shadow"
+LINUX_BACKENDS = frozenset(
+    {
+        LINUX_BACKEND_SECRET_SERVICE,
+        LINUX_BACKEND_PRIVATE_FILE,
+        LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW,
+    }
+)
 WINDOWS_TOKEN_FILE_NAME = "computer-token.dpapi"
 KEYCHAIN_SERVICE = "io.github.taotaoxu7447.agentwatch.computer"
 SECRET_TOOL_LABEL = "AgentWatch computer token"
-ALLOWED_SOURCES = {"codex", "zcode", "kimi", "grok", "other"}
+ALLOWED_SOURCES = {"codex", "zcode", "kimi", "grok", "claude", "other"}
 
 
 class AgentWatchError(RuntimeError):
@@ -56,11 +69,63 @@ class ApiError(AgentWatchError):
 
 def config_dir() -> Path:
     configured = os.getenv("AGENTWATCH_CONFIG_DIR", DEFAULT_CONFIG_DIR)
-    return Path(os.path.expandvars(os.path.expanduser(configured))).resolve()
+    # Keep the lexical path so installer safety checks can still detect a
+    # symlink or Windows junction in AGENTWATCH_CONFIG_DIR. Resolving here would
+    # erase that evidence before any mutating operation validates the path.
+    expanded = os.path.expandvars(os.path.expanduser(configured))
+    return Path(os.path.abspath(expanded))
 
 
 def api_base() -> str:
     return os.getenv("AGENTWATCH_API_BASE", DEFAULT_API_BASE).strip().rstrip("/")
+
+
+def path_has_link_component(path: Path) -> bool:
+    """Return whether an untrusted descendant contains a symlink/junction.
+
+    The user's home and the platform temporary directory are treated as trusted
+    roots so macOS aliases such as `/var -> /private/var` do not reject normal
+    temporary files. Every component below the longest matching trusted root is
+    checked without resolving the final target. Paths elsewhere are checked
+    from their filesystem anchor.
+    """
+    target = Path(os.path.abspath(path))
+    trusted_roots: list[Path] = []
+    for raw_root in (Path.home(), Path(tempfile.gettempdir())):
+        root = Path(os.path.abspath(raw_root))
+        try:
+            target.relative_to(root)
+        except ValueError:
+            continue
+        trusted_roots.append(root)
+    if trusted_roots:
+        boundary = max(trusted_roots, key=lambda candidate: len(candidate.parts))
+    else:
+        boundary = Path(target.anchor)
+
+    try:
+        relative = target.relative_to(boundary)
+    except ValueError:
+        return True
+    current = boundary
+    reparse_flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    for part in relative.parts:
+        current = current / part
+        if not os.path.lexists(current):
+            continue
+        try:
+            metadata = current.lstat()
+        except OSError:
+            return True
+        is_junction = bool(
+            hasattr(os.path, "isjunction") and os.path.isjunction(current)
+        )
+        is_reparse = bool(
+            getattr(metadata, "st_file_attributes", 0) & reparse_flag
+        )
+        if stat_module.S_ISLNK(metadata.st_mode) or is_junction or is_reparse:
+            return True
+    return False
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -100,27 +165,39 @@ def _platform_slug(system_name: str | None = None) -> str:
     }.get(normalized, normalized or "unknown")
 
 
-def load_or_create_machine(config_root: Path | None = None) -> dict[str, str]:
-    root = config_root or config_dir()
-    path = root / MACHINE_FILE_NAME
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        raw = {}
+def _normalized_machine(raw: Any, *, existing_identity: bool) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        raise AgentWatchError(
+            "AgentWatch machine.json must be a JSON object; refusing to replace computer identity"
+        )
 
-    computer_id = str(raw.get("computer_id") or "").strip()
-    try:
-        parsed_id = str(uuid.UUID(computer_id)) if computer_id else ""
-    except ValueError:
-        parsed_id = ""
-    if not parsed_id:
+    computer_id_value = raw.get("computer_id")
+    computer_id = computer_id_value.strip() if isinstance(computer_id_value, str) else ""
+    if existing_identity:
+        if not computer_id:
+            raise AgentWatchError(
+                "AgentWatch machine.json is missing a valid computer_id; refusing to rotate computer identity"
+            )
+        try:
+            parsed_id = str(uuid.UUID(computer_id))
+        except ValueError as exc:
+            raise AgentWatchError(
+                "AgentWatch machine.json has an invalid computer_id; refusing to rotate computer identity"
+            ) from exc
+    else:
         parsed_id = str(uuid.uuid4())
 
-    computer_name = str(raw.get("computer_name") or "").strip()
+    computer_name_value = raw.get("computer_name")
+    if computer_name_value is not None and not isinstance(computer_name_value, str):
+        raise AgentWatchError("AgentWatch machine.json computer_name must be a string")
+    computer_name = (computer_name_value or "").strip()
     if not computer_name:
         computer_name = platform_module.node().strip() or f"{PRODUCT_NAME}-{parsed_id[:8]}"
     platform_name = _platform_slug()
-    username = str(raw.get("username") or "").strip()
+    username_value = raw.get("username")
+    if username_value is not None and not isinstance(username_value, str):
+        raise AgentWatchError("AgentWatch machine.json username must be a string")
+    username = (username_value or "").strip()
     machine = {
         "computer_id": parsed_id,
         "computer_name": computer_name[:120],
@@ -128,6 +205,30 @@ def load_or_create_machine(config_root: Path | None = None) -> dict[str, str]:
     }
     if username:
         machine["username"] = username[:120]
+    return machine
+
+
+def load_machine(config_root: Path | None = None) -> dict[str, str] | None:
+    """Read and validate an existing computer identity without creating or rewriting it."""
+    root = config_root or config_dir()
+    path = root / MACHINE_FILE_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise AgentWatchError(
+            "AgentWatch machine.json is unreadable or invalid; refusing to replace computer identity"
+        ) from exc
+    return _normalized_machine(raw, existing_identity=True)
+
+
+def load_or_create_machine(config_root: Path | None = None) -> dict[str, str]:
+    root = config_root or config_dir()
+    path = root / MACHINE_FILE_NAME
+    machine = load_machine(root)
+    if machine is None:
+        machine = _normalized_machine({}, existing_identity=False)
 
     serialized = (json.dumps(machine, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
     existing = None
@@ -162,7 +263,7 @@ def load_delivery_mode(config_root: Path | None = None) -> str | None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except (OSError, json.JSONDecodeError, TypeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
         raise AgentWatchError("AgentWatch settings.json is unreadable or invalid") from exc
     if not isinstance(raw, dict) or raw.get("version") != DELIVERY_SETTINGS_VERSION:
         raise AgentWatchError("AgentWatch settings.json has an unsupported format")
@@ -603,16 +704,57 @@ class ComputerTokenStore:
 
     def load(self) -> str | None:
         try:
-            if self.system_name == "Darwin":
-                return self._macos_load()
-            if self.system_name == "Windows":
-                return self._windows_load()
-            if self.system_name == "Linux" and self.which("secret-tool"):
-                secret_value = self._linux_secret_load()
-                return secret_value or self._file_load()
-            return self._file_load()
+            return self.load_strict()
         except (OSError, subprocess.SubprocessError, AgentWatchError, ValueError):
             return None
+
+    def load_strict(self, *, migrate: bool = True) -> str | None:
+        """Load a token, optionally persisting legacy backend discovery."""
+        if self.system_name == "Darwin":
+            return self._macos_load()
+        if self.system_name == "Windows":
+            return self._windows_load_strict()
+        if self.system_name == "Linux":
+            backend = self._linux_backend_load_strict()
+            secret_tool = self.which("secret-tool")
+            if backend in {
+                LINUX_BACKEND_SECRET_SERVICE,
+                LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW,
+            } and not secret_tool:
+                raise AgentWatchError(
+                    "recorded Linux Secret Service credential backend is unavailable"
+                )
+            if backend == LINUX_BACKEND_SECRET_SERVICE:
+                return self._linux_secret_load(strict=True)
+            if backend in {
+                LINUX_BACKEND_PRIVATE_FILE,
+                LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW,
+            }:
+                return self._file_load_strict()
+
+            # Legacy installs predate the backend marker.  A fallback file is
+            # authoritative; when Secret Service is available it may still
+            # contain an older token and is recorded as a shadow that must be
+            # cleared before a destructive logout can finish.
+            if os.path.lexists(self._fallback_path()):
+                value = self._file_load_strict()
+                if migrate:
+                    self._linux_backend_save(
+                        LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW
+                        if secret_tool
+                        else LINUX_BACKEND_PRIVATE_FILE
+                    )
+                return value
+            if secret_tool:
+                value = self._linux_secret_load(strict=True)
+                if value is not None and migrate:
+                    self._linux_backend_save(LINUX_BACKEND_SECRET_SERVICE)
+                return value
+        return self._file_load_strict()
+
+    def load_read_only(self) -> str | None:
+        """Strictly inspect credentials without creating a backend marker."""
+        return self.load_strict(migrate=False)
 
     def save(self, token: str) -> None:
         normalized = token.strip()
@@ -622,26 +764,76 @@ class ComputerTokenStore:
             self._macos_save(normalized)
         elif self.system_name == "Windows":
             self._windows_save(normalized)
-        elif self.system_name == "Linux" and self.which("secret-tool"):
-            try:
-                self._linux_secret_save(normalized)
-            except (OSError, subprocess.SubprocessError, AgentWatchError):
+        elif self.system_name == "Linux":
+            secret_tool = self.which("secret-tool")
+            # Validate any existing marker before changing credential state.
+            previous_backend = self._linux_backend_load_strict()
+            if secret_tool:
+                try:
+                    self._linux_secret_save(normalized)
+                except (OSError, subprocess.SubprocessError, AgentWatchError):
+                    self._file_save(normalized)
+                    self._linux_backend_save(
+                        LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW
+                    )
+                else:
+                    try:
+                        self._linux_backend_save(LINUX_BACKEND_SECRET_SERVICE)
+                    except (OSError, AgentWatchError):
+                        # Preserve a retrievable copy if the non-secret marker
+                        # cannot be committed after Secret Service accepted the
+                        # new token.  The original exception still prevents a
+                        # caller from reporting a completed login.
+                        self._file_save(normalized)
+                        raise
+                    self._unlink_linux_path(self._fallback_path())
+            else:
+                if previous_backend in {
+                    LINUX_BACKEND_SECRET_SERVICE,
+                    LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW,
+                }:
+                    raise AgentWatchError(
+                        "recorded Linux Secret Service credential backend is unavailable"
+                    )
                 self._file_save(normalized)
+                self._linux_backend_save(LINUX_BACKEND_PRIVATE_FILE)
         else:
             self._file_save(normalized)
 
     def delete(self) -> None:
+        local_paths: tuple[Path, ...]
         if self.system_name == "Darwin":
             self._macos_backend().delete(self.computer_id)
-        elif self.system_name == "Linux" and self.which("secret-tool"):
-            subprocess.run(
-                ["secret-tool", "clear", "service", KEYCHAIN_SERVICE, "computer_id", self.computer_id],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
+            local_paths = ()
+        elif self.system_name == "Linux":
+            backend = self._linux_backend_load_strict()
+            secret_tool = self.which("secret-tool")
+            if backend in {
+                LINUX_BACKEND_SECRET_SERVICE,
+                LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW,
+            } and not secret_tool:
+                raise AgentWatchError(
+                    "recorded Linux Secret Service credential backend is unavailable"
+                )
+            # With no marker, preserve the legacy behavior: an available
+            # Secret Service is cleared before the fallback file.  A marked
+            # private-file backend is known not to have a Secret Service copy.
+            if backend in {
+                LINUX_BACKEND_SECRET_SERVICE,
+                LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW,
+            } or (backend is None and secret_tool):
+                self._linux_secret_delete()
+            local_paths = (
+                self._fallback_path(),
+                self._linux_backend_path(),
             )
-        for path in (self._fallback_path(), self._windows_path()):
+        elif self.system_name == "Windows":
+            local_paths = (self._windows_path(),)
+        else:
+            local_paths = (self._fallback_path(),)
+        for path in local_paths:
+            if path_has_link_component(path):
+                raise AgentWatchError("computer credential path must not contain a symlink or junction")
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -652,10 +844,27 @@ class ComputerTokenStore:
             return "macOS Keychain"
         if self.system_name == "Windows":
             return "Windows DPAPI"
-        if self.system_name == "Linux" and self._fallback_path().exists():
-            return "0600 private file"
-        if self.system_name == "Linux" and self.which("secret-tool"):
-            return "Linux Secret Service"
+        if self.system_name == "Linux":
+            try:
+                backend = self._linux_backend_load_strict()
+            except (OSError, AgentWatchError):
+                return "unavailable Linux credential backend"
+            if backend == LINUX_BACKEND_SECRET_SERVICE:
+                return (
+                    "Linux Secret Service"
+                    if self.which("secret-tool")
+                    else "unavailable Linux Secret Service"
+                )
+            if backend == LINUX_BACKEND_PRIVATE_FILE_SECRET_SHADOW:
+                return (
+                    "0600 private file"
+                    if self.which("secret-tool")
+                    else "unavailable Linux Secret Service shadow"
+                )
+            if backend == LINUX_BACKEND_PRIVATE_FILE or self._fallback_path().exists():
+                return "0600 private file"
+            if self.which("secret-tool"):
+                return "Linux Secret Service"
         return "0600 private file"
 
     def _macos_load(self) -> str | None:
@@ -664,14 +873,77 @@ class ComputerTokenStore:
     def _macos_save(self, token: str) -> None:
         self._macos_backend().save(self.computer_id, token)
 
-    def _linux_secret_load(self) -> str | None:
+    def _linux_backend_path(self) -> Path:
+        return self.config_root / LINUX_TOKEN_BACKEND_FILE_NAME
+
+    def _linux_backend_load_strict(self) -> str | None:
+        path = self._linux_backend_path()
+        if path_has_link_component(path):
+            raise AgentWatchError(
+                "Linux credential backend marker path must not contain a symlink or junction"
+            )
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        if value not in LINUX_BACKENDS:
+            raise AgentWatchError("Linux credential backend marker is invalid")
+        return value
+
+    def _linux_backend_save(self, backend: str) -> None:
+        if backend not in LINUX_BACKENDS:
+            raise AgentWatchError("refusing invalid Linux credential backend marker")
+        path = self._linux_backend_path()
+        if path_has_link_component(path):
+            raise AgentWatchError(
+                "Linux credential backend marker path must not contain a symlink or junction"
+            )
+        atomic_write(path, (backend + "\n").encode("ascii"), mode=0o600)
+
+    def _linux_secret_delete(self) -> None:
+        completed = subprocess.run(
+            [
+                "secret-tool",
+                "clear",
+                "service",
+                KEYCHAIN_SERVICE,
+                "computer_id",
+                self.computer_id,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode not in {0, 1} or (
+            completed.returncode == 1 and completed.stderr.strip()
+        ):
+            raise AgentWatchError("Linux Secret Service could not clear the computer token")
+
+    @staticmethod
+    def _unlink_linux_path(path: Path) -> None:
+        if path_has_link_component(path):
+            raise AgentWatchError(
+                "computer credential path must not contain a symlink or junction"
+            )
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _linux_secret_load(self, *, strict: bool = False) -> str | None:
         completed = subprocess.run(
             ["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "computer_id", self.computer_id],
             text=True,
             capture_output=True,
             check=False,
         )
-        value = completed.stdout.strip() if completed.returncode == 0 else ""
+        if completed.returncode != 0:
+            if strict and (completed.returncode != 1 or completed.stderr.strip()):
+                raise AgentWatchError("Linux Secret Service was unavailable")
+            return None
+        value = completed.stdout.strip()
         return value or None
 
     def _linux_secret_save(self, token: str) -> None:
@@ -698,27 +970,53 @@ class ComputerTokenStore:
         return self.config_root / LINUX_TOKEN_FILE_NAME
 
     def _file_load(self) -> str | None:
+        try:
+            return self._file_load_strict()
+        except (OSError, UnicodeError, AgentWatchError):
+            return None
+
+    def _file_load_strict(self) -> str | None:
         path = self._fallback_path()
+        if path_has_link_component(path):
+            raise AgentWatchError("computer credential path must not contain a symlink or junction")
         try:
             if path.stat().st_mode & 0o077:
-                return None
+                raise AgentWatchError("computer credential file permissions are unsafe")
             value = path.read_text(encoding="utf-8").strip()
-        except OSError:
+        except FileNotFoundError:
             return None
         return value or None
 
     def _file_save(self, token: str) -> None:
-        atomic_write(self._fallback_path(), (token + "\n").encode("utf-8"))
+        path = self._fallback_path()
+        if path_has_link_component(path):
+            raise AgentWatchError(
+                "computer credential path must not contain a symlink or junction"
+            )
+        atomic_write(path, (token + "\n").encode("utf-8"))
 
     def _windows_path(self) -> Path:
         return self.config_root / WINDOWS_TOKEN_FILE_NAME
 
     def _windows_load(self) -> str | None:
         try:
-            protected = base64.b64decode(self._windows_path().read_bytes(), validate=True)
-            value = _dpapi_unprotect(protected).decode("utf-8").strip()
-        except (OSError, ValueError, UnicodeError):
+            return self._windows_load_strict()
+        except (OSError, ValueError, UnicodeError, AgentWatchError):
             return None
+
+    def _windows_load_strict(self) -> str | None:
+        path = self._windows_path()
+        if path_has_link_component(path):
+            raise AgentWatchError("computer credential path must not contain a symlink or junction")
+        try:
+            encoded = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        try:
+            protected = base64.b64decode(encoded, validate=True)
+            value = _dpapi_unprotect(protected).decode("utf-8").strip()
+        except (ValueError, UnicodeError, AgentWatchError) as exc:
+            raise AgentWatchError("Windows DPAPI computer token is unreadable") from exc
         return value or None
 
     def _windows_save(self, token: str) -> None:
@@ -737,7 +1035,7 @@ class AgentWatchApi:
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Accept": "application/json",
-            "User-Agent": "agentwatch-computer/0.2",
+            "User-Agent": CLIENT_USER_AGENT,
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -818,7 +1116,7 @@ class AgentWatchApi:
     def health(self) -> dict[str, Any]:
         request = urllib.request.Request(
             self.base_url + "/health",
-            headers={"Accept": "application/json", "User-Agent": "agentwatch-computer/0.2"},
+            headers={"Accept": "application/json", "User-Agent": CLIENT_USER_AGENT},
             method="GET",
         )
         try:

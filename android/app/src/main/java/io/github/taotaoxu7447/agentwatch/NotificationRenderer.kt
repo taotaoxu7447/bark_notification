@@ -15,12 +15,12 @@ class NotificationRenderer(private val context: Context) {
 
     fun eventBlockReason(source: NtfyMessage.Source, silentRecovery: Boolean): String? {
         if (!manager.areNotificationsEnabled()) return "系统通知总开关已关闭，本条未标记为送达"
-        val primaryChannel = manager.getNotificationChannel(channelId(source))
+        val primaryChannel = manager.getNotificationChannel(SourcePresentation.channelId(source))
         if (primaryChannel == null || primaryChannel.importance == NotificationManager.IMPORTANCE_NONE) {
             return "${source.displayName} 通知频道已关闭，本条未标记为送达"
         }
         if (silentRecovery) {
-            val recoveryChannel = manager.getNotificationChannel(recoveryChannelId(source))
+            val recoveryChannel = manager.getNotificationChannel(SourcePresentation.recoveryChannelId(source))
             if (recoveryChannel == null || recoveryChannel.importance == NotificationManager.IMPORTANCE_NONE) {
                 return "${source.displayName} 静默恢复频道已关闭，本条未标记为送达"
             }
@@ -46,7 +46,7 @@ class NotificationRenderer(private val context: Context) {
 
         NtfyMessage.Source.entries.forEach { source ->
             val channel = NotificationChannel(
-                channelId(source),
+                SourcePresentation.channelId(source),
                 source.displayName,
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply {
@@ -64,7 +64,7 @@ class NotificationRenderer(private val context: Context) {
             manager.createNotificationChannel(channel)
             manager.createNotificationChannel(
                 NotificationChannel(
-                    recoveryChannelId(source),
+                    SourcePresentation.recoveryChannelId(source),
                     "${source.displayName}（静默恢复）",
                     NotificationManager.IMPORTANCE_LOW,
                 ).apply {
@@ -103,9 +103,13 @@ class NotificationRenderer(private val context: Context) {
         val title = message.title.ifBlank { "${message.source.displayName} 任务提醒" }
         val builder = Notification.Builder(
             context,
-            if (silent) recoveryChannelId(message.source) else channelId(message.source),
+            if (silent) {
+                SourcePresentation.recoveryChannelId(message.source)
+            } else {
+                SourcePresentation.channelId(message.source)
+            },
         )
-            .setSmallIcon(smallIcon(message.source))
+            .setSmallIcon(SourcePresentation.smallIcon(message.source))
             .setContentTitle(title.take(180))
             .setContentText(message.message.lineSequence().firstOrNull().orEmpty().take(220))
             .setStyle(Notification.BigTextStyle().bigText(message.message.take(3500)))
@@ -118,7 +122,9 @@ class NotificationRenderer(private val context: Context) {
             .setWhen(if (message.time > 0L) message.time * 1000L else System.currentTimeMillis())
             .setShowWhen(true)
 
-        largeIcon(message.source)?.let(builder::setLargeIcon)
+        SourcePresentation.largeIcon(message.source)
+            ?.let { BitmapFactory.decodeResource(context.resources, it) }
+            ?.let(builder::setLargeIcon)
         manager.notify(eventTag(message.eventKey), eventId(message.eventKey), builder.build())
     }
 
@@ -140,8 +146,8 @@ class NotificationRenderer(private val context: Context) {
         notificationTimeMillis: Long,
         history: HistoryStore.Entry? = null,
     ) {
-        val notification = Notification.Builder(context, recoveryChannelId(source))
-            .setSmallIcon(smallIcon(source))
+        val notification = Notification.Builder(context, SourcePresentation.recoveryChannelId(source))
+            .setSmallIcon(SourcePresentation.smallIcon(source))
             .setContentTitle(history?.title ?: "${source.displayName} 任务提醒")
             .setContentText(history?.body?.lineSequence()?.firstOrNull()?.take(220) ?: "进程中断后已静默恢复送达")
             .setStyle(history?.let { Notification.BigTextStyle().bigText(it.body.take(3500)) })
@@ -166,26 +172,8 @@ class NotificationRenderer(private val context: Context) {
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
 
-    private fun channelId(source: NtfyMessage.Source): String = "event_${source.key}_v1"
-    private fun recoveryChannelId(source: NtfyMessage.Source): String = "event_${source.key}_recovery_v1"
     private fun eventTag(eventKey: String): String = "agentwatch:$eventKey"
     private fun eventId(eventKey: String): Int = eventKey.hashCode() and Int.MAX_VALUE
-
-    private fun smallIcon(source: NtfyMessage.Source): Int = when (source) {
-        NtfyMessage.Source.CODEX -> R.drawable.ic_notify_codex
-        NtfyMessage.Source.ZCODE -> R.drawable.ic_notify_zcode
-        NtfyMessage.Source.KIMI -> R.drawable.ic_notify_kimi
-        NtfyMessage.Source.GROK -> R.drawable.ic_notify_grok
-        NtfyMessage.Source.OTHER -> R.drawable.ic_notify_other
-    }
-
-    private fun largeIcon(source: NtfyMessage.Source) = when (source) {
-        NtfyMessage.Source.CODEX -> R.drawable.source_codex
-        NtfyMessage.Source.ZCODE -> R.drawable.source_zcode
-        NtfyMessage.Source.KIMI -> R.drawable.source_kimi
-        NtfyMessage.Source.GROK -> R.drawable.source_grok
-        NtfyMessage.Source.OTHER -> null
-    }?.let { BitmapFactory.decodeResource(context.resources, it) }
 
     companion object {
         const val FOREGROUND_NOTIFICATION_ID = 41001

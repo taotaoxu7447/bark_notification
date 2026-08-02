@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import secrets
+import stat
 import subprocess
 import sys
 import time
@@ -24,6 +25,7 @@ from agentwatch_core import (
     infer_delivery_mode,
     load_delivery_mode,
     load_or_create_machine,
+    path_has_link_component,
     resolve_delivery,
     stable_event_id,
 )
@@ -37,6 +39,22 @@ DEFAULT_SESSION_INDEX = "~/.codex/session_index.jsonl"
 DEFAULT_ZCODE_LOG_ROOT = "~/.zcode/cli/log"
 DEFAULT_KIMI_SESSIONS_ROOT = "~/.kimi-code/sessions"
 DEFAULT_GROK_SESSIONS_ROOT = "~/.grok/sessions"
+CLAUDE_HOOK_EVENTS_FILE_NAME = "claude-hook-events.jsonl"
+DEFAULT_CLAUDE_SPOOL_MAX_BYTES = 4 * 1024 * 1024
+MIN_CLAUDE_SPOOL_MAX_BYTES = 64 * 1024
+DEFAULT_CLAUDE_SPOOL_MAX_AGE_SECONDS = 24 * 60 * 60
+MIN_CLAUDE_SPOOL_MAX_AGE_SECONDS = 60 * 60
+DEFAULT_CLAUDE_DRAIN_GRACE_SECONDS = 30
+# A first-pass Stop (stop_hook_active=false) is provisional because all
+# matching Claude hooks run in parallel and a sibling may still block the
+# stop. Thirty-five seconds covers Claude's 30-second default prompt-hook
+# window plus polling/merge slack without imposing the 10-minute command-hook
+# default on every notification. Installations with slow blocking command,
+# HTTP, or MCP hooks can opt into the full 600-second window.
+DEFAULT_CLAUDE_STOP_SETTLE_SECONDS = 35
+MIN_CLAUDE_STOP_SETTLE_SECONDS = 5
+MAX_CLAUDE_STOP_SETTLE_SECONDS = 600
+CLAUDE_DRAIN_MARKER = ".agentwatch-drain-"
 DEFAULT_PUBLISHER_ID_FILE = "~/.codex-watch-notifier/publisher-id"
 DEFAULT_CODEX_BARK_ICON = (
     "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png"
@@ -50,6 +68,26 @@ DEFAULT_KIMI_BARK_ICON = (
 DEFAULT_GROK_BARK_ICON = (
     "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/grok-icon-v1.png"
 )
+DEFAULT_CLAUDE_BARK_ICON = (
+    "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/"
+    "android/app/src/main/res/drawable-nodpi/source_claude.png"
+)
+CLAUDE_HOOK_SCHEMA = "agentwatch_claude_hook_v1"
+CLAUDE_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
+CLAUDE_STOP_FAILURE_ERRORS = frozenset(
+    {
+        "rate_limit",
+        "overloaded",
+        "authentication_failed",
+        "oauth_org_not_allowed",
+        "billing_error",
+        "invalid_request",
+        "model_not_found",
+        "server_error",
+        "max_output_tokens",
+        "unknown",
+    }
+)
 DEFAULT_MAX_EVENT_AGE_SECONDS = 3600
 STATE_VERSION = 2
 MAX_SENT_KEYS = 3000
@@ -62,8 +100,22 @@ MAX_EXHAUSTED_DELIVERIES = 500
 NTFY_PROTOCOL_VERSION = 1
 
 
+class StateFileError(ValueError):
+    """The watcher state is unreadable or structurally unsafe to continue from."""
+
+
+class ConfigFileError(ValueError):
+    """The persistent private environment cannot be read safely."""
+
+
 def expand_path(value: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
+
+
+def absolute_path_without_symlink_resolution(value: str) -> Path:
+    """Expand a configured path without turning its final symlink into a target path."""
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    return Path(os.path.abspath(expanded))
 
 
 def load_env_file(path: Path) -> None:
@@ -71,8 +123,12 @@ def load_env_file(path: Path) -> None:
         return
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except FileNotFoundError:
         return
+    except (OSError, UnicodeError) as exc:
+        raise ConfigFileError(
+            f"cannot read private watcher config {path}: {type(exc).__name__}"
+        ) from exc
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -124,6 +180,17 @@ def env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def claude_stop_settle_seconds() -> int:
+    configured = env_int(
+        "CLAUDE_WATCH_STOP_SETTLE_SECONDS",
+        DEFAULT_CLAUDE_STOP_SETTLE_SECONDS,
+    )
+    return min(
+        max(configured, MIN_CLAUDE_STOP_SETTLE_SECONDS),
+        MAX_CLAUDE_STOP_SETTLE_SECONDS,
+    )
 
 
 def include_workspace_in_notifications() -> bool:
@@ -196,7 +263,7 @@ def publisher_instance_id() -> str:
 
 def ntfy_source(event: dict[str, Any]) -> str:
     prefix = str(event.get("event_type") or "").partition("_")[0].lower()
-    return prefix if prefix in {"codex", "zcode", "kimi", "grok"} else "codex"
+    return prefix if prefix in {"codex", "zcode", "kimi", "grok", "claude"} else "codex"
 
 
 def ntfy_sequence_id(event: dict[str, Any]) -> str:
@@ -222,6 +289,7 @@ def ntfy_icon(event: dict[str, Any]) -> str:
         "zcode": DEFAULT_ZCODE_BARK_ICON,
         "kimi": DEFAULT_KIMI_BARK_ICON,
         "grok": DEFAULT_GROK_BARK_ICON,
+        "claude": DEFAULT_CLAUDE_BARK_ICON,
     }
     configured = str(event.get("bark_icon") or os.getenv(f"{source.upper()}_BARK_ICON", "") or defaults[source]).strip()
     parsed = urllib.parse.urlparse(configured)
@@ -232,12 +300,15 @@ def parse_timestamp(value: Any) -> dt.datetime | None:
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        timestamp = float(value)
-        if timestamp > 10_000_000_000_000:
-            timestamp /= 1_000_000
-        elif timestamp > 10_000_000_000:
-            timestamp /= 1_000
-        return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc)
+        try:
+            timestamp = float(value)
+            if timestamp > 10_000_000_000_000:
+                timestamp /= 1_000_000
+            elif timestamp > 10_000_000_000:
+                timestamp /= 1_000
+            return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc)
+        except (OverflowError, OSError, TypeError, ValueError):
+            return None
 
     text = str(value).strip()
     if not text:
@@ -596,7 +667,7 @@ class Notifier:
 
     def _send_ntfy(self, title: str, body: str, event: dict[str, Any]) -> bool:
         prefix = str(event.get("event_type") or "").partition("_")[0].upper()
-        if prefix not in {"CODEX", "ZCODE", "KIMI", "GROK"}:
+        if prefix not in {"CODEX", "ZCODE", "KIMI", "GROK", "CLAUDE"}:
             prefix = "CODEX"
         url = (
             str(event.get("ntfy_url") or "").strip()
@@ -691,8 +762,94 @@ def load_state(path: Path) -> dict[str, Any]:
             "delivery_attempts": {},
             "delivery_stats": {},
         }
-    with path.open("r", encoding="utf-8") as handle:
-        state = json.load(handle)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StateFileError(f"cannot read watcher state {path}: {type(exc).__name__}") from exc
+    if not isinstance(state, dict):
+        raise StateFileError(f"watcher state {path} must contain a JSON object")
+    if "version" in state and (
+        isinstance(state["version"], bool) or not isinstance(state["version"], int)
+    ):
+        raise StateFileError(f"watcher state {path} has an invalid version")
+    for key in ("initialized", "zcode_initialized", "kimi_initialized", "grok_initialized"):
+        if key in state and not isinstance(state[key], bool):
+            raise StateFileError(f"watcher state {path} field {key!r} must be boolean")
+    if "claude_initialized" in state and not isinstance(state["claude_initialized"], str):
+        raise StateFileError(
+            f"watcher state {path} field 'claude_initialized' must be a path string"
+        )
+    for key in ("files", "sent", "delivery_attempts", "delivery_stats"):
+        value = state.get(key, {})
+        if not isinstance(value, dict):
+            raise StateFileError(f"watcher state {path} field {key!r} must be an object")
+    files = state.get("files", {})
+    if any(not isinstance(key, str) or not isinstance(value, dict) for key, value in files.items()):
+        raise StateFileError(f"watcher state {path} contains an invalid files entry")
+    numeric_file_fields = {
+        "offset",
+        "size",
+        "updated_at",
+        "new_file_at",
+        "invalid_records_skipped",
+        "stale_events_skipped",
+        "claude_provisional_stops_suppressed",
+        "claude_stop_settle_offset",
+        "claude_stop_settle_received_at",
+        "claude_spool_started_at",
+        "drain_stable_since",
+        "drain_stable_size",
+    }
+    for entry in files.values():
+        if any(
+            field in entry
+            and (
+                isinstance(entry[field], bool)
+                or not isinstance(entry[field], (int, float))
+            )
+            for field in numeric_file_fields
+        ):
+            raise StateFileError(f"watcher state {path} contains invalid file counters")
+    sent = state.get("sent", {})
+    if any(
+        not isinstance(key, str)
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        for key, value in sent.items()
+    ):
+        raise StateFileError(f"watcher state {path} contains an invalid sent entry")
+    delivery_attempts = state.get("delivery_attempts", {})
+    if any(
+        not isinstance(key, str) or not isinstance(value, dict)
+        for key, value in delivery_attempts.items()
+    ):
+        raise StateFileError(f"watcher state {path} contains an invalid delivery entry")
+    numeric_delivery_fields = {
+        "attempts",
+        "first_attempt_at",
+        "last_attempt_at",
+        "next_retry_at",
+        "exhausted_at",
+        "line_offset",
+    }
+    for entry in delivery_attempts.values():
+        if any(
+            field in entry
+            and entry[field] is not None
+            and (
+                isinstance(entry[field], bool)
+                or not isinstance(entry[field], (int, float))
+            )
+            for field in numeric_delivery_fields
+        ):
+            raise StateFileError(f"watcher state {path} contains invalid delivery counters")
+    delivery_stats = state.get("delivery_stats", {})
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in delivery_stats.values()
+    ):
+        raise StateFileError(f"watcher state {path} contains invalid delivery statistics")
     try:
         state["version"] = max(int(state.get("version", 1)), STATE_VERSION)
     except (TypeError, ValueError):
@@ -954,6 +1111,77 @@ def grok_event_files(root: Path) -> list[Path]:
     return sorted(root.glob("**/events.jsonl"), key=lambda path: str(path))
 
 
+def regular_file_without_symlink(path: Path) -> bool:
+    if path_has_link_component(path):
+        return False
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode)
+
+
+def claude_hook_event_files(path: Path) -> list[Path]:
+    if not regular_file_without_symlink(path):
+        return []
+    return [path]
+
+
+def claude_drain_prefix(spool_path: Path) -> str:
+    return f".{spool_path.name}{CLAUDE_DRAIN_MARKER}"
+
+
+def parse_claude_drain_path(spool_path: Path, drain_path: Path) -> tuple[int, int, str] | None:
+    prefix = claude_drain_prefix(spool_path)
+    if drain_path.parent != spool_path.parent or not drain_path.name.startswith(prefix):
+        return None
+    parts = drain_path.name[len(prefix) :].split("-")
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    token = parts[2]
+    if len(token) != 8 or any(character not in "0123456789abcdef" for character in token):
+        return None
+    return int(parts[0]), int(parts[1]), token
+
+
+def claude_drain_files(spool_path: Path) -> list[Path]:
+    try:
+        prefix = claude_drain_prefix(spool_path)
+        candidates = (path for path in spool_path.parent.iterdir() if path.name.startswith(prefix))
+        return sorted(
+            (
+                path
+                for path in candidates
+                if parse_claude_drain_path(spool_path, path) is not None
+                and regular_file_without_symlink(path)
+            ),
+            key=lambda path: str(path),
+        )
+    except OSError:
+        return []
+
+
+def owned_claude_drain_files(spool_path: Path, state: dict[str, Any]) -> list[Path]:
+    """Return only drains whose persisted inode identity still belongs to us."""
+    files = state.setdefault("files", {})
+    owned: list[Path] = []
+    for path in claude_drain_files(spool_path):
+        rec = files.get(str(path))
+        if not isinstance(rec, dict) or not rec.get("claude_drain"):
+            continue
+        if rec.get("claude_spool_path") != str(spool_path) or rec.get("foreign_replacement"):
+            continue
+        expected_identity = str(rec.get("file_identity") or "")
+        if expected_identity and file_identity(path) == expected_identity:
+            owned.append(path)
+    return owned
+
+
+def claude_drain_baseline_offset(spool_path: Path, drain_path: Path) -> int | None:
+    parsed = parse_claude_drain_path(spool_path, drain_path)
+    return parsed[0] if parsed is not None else None
+
+
 def load_json_object(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
@@ -973,8 +1201,12 @@ def load_session_meta(path: Path) -> dict[str, Any]:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(record, dict):
+                    continue
                 if record.get("type") == "session_meta":
                     payload = record.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
                     return {
                         "thread_id": payload.get("id") or path.stem,
                         "cwd": payload.get("cwd") or "",
@@ -1011,6 +1243,8 @@ def load_thread_title(thread_id: str) -> str:
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
                     continue
                 if record.get("id") == thread_id:
                     title = str(record.get("thread_name") or "")
@@ -1072,14 +1306,18 @@ def classify_task_complete(message: str, agent_name: str = "Codex") -> tuple[str
 def trigger_from_record(
     path: Path,
     offset: int,
-    record: dict[str, Any],
+    record: Any,
     extra_types: set[str],
     meta: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
     if record.get("type") != "event_msg":
         return None
 
     payload = record.get("payload") or {}
+    if not isinstance(payload, dict):
+        return None
     event_type = payload.get("type")
     if event_type not in {"task_complete", "turn_aborted"} and event_type not in extra_types:
         return None
@@ -1158,11 +1396,15 @@ def codex_event_stable_id(event: dict[str, Any]) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
 
 
-def trigger_from_zcode_record(path: Path, offset: int, record: dict[str, Any]) -> dict[str, Any] | None:
+def trigger_from_zcode_record(path: Path, offset: int, record: Any) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
     if record.get("message") != "ZCode Protocol background turn completed":
         return None
 
     context = record.get("context") or {}
+    if not isinstance(context, dict):
+        return None
     session_id = str(record.get("sessionId") or "")
     input_id = str(context.get("inputId") or "")
     query_id = str(context.get("queryId") or "")
@@ -1231,6 +1473,191 @@ def zcode_event_stable_id(event: dict[str, Any], path: Path, line_offset: int) -
     else:
         source = f"zcode:{path}:{line_offset}:{event_type}"
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+
+
+def _claude_record_string(
+    record: dict[str, Any],
+    key: str,
+    *,
+    limit: int,
+    required: bool = False,
+) -> str | None:
+    value = record.get(key)
+    if not isinstance(value, str) or len(value) > limit:
+        return None
+    normalized = value.strip()
+    if required and not normalized:
+        return None
+    return normalized
+
+
+def validated_claude_hook_record(record: Any) -> dict[str, Any] | None:
+    """Accept only the exact private-spool contract emitted by agentwatch hook."""
+    if not isinstance(record, dict) or record.get("schema") != CLAUDE_HOOK_SCHEMA:
+        return None
+    hook_event_name = record.get("hook_event_name")
+    if hook_event_name not in {"Stop", "StopFailure"}:
+        return None
+
+    session_id = _claude_record_string(record, "session_id", required=True, limit=256)
+    prompt_id = _claude_record_string(record, "prompt_id", limit=256)
+    transcript_path = _claude_record_string(
+        record, "transcript_path", required=True, limit=4096
+    )
+    cwd = _claude_record_string(record, "cwd", required=True, limit=4096)
+    message = _claude_record_string(
+        record, "last_assistant_message", limit=CLAUDE_HOOK_MESSAGE_LIMIT_CHARS
+    )
+    message_hash = _claude_record_string(
+        record, "last_assistant_message_sha256", required=True, limit=64
+    )
+    error = _claude_record_string(record, "error", limit=64)
+    error_details = _claude_record_string(record, "error_details", limit=4096)
+    if None in {
+        session_id,
+        prompt_id,
+        transcript_path,
+        cwd,
+        message,
+        message_hash,
+        error,
+        error_details,
+    }:
+        return None
+    if len(message_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in message_hash
+    ):
+        return None
+
+    transcript_size = record.get("transcript_size")
+    if isinstance(transcript_size, bool) or not isinstance(transcript_size, int) or transcript_size < -1:
+        return None
+    received_at = record.get("received_at")
+    if isinstance(received_at, bool) or not isinstance(received_at, int) or received_at <= 0:
+        return None
+    stop_hook_active = record.get("stop_hook_active", False)
+    has_background_tasks = record.get("has_background_tasks", False)
+    has_session_crons = record.get("has_session_crons", False)
+    if (
+        not isinstance(stop_hook_active, bool)
+        or not isinstance(has_background_tasks, bool)
+        or not isinstance(has_session_crons, bool)
+    ):
+        return None
+
+    if hook_event_name == "StopFailure":
+        if (
+            error not in CLAUDE_STOP_FAILURE_ERRORS
+            or stop_hook_active
+            or has_background_tasks
+            or has_session_crons
+        ):
+            return None
+    else:
+        if not message or error or error_details or has_background_tasks or has_session_crons:
+            return None
+
+    return {
+        "hook_event_name": hook_event_name,
+        "session_id": session_id,
+        "prompt_id": prompt_id,
+        "transcript_path": transcript_path,
+        "transcript_size": transcript_size,
+        "cwd": cwd,
+        "received_at": received_at,
+        "last_assistant_message": message,
+        "last_assistant_message_sha256": message_hash,
+        "error": error,
+        "error_details": error_details,
+        "stop_hook_active": stop_hook_active,
+        "has_background_tasks": has_background_tasks,
+        "has_session_crons": has_session_crons,
+    }
+
+
+def trigger_from_claude_hook_record(path: Path, offset: int, record: dict[str, Any]) -> dict[str, Any] | None:
+    parsed = validated_claude_hook_record(record)
+    if parsed is None:
+        return None
+
+    hook_event_name = parsed["hook_event_name"]
+    session_id = parsed["session_id"]
+    prompt_id = parsed["prompt_id"]
+    transcript_path = parsed["transcript_path"]
+    transcript_size = parsed["transcript_size"]
+    cwd = parsed["cwd"]
+    timestamp = parsed["received_at"]
+    message = parsed["last_assistant_message"]
+    message_hash = parsed["last_assistant_message_sha256"]
+    error = parsed["error"]
+    error_details = parsed["error_details"]
+    stop_hook_active = parsed["stop_hook_active"]
+
+    if hook_event_name == "StopFailure":
+        status = "需要处理"
+        status_detail = f"Claude Code 本轮因 {error} 结束"
+        title = "Claude Code 需要处理"
+        event_type = "claude_turn_attention"
+    else:
+        status, status_detail = classify_task_complete(message, "Claude Code")
+        if status == "完成":
+            title = "Claude Code 已结束本轮"
+            event_type = "claude_turn_completed"
+        elif status == "需要处理":
+            title = "Claude Code 需要处理"
+            event_type = "claude_turn_attention"
+        else:
+            title = "Claude Code 已结束本轮"
+            event_type = "claude_turn_completed"
+
+    error_hash = hashlib.sha256(f"{error}\0{error_details}".encode("utf-8")).hexdigest()
+    if prompt_id:
+        stable_source = f"claude\0{hook_event_name.lower()}\0{session_id}\0{prompt_id}"
+    else:
+        stable_source = json.dumps(
+            [session_id, transcript_path, transcript_size, message_hash, error_hash],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    stable_id = hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24]
+    local_time = utc_to_local(timestamp)
+    display_name = Path(cwd).name or session_id[:12]
+    event = {
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "local_time": local_time,
+        "session_id": session_id,
+        "prompt_id": prompt_id,
+        "status": status,
+        "status_detail": status_detail,
+        "cwd": cwd,
+        "transcript_path": transcript_path,
+        "transcript_size": transcript_size,
+        "stop_hook_active": stop_hook_active,
+        "log_path": str(path),
+        "offset": offset,
+        "message": message,
+        "error": error,
+        "error_details": error_details,
+        "stable_id": stable_id,
+        "bark_group": os.getenv("CLAUDE_BARK_GROUP", "Claude Code"),
+        "bark_icon": os.getenv("CLAUDE_BARK_ICON", DEFAULT_CLAUDE_BARK_ICON),
+        "ntfy_url": os.getenv("CLAUDE_NTFY_URL", ""),
+        "ntfy_tags": os.getenv("CLAUDE_NTFY_TAGS", "robot,computer"),
+    }
+    body_parts = [
+        f"状态: {status}",
+        f"判断: {status_detail}",
+        f"会话: {display_name}",
+        f"时间: {local_time}",
+    ]
+    if include_workspace_in_notifications():
+        body_parts.append(f"目录: {cwd}")
+    if message and include_message_excerpt_in_notifications() and notification_body_max_chars() > 0:
+        body_parts.extend(["", compact(message, notification_body_max_chars())])
+    event["notification_title"] = f"{title}: {compact(display_name, 42)}"
+    event["notification_body"] = "\n".join(body_parts)
+    return event
 
 
 def load_kimi_session_meta(path: Path) -> dict[str, Any]:
@@ -1528,8 +1955,23 @@ def process_file(
                 except json.JSONDecodeError:
                     rec["offset"] = line_end
                     continue
-
-                event = trigger_from_record(path, line_offset, record, extra_types, meta)
+                if not isinstance(record, dict):
+                    invalid = int(rec.get("invalid_records_skipped", 0) or 0) + 1
+                    rec["invalid_records_skipped"] = invalid
+                    rec["offset"] = line_end
+                    continue
+                try:
+                    event = trigger_from_record(path, line_offset, record, extra_types, meta)
+                except Exception as exc:  # noqa: BLE001 - isolate one poisoned rollout record.
+                    invalid = int(rec.get("invalid_records_skipped", 0) or 0) + 1
+                    rec["invalid_records_skipped"] = invalid
+                    if invalid <= 3 or invalid in {10, 50, 100} or invalid % 1000 == 0:
+                        log(
+                            f"skipped invalid Codex record from {path.name}: "
+                            f"{type(exc).__name__}"
+                        )
+                    rec["offset"] = line_end
+                    continue
                 if not event:
                     rec["offset"] = line_end
                     continue
@@ -1621,8 +2063,23 @@ def process_zcode_file(
                 except json.JSONDecodeError:
                     rec["offset"] = line_end
                     continue
-
-                event = trigger_from_zcode_record(path, line_offset, record)
+                if not isinstance(record, dict):
+                    invalid = int(rec.get("invalid_records_skipped", 0) or 0) + 1
+                    rec["invalid_records_skipped"] = invalid
+                    rec["offset"] = line_end
+                    continue
+                try:
+                    event = trigger_from_zcode_record(path, line_offset, record)
+                except Exception as exc:  # noqa: BLE001 - isolate one poisoned log record.
+                    invalid = int(rec.get("invalid_records_skipped", 0) or 0) + 1
+                    rec["invalid_records_skipped"] = invalid
+                    if invalid <= 3 or invalid in {10, 50, 100} or invalid % 1000 == 0:
+                        log(
+                            f"skipped invalid ZCode record from {path.name}: "
+                            f"{type(exc).__name__}"
+                        )
+                    rec["offset"] = line_end
+                    continue
                 if not event:
                     rec["offset"] = line_end
                     continue
@@ -1657,6 +2114,136 @@ def process_zcode_file(
         rec["size"] = size
         rec["updated_at"] = int(time.time())
     return sent_count
+
+
+def claude_is_provisional_stop_record(record: dict[str, Any]) -> bool:
+    parsed = validated_claude_hook_record(record)
+    return bool(
+        parsed
+        and parsed["hook_event_name"] == "Stop"
+        and parsed["stop_hook_active"] is False
+    )
+
+
+def claude_stop_transcript_grew(record: dict[str, Any]) -> bool:
+    """Observe transcript growth without treating it as proof of continuation.
+
+    Claude documents transcript writes as asynchronous. A normal final Stop can
+    therefore be followed by a delayed transcript flush. Growth is only
+    corroborating evidence when a matching stop_hook_active=true record is also
+    present later in the private spool; growth by itself never suppresses an
+    otherwise valid notification.
+    """
+    if not claude_is_provisional_stop_record(record):
+        return False
+    transcript_size = record["transcript_size"]
+    if transcript_size < 0:
+        return False
+    transcript_path = Path(
+        os.path.expandvars(os.path.expanduser(record["transcript_path"].strip()))
+    )
+    try:
+        return transcript_path.stat().st_size > transcript_size
+    except OSError:
+        return False
+
+
+def claude_terminal_hook_record_follows(
+    handle: Any,
+    path: Path,
+    provisional: dict[str, Any],
+) -> str:
+    """Look ahead for a matching true Stop or StopFailure without advancing state."""
+    if not claude_is_provisional_stop_record(provisional):
+        return ""
+    provisional_event = trigger_from_claude_hook_record(path, handle.tell(), provisional)
+    if provisional_event is None:
+        return ""
+    session_id = provisional_event["session_id"]
+    prompt_id = provisional_event["prompt_id"]
+    transcript_path = provisional_event["transcript_path"]
+    provisional_stable_id = str(provisional_event.get("stable_id") or "")
+    position = handle.tell()
+    try:
+        while True:
+            candidate_offset = handle.tell()
+            line = handle.readline()
+            if not line or not line.endswith(b"\n"):
+                return ""
+            try:
+                candidate = json.loads(line.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            candidate_notification = trigger_from_claude_hook_record(
+                path, candidate_offset, candidate
+            )
+            if candidate_notification is None:
+                continue
+            candidate_event = candidate.get("hook_event_name")
+            if (
+                candidate_notification["session_id"] != session_id
+                or candidate_notification["transcript_path"] != transcript_path
+            ):
+                continue
+            if candidate_event == "Stop" and candidate_notification["stop_hook_active"] is not True:
+                continue
+            candidate_prompt_id = candidate_notification["prompt_id"]
+            if prompt_id and candidate_prompt_id != prompt_id:
+                continue
+            if candidate_event == "Stop":
+                if (
+                    not provisional_stable_id
+                    or candidate_notification.get("stable_id")
+                    != provisional_stable_id
+                ):
+                    continue
+                return "continuation Stop"
+            # Stop and StopFailure intentionally use different stable IDs, but
+            # prompt_id is the official shared per-turn correlation key on the
+            # supported Claude version. Without it, do not let an ambiguous
+            # later failure suppress a valid provisional notification.
+            if prompt_id and candidate_prompt_id == prompt_id:
+                return "StopFailure"
+    finally:
+        handle.seek(position)
+
+
+def claude_stop_settle_disposition(
+    record: dict[str, Any],
+    *,
+    now: int | None = None,
+) -> str:
+    """Return ready or waiting for one provisional Claude Stop record.
+
+    Claude starts every matching Stop hook in parallel. A false
+    stop_hook_active value therefore means only "first Stop pass", not that
+    every sibling hook has allowed the turn to stop. Keep that record unread
+    for a bounded settle window. A caller separately looks ahead for the
+    matching true continuation record before allowing the false record through.
+
+    Structurally invalid and non-Stop records remain "ready" so the normal
+    parser can skip them without letting a poisoned line pin the spool.
+    """
+    if not claude_is_provisional_stop_record(record):
+        return "ready"
+
+    received_at = record.get("received_at")
+    if isinstance(received_at, bool) or not isinstance(received_at, int):
+        return "ready"
+    current_time = int(time.time()) if now is None else int(now)
+    settle_seconds = claude_stop_settle_seconds()
+    # A wildly future timestamp is an invalid external spool record. Do not
+    # let it hold the queue indefinitely; the regular parser will handle it.
+    if received_at <= 0 or received_at > current_time + settle_seconds:
+        return "ready"
+    return "ready" if current_time - received_at >= settle_seconds else "waiting"
+
+
+def clear_claude_stop_settle_state(file_state: dict[str, Any]) -> None:
+    file_state.pop("claude_stop_settle_offset", None)
+    file_state.pop("claude_stop_settle_received_at", None)
 
 
 def process_external_file(
@@ -1701,8 +2288,57 @@ def process_external_file(
                 except json.JSONDecodeError:
                     rec["offset"] = line_end
                     continue
-
-                event = trigger(path, line_offset, record)
+                if not isinstance(record, dict):
+                    rec["offset"] = line_end
+                    continue
+                if kind == "Claude Code":
+                    transcript_grew = claude_stop_transcript_grew(record)
+                    terminal_followup = claude_terminal_hook_record_follows(
+                        handle, path, record
+                    )
+                    if terminal_followup:
+                        clear_claude_stop_settle_state(rec)
+                        rec["claude_provisional_stops_suppressed"] = int(
+                            rec.get("claude_provisional_stops_suppressed", 0) or 0
+                        ) + 1
+                        rec["offset"] = line_end
+                        evidence = (
+                            f"matching {terminal_followup} and transcript growth"
+                            if transcript_grew
+                            else f"matching {terminal_followup}"
+                        )
+                        log(
+                            "suppressed provisional Claude Code Stop after "
+                            f"{evidence}: {path.name}"
+                        )
+                        continue
+                    disposition = claude_stop_settle_disposition(record)
+                    if disposition == "waiting":
+                        if rec.get("claude_stop_settle_offset") != line_offset:
+                            rec["claude_stop_settle_offset"] = line_offset
+                            rec["claude_stop_settle_received_at"] = record.get(
+                                "received_at"
+                            )
+                            log(
+                                "holding provisional Claude Code Stop until "
+                                f"the {claude_stop_settle_seconds()}s settle window closes: "
+                                f"{path.name}"
+                            )
+                        # This is intentionally before trigger/delivery: no
+                        # network call, attempt counter, checkpoint, or offset
+                        # advance occurs while sibling Stop hooks can still
+                        # change Claude's decision.
+                        break
+                    clear_claude_stop_settle_state(rec)
+                try:
+                    event = trigger(path, line_offset, record)
+                except Exception as exc:  # noqa: BLE001 - one poisoned record must not stop all sources.
+                    invalid = int(rec.get("invalid_records_skipped", 0) or 0) + 1
+                    rec["invalid_records_skipped"] = invalid
+                    if invalid <= 3 or invalid in {10, 50, 100} or invalid % 1000 == 0:
+                        log(f"skipped invalid {kind} record from {path.name}: {type(exc).__name__}")
+                    rec["offset"] = line_end
+                    continue
                 if not event:
                     rec["offset"] = line_end
                     continue
@@ -1809,6 +2445,436 @@ def baseline_external_files(
     log(f"initialized {kind} baseline at EOF for {count} event files", always_stdout=True)
 
 
+def claude_spool_max_bytes() -> int:
+    configured = env_int("CLAUDE_WATCH_SPOOL_MAX_BYTES", DEFAULT_CLAUDE_SPOOL_MAX_BYTES)
+    return max(configured, MIN_CLAUDE_SPOOL_MAX_BYTES)
+
+
+def claude_spool_max_age_seconds() -> int:
+    configured = env_int(
+        "CLAUDE_WATCH_SPOOL_MAX_AGE_SECONDS",
+        DEFAULT_CLAUDE_SPOOL_MAX_AGE_SECONDS,
+    )
+    return max(configured, MIN_CLAUDE_SPOOL_MAX_AGE_SECONDS)
+
+
+def claude_drain_grace_seconds() -> int:
+    configured = env_int("CLAUDE_WATCH_DRAIN_GRACE_SECONDS", DEFAULT_CLAUDE_DRAIN_GRACE_SECONDS)
+    return max(configured, DEFAULT_CLAUDE_DRAIN_GRACE_SECONDS)
+
+
+def infer_claude_spool_started_at(path: Path, now: int | None = None) -> int:
+    """Infer a pre-existing live spool generation's start without postponing TTL."""
+    if not regular_file_without_symlink(path):
+        return 0
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return 0
+    if metadata.st_size <= 0:
+        return 0
+    current_time = int(time.time()) if now is None else max(int(now), 0)
+    candidates = [metadata.st_mtime, metadata.st_ctime]
+    birth_time = getattr(metadata, "st_birthtime", None)
+    if isinstance(birth_time, (int, float)):
+        candidates.append(birth_time)
+    timestamps = [
+        int(value)
+        for value in candidates
+        if isinstance(value, (int, float)) and value > 0
+    ]
+    if not timestamps:
+        return current_time
+    return min(current_time, min(timestamps))
+
+
+def file_identity(path: Path) -> str:
+    if not regular_file_without_symlink(path):
+        return ""
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return ""
+    return f"{metadata.st_dev}:{metadata.st_ino}"
+
+
+def has_active_delivery_for_path(state: dict[str, Any], path: Path) -> bool:
+    expected = str(path)
+    return any(
+        isinstance(entry, dict)
+        and entry.get("log_path") == expected
+        and entry.get("status") in {"attempting", "retry_wait"}
+        for entry in delivery_attempts_for_state(state).values()
+    )
+
+
+def discard_active_deliveries_for_path(state: dict[str, Any], path: Path) -> int:
+    expected = str(path)
+    attempts = delivery_attempts_for_state(state)
+    related_paths = {expected}
+    for candidate_path, rec in state.setdefault("files", {}).items():
+        if isinstance(rec, dict) and rec.get("claude_spool_path") == expected:
+            related_paths.add(str(candidate_path))
+    abandoned = 0
+    now = int(time.time())
+    for entry in attempts.values():
+        if not isinstance(entry, dict) or entry.get("log_path") not in related_paths:
+            continue
+        if entry.get("status") not in {"attempting", "retry_wait"}:
+            continue
+        entry.update(
+            {
+                "status": "exhausted",
+                "next_retry_at": None,
+                "exhausted_at": now,
+                "last_result": "abandoned_source_change",
+            }
+        )
+        abandoned += 1
+    if abandoned:
+        stats = state.setdefault("delivery_stats", {})
+        stats["abandoned_source_changes"] = int(
+            stats.get("abandoned_source_changes", 0) or 0
+        ) + abandoned
+    return abandoned
+
+
+def initialize_claude_spool(
+    state: dict[str, Any],
+    spool_path: Path,
+    *,
+    process_existing: bool,
+    log: Logger,
+) -> bool:
+    """Bind Claude initialization to one path and safely recover drain rotations.
+
+    A missing spool is represented with offset zero so the first future Hook is
+    delivered. An already-existing spool at a newly selected path is baselined
+    at EOF unless the explicit process-existing option was requested.
+    """
+    files = state.setdefault("files", {})
+    key = str(spool_path)
+    previous_path = state.get("claude_initialized")
+    path_changed = previous_path != key
+    current_missing = key not in files
+    changed = False
+    now = int(time.time())
+
+    if path_changed or current_missing:
+        if path_changed and isinstance(previous_path, str) and previous_path:
+            discard_active_deliveries_for_path(state, Path(previous_path))
+        size = 0
+        if regular_file_without_symlink(spool_path):
+            try:
+                size = spool_path.stat().st_size
+            except OSError:
+                size = 0
+        offset = 0 if process_existing else size
+        files[key] = {
+            "offset": offset,
+            "size": size,
+            "updated_at": now,
+            "kind": "Claude Code",
+            "file_identity": file_identity(spool_path),
+            "claude_spool_started_at": infer_claude_spool_started_at(spool_path, now),
+        }
+        state["claude_initialized"] = key
+        changed = True
+
+        for drain_path in claude_drain_files(spool_path):
+            try:
+                drain_size = drain_path.stat().st_size
+            except OSError:
+                continue
+            files[str(drain_path)] = {
+                "offset": 0 if process_existing else drain_size,
+                "size": drain_size,
+                "updated_at": now,
+                "kind": "Claude Code",
+                "claude_drain": True,
+                "drain_stable_size": drain_size,
+                "drain_stable_since": now,
+                "file_identity": file_identity(drain_path),
+                "claude_spool_path": key,
+            }
+
+        action = "from BOF" if process_existing else "at EOF"
+        log(
+            f"initialized Claude Code spool {action} for path {spool_path}",
+            always_stdout=True,
+        )
+        return changed
+
+    current = files.get(key)
+    actual_identity = file_identity(spool_path)
+    if isinstance(current, dict):
+        expected_identity = str(current.get("file_identity") or "")
+        if actual_identity and expected_identity and actual_identity != expected_identity:
+            try:
+                replacement_size = spool_path.stat().st_size
+            except OSError:
+                replacement_size = 0
+            current.update(
+                {
+                    "offset": 0 if process_existing else replacement_size,
+                    "size": replacement_size,
+                    "updated_at": now,
+                    "file_identity": actual_identity,
+                    "claude_spool_started_at": infer_claude_spool_started_at(
+                        spool_path, now
+                    ),
+                }
+            )
+            discard_active_deliveries_for_path(state, spool_path)
+            changed = True
+            action = "from BOF" if process_existing else "at EOF"
+            log(f"Claude Code spool inode changed; baselined replacement {action}: {spool_path}")
+        elif actual_identity and not expected_identity:
+            current["file_identity"] = actual_identity
+            changed = True
+        try:
+            recorded_start = int(current.get("claude_spool_started_at", 0) or 0)
+        except (TypeError, ValueError):
+            recorded_start = 0
+        inferred_start = infer_claude_spool_started_at(spool_path, now)
+        replacement_start: int | None = None
+        if recorded_start <= 0 and inferred_start > 0:
+            replacement_start = inferred_start
+        elif recorded_start > now:
+            replacement_start = inferred_start if inferred_start > 0 else now
+        elif recorded_start > 0 and inferred_start == 0 and actual_identity:
+            # A still-identical regular file is now empty. Do not reset the TTL
+            # merely because a missing/inaccessible path could not be inspected.
+            replacement_start = 0
+        if replacement_start is not None:
+            current["claude_spool_started_at"] = replacement_start
+            changed = True
+
+    # A drain absent from state means rotation completed on disk but the state
+    # checkpoint was interrupted. Its filename records the already-consumed
+    # prefix, so only bytes appended to the old inode after rename are replayed.
+    recovered_drain = False
+    for drain_path in claude_drain_files(spool_path):
+        drain_key = str(drain_path)
+        if drain_key in files:
+            existing = files.get(drain_key)
+            if isinstance(existing, dict):
+                expected_identity = str(existing.get("file_identity") or "")
+                actual_identity = file_identity(drain_path)
+                if expected_identity and actual_identity != expected_identity:
+                    existing["foreign_replacement"] = True
+                    changed = True
+            continue
+        try:
+            drain_size = drain_path.stat().st_size
+        except OSError:
+            continue
+        encoded_offset = claude_drain_baseline_offset(spool_path, drain_path)
+        offset = drain_size if encoded_offset is None else min(encoded_offset, drain_size)
+        files[drain_key] = {
+            "offset": offset,
+            "size": drain_size,
+            "updated_at": now,
+            "kind": "Claude Code",
+            "claude_drain": True,
+            "drain_stable_size": drain_size,
+            "drain_stable_since": now,
+            "file_identity": file_identity(drain_path),
+            "claude_spool_path": key,
+        }
+        recovered_drain = True
+        changed = True
+        log(f"recovered Claude Code spool drain {drain_path.name}")
+
+    if recovered_drain:
+        # The current path may already be a fresh file created between rename
+        # and the interrupted checkpoint. Start at zero to avoid dropping it;
+        # stable event IDs prevent a completed record from being sent twice.
+        current = files.get(key)
+        if isinstance(current, dict):
+            try:
+                current_size = (
+                    spool_path.stat().st_size
+                    if regular_file_without_symlink(spool_path)
+                    else 0
+                )
+            except OSError:
+                current_size = 0
+            current["offset"] = 0
+            current["size"] = current_size
+            current["updated_at"] = now
+            current["file_identity"] = file_identity(spool_path)
+            current["claude_spool_started_at"] = infer_claude_spool_started_at(
+                spool_path, now
+            )
+    return changed
+
+
+def rotate_consumed_claude_spool(
+    spool_path: Path,
+    state: dict[str, Any],
+    log: Logger,
+    checkpoint: Callable[[], None] | None = None,
+) -> bool:
+    """Rotate a fully consumed size- or age-expired spool without truncation.
+
+    At most one drain is retained. Writers that opened the old inode before the
+    rename continue appending to that drain; writers opening the configured path
+    afterwards append to the new spool. The drain is still watched until it has
+    been fully consumed and stable past the Hook timeout safety window.
+    """
+    if owned_claude_drain_files(spool_path, state) or not regular_file_without_symlink(spool_path):
+        return False
+    try:
+        metadata = spool_path.lstat()
+    except OSError:
+        return False
+    size = metadata.st_size
+
+    files = state.setdefault("files", {})
+    key = str(spool_path)
+    rec = files.get(key)
+    if not isinstance(rec, dict):
+        return False
+    try:
+        offset = int(rec.get("offset", 0) or 0)
+        started_at = int(rec.get("claude_spool_started_at", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    now = int(time.time())
+    size_expired = size >= claude_spool_max_bytes()
+    age_seconds = max(now - started_at, 0) if started_at > 0 else 0
+    age_expired = bool(
+        size > 0
+        and started_at > 0
+        and age_seconds >= claude_spool_max_age_seconds()
+    )
+    if not size_expired and not age_expired:
+        return False
+    if offset < size or has_active_delivery_for_path(state, spool_path):
+        return False
+
+    drain_name = (
+        f"{claude_drain_prefix(spool_path)}{size}-{time.time_ns()}-{secrets.token_hex(4)}"
+    )
+    drain_path = spool_path.parent / drain_name
+    try:
+        spool_path.rename(drain_path)
+    except OSError as exc:
+        log(f"cannot rotate Claude Code spool {spool_path}: {exc}")
+        return False
+
+    try:
+        descriptor = os.open(spool_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # A Hook won the creation race and already owns the new live spool.
+        pass
+    except OSError as exc:
+        log(f"Claude Code spool rotated; new live spool will be created by the next Hook: {exc}")
+    else:
+        os.close(descriptor)
+
+    drain_rec = dict(rec)
+    drain_rec.update(
+        {
+            "offset": size,
+            "size": size,
+            "updated_at": now,
+            "kind": "Claude Code",
+            "claude_drain": True,
+            "drain_stable_size": size,
+            "drain_stable_since": now,
+            "file_identity": f"{metadata.st_dev}:{metadata.st_ino}",
+            "claude_spool_path": key,
+        }
+    )
+    files[str(drain_path)] = drain_rec
+    try:
+        live_size = spool_path.stat().st_size if regular_file_without_symlink(spool_path) else 0
+    except OSError:
+        live_size = 0
+    files[key] = {
+        "offset": 0,
+        "size": live_size,
+        "updated_at": now,
+        "kind": "Claude Code",
+        "file_identity": file_identity(spool_path),
+        "claude_spool_started_at": now if live_size > 0 else 0,
+    }
+    for entry in delivery_attempts_for_state(state).values():
+        if isinstance(entry, dict) and entry.get("log_path") == key:
+            entry["log_path"] = str(drain_path)
+    delivery_checkpoint(checkpoint)
+    reasons = []
+    if size_expired:
+        reasons.append(f"size={size}")
+    if age_expired:
+        reasons.append(f"age={age_seconds}s")
+    log(f"rotated fully consumed Claude Code spool ({', '.join(reasons)})")
+    return True
+
+
+def retire_stable_claude_drain(
+    drain_path: Path,
+    state: dict[str, Any],
+    log: Logger,
+    checkpoint: Callable[[], None] | None = None,
+) -> bool:
+    """Remove a consumed drain only after it outlives all configured Hook writers."""
+    files = state.setdefault("files", {})
+    key = str(drain_path)
+    rec = files.get(key)
+    if not isinstance(rec, dict) or not rec.get("claude_drain"):
+        return False
+    spool_value = rec.get("claude_spool_path")
+    if not isinstance(spool_value, str) or not spool_value:
+        return False
+    spool_path = Path(spool_value)
+    if parse_claude_drain_path(spool_path, drain_path) is None:
+        return False
+    if not regular_file_without_symlink(drain_path):
+        files.pop(key, None)
+        delivery_checkpoint(checkpoint)
+        return False
+    try:
+        metadata = drain_path.lstat()
+        offset = int(rec.get("offset", 0) or 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    actual_identity = f"{metadata.st_dev}:{metadata.st_ino}"
+    expected_identity = str(rec.get("file_identity") or "")
+    if not expected_identity or actual_identity != expected_identity:
+        rec["foreign_replacement"] = True
+        delivery_checkpoint(checkpoint)
+        log(f"ignored replaced Claude Code spool drain {drain_path.name}")
+        return False
+    size = metadata.st_size
+    now = int(time.time())
+    previous_size = int(rec.get("drain_stable_size", -1) or 0)
+    if offset < size or previous_size != size:
+        rec["drain_stable_size"] = size
+        rec["drain_stable_since"] = now
+        return False
+    stable_since = int(rec.get("drain_stable_since", now) or now)
+    if now - stable_since < claude_drain_grace_seconds():
+        return False
+
+    # No process can newly open the private drain name. After the grace window
+    # (six times the installed Hook timeout), all pre-rename writers are gone.
+    try:
+        current = drain_path.lstat()
+        if current.st_dev != metadata.st_dev or current.st_ino != metadata.st_ino or current.st_size != size:
+            return False
+        drain_path.unlink()
+    except OSError as exc:
+        log(f"cannot retire Claude Code spool drain {drain_path}: {exc}")
+        return False
+    files.pop(key, None)
+    delivery_checkpoint(checkpoint)
+    log(f"retired consumed Claude Code spool drain {drain_path.name}")
+    return True
+
+
 def build_roots(args: argparse.Namespace) -> list[Path]:
     roots = [expand_path(value) for value in (args.sessions_root or [DEFAULT_SESSIONS_ROOT])]
     include_archived = args.include_archived or os.getenv("CODEX_WATCH_INCLUDE_ARCHIVED") in {"1", "true", "True"}
@@ -1851,6 +2917,24 @@ def grok_watch_enabled(args: argparse.Namespace) -> bool:
     if getattr(args, "disable_grok", False):
         return False
     return env_flag("GROK_WATCH_ENABLED", True)
+
+
+def build_claude_hook_events_file(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "claude_hook_events_file", None) or os.getenv("CLAUDE_WATCH_EVENTS_FILE", "")
+    if configured:
+        return absolute_path_without_symlink_resolution(configured)
+    config_root = (
+        os.getenv("CODEX_WATCH_CONFIG_DIR")
+        or os.getenv("AGENTWATCH_CONFIG_DIR")
+        or "~/.codex-watch-notifier"
+    )
+    return absolute_path_without_symlink_resolution(str(Path(config_root) / CLAUDE_HOOK_EVENTS_FILE_NAME))
+
+
+def claude_watch_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "disable_claude", False):
+        return False
+    return env_flag("CLAUDE_WATCH_ENABLED", True)
 
 
 def parse_extra_event_types() -> set[str]:
@@ -1903,6 +2987,7 @@ def send_external_test_notification(
     default_icon = {
         "KIMI": DEFAULT_KIMI_BARK_ICON,
         "GROK": DEFAULT_GROK_BARK_ICON,
+        "CLAUDE": DEFAULT_CLAUDE_BARK_ICON,
     }.get(env_prefix, "")
     event = {
         "event_type": f"{event_prefix}_test",
@@ -1967,6 +3052,7 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     zcode_root = build_zcode_log_root(args)
     kimi_root = build_kimi_sessions_root(args)
     grok_root = build_grok_sessions_root(args)
+    claude_events_file = build_claude_hook_events_file(args)
     notifier = Notifier(False, Logger(None))
 
     print("Codex Watch Notifier doctor")
@@ -1996,13 +3082,21 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
         )
     legacy_ntfy = any(
         os.getenv(name)
-        for name in ("NTFY_URL", "NTFY_TOKEN", "CODEX_NTFY_URL", "ZCODE_NTFY_URL", "KIMI_NTFY_URL", "GROK_NTFY_URL")
+        for name in (
+            "NTFY_URL",
+            "NTFY_TOKEN",
+            "CODEX_NTFY_URL",
+            "ZCODE_NTFY_URL",
+            "KIMI_NTFY_URL",
+            "GROK_NTFY_URL",
+            "CLAUDE_NTFY_URL",
+        )
     )
     if legacy_ntfy:
         print_check(
             "legacy ntfy configuration ignored",
             False,
-            "v0.2 publishes only through the account-bound /publish API; no duplicate is sent",
+            "private delivery publishes only through the account-bound /publish API; no duplicate is sent",
         )
     subagent_policy = "enabled" if notify_subagents_enabled() else "main sessions only"
     print(f"Codex subagent notifications: {subagent_policy}")
@@ -2024,13 +3118,25 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     if grok_watch_enabled(args):
         print_check("Grok sessions root", grok_root.exists(), str(grok_root))
         print_check("Grok event files", count_paths(grok_event_files(grok_root)) > 0, f"{count_paths(grok_event_files(grok_root))} file(s)")
+    print_check("Claude Code watch enabled", claude_watch_enabled(args), f"events={claude_events_file}")
+    if claude_watch_enabled(args):
+        print_check(
+            "Claude Code hook event spool",
+            regular_file_without_symlink(claude_events_file),
+            str(claude_events_file),
+        )
     print_check("state file", state_path.exists(), str(state_path))
+    state_file_valid = True
     delivery_state: dict[str, Any] = {}
     if state_path.exists():
         try:
             delivery_state = load_state(state_path)
-        except (OSError, json.JSONDecodeError):
+        except StateFileError as exc:
+            state_file_valid = False
+            print_check("state data valid", False, str(exc))
             delivery_state = {}
+        else:
+            print_check("state data valid", True, "preserved offsets and delivery state")
     delivery_entries = delivery_state.get("delivery_attempts", {})
     if not isinstance(delivery_entries, dict):
         delivery_entries = {}
@@ -2070,7 +3176,7 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
                 print(line)
         except OSError as exc:
             print(f"cannot read log: {exc}")
-    return 0
+    return 0 if state_file_valid else 1
 
 
 def replay_file(args: argparse.Namespace, log: Logger) -> int:
@@ -2090,7 +3196,25 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
     kimi_root = build_kimi_sessions_root(args)
     grok_enabled = grok_watch_enabled(args)
     grok_root = build_grok_sessions_root(args)
-    state = load_state(state_path)
+    claude_enabled = claude_watch_enabled(args)
+    claude_events_file = build_claude_hook_events_file(args)
+    last_state_error = ""
+    while True:
+        try:
+            state = load_state(state_path)
+            break
+        except StateFileError as exc:
+            message = str(exc)
+            if message != last_state_error:
+                log(
+                    message
+                    + "; watcher is paused without changing offsets or delivery state",
+                    always_stdout=True,
+                )
+                last_state_error = message
+            if args.once:
+                return 78
+            time.sleep(max(float(args.poll_interval), 30.0))
 
     def checkpoint() -> None:
         save_state(state_path, state)
@@ -2131,6 +3255,19 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
             did_baseline = True
         else:
             state["grok_initialized"] = True
+    if claude_enabled:
+        claude_needs_baseline = bool(
+            state.get("claude_initialized") != str(claude_events_file)
+            or str(claude_events_file) not in state.setdefault("files", {})
+        )
+        initialize_claude_spool(
+            state,
+            claude_events_file,
+            process_existing=args.process_existing,
+            log=log,
+        )
+        if claude_needs_baseline and not args.process_existing:
+            did_baseline = True
     if did_baseline:
         save_state(state_path, state)
         if args.once:
@@ -2145,6 +3282,8 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
         log(f"watching Kimi Code {kimi_root} with channels={notifier.channels}", always_stdout=True)
     if grok_enabled:
         log(f"watching Grok Build {grok_root} with channels={notifier.channels}", always_stdout=True)
+    if claude_enabled:
+        log(f"watching Claude Code hook events {claude_events_file} with channels={notifier.channels}", always_stdout=True)
 
     while True:
         for path in rollout_files(roots):
@@ -2190,6 +3329,32 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
                     trigger_from_grok_record,
                     checkpoint,
                 )
+        if claude_enabled:
+            if initialize_claude_spool(
+                state,
+                claude_events_file,
+                process_existing=args.process_existing,
+                log=log,
+            ):
+                checkpoint()
+            drain_paths = claude_drain_files(claude_events_file)
+            for path in drain_paths + claude_hook_event_files(claude_events_file):
+                if path in drain_paths:
+                    drain_rec = state.setdefault("files", {}).get(str(path))
+                    if not isinstance(drain_rec, dict) or drain_rec.get("foreign_replacement"):
+                        continue
+                process_external_file(
+                    path,
+                    state,
+                    notifier,
+                    log,
+                    "Claude Code",
+                    trigger_from_claude_hook_record,
+                    checkpoint,
+                )
+                if path in drain_paths:
+                    retire_stable_claude_drain(path, state, log, checkpoint)
+            rotate_consumed_claude_spool(claude_events_file, state, log, checkpoint)
         save_state(state_path, state)
         if args.once:
             return 0
@@ -2197,7 +3362,34 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
 
 
 def main() -> int:
-    load_env_file(default_env_path())
+    env_path = default_env_path()
+    last_config_error = ""
+    one_shot_flags = {
+        "--once",
+        "--doctor",
+        "--replay-file",
+        "--test",
+        "--test-zcode",
+        "--test-kimi",
+        "--test-grok",
+        "--test-claude",
+    }
+    while True:
+        try:
+            load_env_file(env_path)
+            break
+        except ConfigFileError as exc:
+            message = str(exc)
+            if message != last_config_error:
+                print(
+                    message
+                    + "; watcher is paused without using fallback delivery configuration",
+                    file=sys.stderr,
+                )
+                last_config_error = message
+            if any(flag in sys.argv[1:] for flag in one_shot_flags):
+                return 78
+            time.sleep(30.0)
     parser = argparse.ArgumentParser(description="Notify when Codex rollout sessions complete or stop.")
     parser.add_argument("--sessions-root", action="append", help="Root containing rollout-*.jsonl files.")
     parser.add_argument("--state", default=os.getenv("CODEX_WATCH_STATE", DEFAULT_STATE), help="State JSON path.")
@@ -2212,12 +3404,15 @@ def main() -> int:
     parser.add_argument("--disable-kimi", action="store_true", help="Disable Kimi Code notifications.")
     parser.add_argument("--grok-sessions-root", help="Root containing Grok Build session events.jsonl files.")
     parser.add_argument("--disable-grok", action="store_true", help="Disable Grok Build notifications.")
+    parser.add_argument("--claude-hook-events-file", help="JSONL spool written by the official Claude Code hooks.")
+    parser.add_argument("--disable-claude", action="store_true", help="Disable Claude Code hook notifications.")
     parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them.")
     parser.add_argument("--verbose", action="store_true", help="Also print log lines to stdout.")
     parser.add_argument("--test", action="store_true", help="Send one test notification and exit.")
     parser.add_argument("--test-zcode", action="store_true", help="Send one ZCode test notification and exit.")
     parser.add_argument("--test-kimi", action="store_true", help="Send one Kimi Code test notification and exit.")
     parser.add_argument("--test-grok", action="store_true", help="Send one Grok Build test notification and exit.")
+    parser.add_argument("--test-claude", action="store_true", help="Send one Claude Code test notification and exit.")
     parser.add_argument("--doctor", action="store_true", help="Check configuration, log roots, and LaunchAgent status.")
     parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
     args = parser.parse_args()
@@ -2233,6 +3428,8 @@ def main() -> int:
         return send_external_test_notification(args, log, "Kimi Code", "kimi")
     if args.test_grok:
         return send_external_test_notification(args, log, "Grok Build", "grok")
+    if args.test_claude:
+        return send_external_test_notification(args, log, "Claude Code", "claude")
     if args.doctor:
         return doctor(args, log)
     state_path = expand_path(args.state)

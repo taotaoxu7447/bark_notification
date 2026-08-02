@@ -22,7 +22,18 @@ class NtfyMessageTest {
     @Test
     fun oldMessagesCanFallBackToTitle() {
         assertEquals(NtfyMessage.Source.GROK, NtfyMessage.inferSource(emptySet(), "Grok Build 已完成"))
+        assertEquals(NtfyMessage.Source.CLAUDE, NtfyMessage.inferSource(emptySet(), "Claude Code 已完成"))
         assertEquals(NtfyMessage.Source.OTHER, NtfyMessage.inferSource(emptySet(), "任务已完成"))
+    }
+
+    @Test
+    fun claudeSourceTagAndStoredKeyUseTheirOwnHistoryCategory() {
+        assertEquals(
+            NtfyMessage.Source.CLAUDE,
+            NtfyMessage.inferSource(setOf("agentwatch_v2", "source_claude"), "任务已完成"),
+        )
+        assertEquals(NtfyMessage.Source.CLAUDE, NtfyMessage.sourceForKey("CLAUDE"))
+        assertEquals("Claude Code", NtfyMessage.Source.CLAUDE.displayName)
     }
 
     @Test
@@ -74,6 +85,32 @@ class NtfyMessageTest {
         assertEquals("完整正文", parsed.message)
         assertEquals("工作 Mac", parsed.computerName)
         assertEquals(NtfyMessage.Source.KIMI, parsed.source)
+    }
+
+    @Test
+    fun v2ClaudeEnvelopeIsParsedAsClaudeHistory() {
+        val envelope = JSONObject()
+            .put("schema", "agentwatch_event_v2")
+            .put("event_id", "aw2-claude-event")
+            .put("source", "claude")
+            .put("title", "Claude Code 已完成")
+            .put("body", "Claude 完成了任务")
+            .put("computer_id", "mac-claude")
+            .put("computer_name", "Claude Mac")
+            .put("sent_at", 1_785_600_100L)
+        val wire = JSONObject()
+            .put("id", "ntfy-claude")
+            .put("sequence_id", "aw2-claude-event")
+            .put("event", "message")
+            .put("topic", "aw-0123456789abcdef0123456789abcdef")
+            .put("time", 1_785_600_101L)
+            .put("message", envelope.toString())
+            .put("tags", org.json.JSONArray(listOf("agentwatch_v2", "source_claude")))
+        val parsed = requireNotNull(NtfyMessage.parse(wire.toString()))
+        assertEquals(NtfyMessage.Source.CLAUDE, parsed.source)
+        assertEquals("Claude Code 已完成", parsed.title)
+        assertEquals("Claude 完成了任务", parsed.message)
+        assertEquals("Claude Mac", parsed.computerName)
     }
 
     @Test

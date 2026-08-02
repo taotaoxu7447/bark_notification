@@ -502,7 +502,7 @@ class MainActivity : Activity() {
         gravity = Gravity.TOP
         setOnClickListener { showHistoryDetail(entry) }
         addView(ImageView(this@MainActivity).apply {
-            setImageResource(sourceImage(entry.source))
+            setImageResource(SourcePresentation.largeIcon(entry.source) ?: SourcePresentation.smallIcon(entry.source))
             scaleType = ImageView.ScaleType.CENTER_CROP
             layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(12) }
         })
@@ -812,14 +812,6 @@ class MainActivity : Activity() {
     private fun pillBackground(selected: Boolean): GradientDrawable = GradientDrawable().apply {
         setColor(if (selected) Color.rgb(49, 92, 245) else Color.rgb(237, 241, 255))
         cornerRadius = dp(12).toFloat()
-    }
-
-    private fun sourceImage(source: NtfyMessage.Source): Int = when (source) {
-        NtfyMessage.Source.CODEX -> R.drawable.source_codex
-        NtfyMessage.Source.ZCODE -> R.drawable.source_zcode
-        NtfyMessage.Source.KIMI -> R.drawable.source_kimi
-        NtfyMessage.Source.GROK -> R.drawable.source_grok
-        NtfyMessage.Source.OTHER -> R.drawable.ic_notify_other
     }
 
     private fun card(): LinearLayout = LinearLayout(this).apply {

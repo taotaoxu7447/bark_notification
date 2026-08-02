@@ -13,8 +13,9 @@ development or sideloading and may be disabled after installation.
 
 ## Delivery behavior
 
-- Sources are grouped into separate Codex, ZCode, Kimi Code, and Grok Build
-  notification channels with distinct icons.
+- Sources are grouped into separate Codex, ZCode, Kimi Code, Grok Build, and
+  Claude Code notification channels with distinct icons. Claude payloads use
+  `source=claude`, `source_claude.png`, and their own Android history category.
 - The main UI has Messages, Devices, and Settings pages. Messages are grouped
   by source and support detail view, search, single/source/all deletion. The
   Devices page lists account-bound computers and can revoke one sender.
@@ -78,7 +79,8 @@ to keep that account's local history, and only then clears the encrypted local
 session. Sender computers log in with the same account through the desktop CLI;
 the Android app never asks for or displays a computer pairing code.
 
-Version 0.2 consumes only the dynamic per-account topic returned by API v2.
+Version 0.3.0 consumes only the dynamic per-account topic returned by API v2
+and recognizes Claude as a first-class source in notification and history UI.
 Other accounts have no ACL read access to that topic. ntfy remains a short-term
 offline-delivery buffer (currently about six hours), not a long-term message
 archive; a phone offline beyond that window cannot reconstruct expired events.
