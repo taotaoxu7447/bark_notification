@@ -38,6 +38,10 @@ NTFY_TOKEN=<publisher-token-from-administrator>
 On Android, add the server `https://64.90.8.184:9444`, sign in with the read-only
 subscriber account supplied privately by the administrator, and subscribe to
 `agent-watch`. Do not reuse publisher credentials on a receiving device.
+On ColorOS and similar systems, set ntfy's power-use management to fully allow
+background behavior; the standard battery-optimization exemption alone may not
+prevent the vendor freezer from stopping the live subscription. Enable
+WebSockets when the ntfy client offers it; the Caddy proxy supports the upgrade.
 
 ## Access administration
 
