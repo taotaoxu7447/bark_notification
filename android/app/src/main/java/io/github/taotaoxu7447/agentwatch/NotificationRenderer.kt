@@ -109,7 +109,7 @@ class NotificationRenderer(private val context: Context) {
             .setContentTitle(title.take(180))
             .setContentText(message.message.lineSequence().firstOrNull().orEmpty().take(220))
             .setStyle(Notification.BigTextStyle().bigText(message.message.take(3500)))
-            .setContentIntent(mainPendingIntent())
+            .setContentIntent(mainPendingIntent(message.eventKey))
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_STATUS)
@@ -138,12 +138,14 @@ class NotificationRenderer(private val context: Context) {
         eventKey: String,
         source: NtfyMessage.Source,
         notificationTimeMillis: Long,
+        history: HistoryStore.Entry? = null,
     ) {
         val notification = Notification.Builder(context, recoveryChannelId(source))
             .setSmallIcon(smallIcon(source))
-            .setContentTitle("${source.displayName} 任务提醒")
-            .setContentText("进程中断后已静默恢复送达；原通知正文未在本机保存")
-            .setContentIntent(mainPendingIntent())
+            .setContentTitle(history?.title ?: "${source.displayName} 任务提醒")
+            .setContentText(history?.body?.lineSequence()?.firstOrNull()?.take(220) ?: "进程中断后已静默恢复送达")
+            .setStyle(history?.let { Notification.BigTextStyle().bigText(it.body.take(3500)) })
+            .setContentIntent(mainPendingIntent(eventKey))
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_STATUS)
@@ -155,10 +157,12 @@ class NotificationRenderer(private val context: Context) {
         manager.notify(eventTag(eventKey), eventId(eventKey), notification)
     }
 
-    private fun mainPendingIntent(): PendingIntent = PendingIntent.getActivity(
+    private fun mainPendingIntent(eventKey: String = ""): PendingIntent = PendingIntent.getActivity(
         context,
-        0,
-        Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP),
+        eventKey.hashCode(),
+        Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            .putExtra(MainActivity.EXTRA_EVENT_ID, eventKey),
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
 

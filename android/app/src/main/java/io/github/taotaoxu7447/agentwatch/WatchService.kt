@@ -34,6 +34,8 @@ class WatchService : Service() {
     private lateinit var ackOutbox: AckOutbox
     private lateinit var secretStore: SecretStore
     private lateinit var registrationClient: RegistrationClient
+    private lateinit var historyStore: HistoryStore
+    private lateinit var historySettings: HistorySettings
     private lateinit var connectivityManager: ConnectivityManager
 
     private val client = OkHttpClient.Builder()
@@ -121,6 +123,9 @@ class WatchService : Service() {
         ackOutbox = AckOutbox(this)
         secretStore = SecretStore(this)
         registrationClient = RegistrationClient(this)
+        historyStore = HistoryStore(this)
+        historySettings = HistorySettings(this)
+        historyStore.cleanupAll(historySettings.retentionDays())
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         promoteToForeground(StatusStore.STATE_CONNECTING, "正在启动")
     }
@@ -151,8 +156,14 @@ class WatchService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (secretStore.get(SecretStore.NTFY_TOKEN).isBlank()) {
-            setState(StatusStore.STATE_AUTH_FAILED, "请重新登录")
+        val session = secretStore.session()
+        if (!session.isPrivate) {
+            val detail = if (session.appToken.isNotBlank()) {
+                "请打开 AgentWatch，将旧会话升级到私有通道"
+            } else {
+                "请重新登录"
+            }
+            setState(StatusStore.STATE_AUTH_FAILED, detail)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
@@ -189,6 +200,7 @@ class WatchService : Service() {
         }
         client.dispatcher.executorService.shutdown()
         client.connectionPool.evictAll()
+        historyStore.close()
         if (stopRequested) statusStore.update(StatusStore.STATE_STOPPED, "接收服务已停止")
         super.onDestroy()
     }
@@ -228,8 +240,8 @@ class WatchService : Service() {
             setState(StatusStore.STATE_RECONNECTING, "等待网络恢复")
             return
         }
-        val token = secretStore.get(SecretStore.NTFY_TOKEN)
-        if (token.isBlank()) {
+        val session = secretStore.session()
+        if (!session.isPrivate) {
             setState(StatusStore.STATE_AUTH_FAILED, "请重新登录")
             return
         }
@@ -239,8 +251,8 @@ class WatchService : Service() {
             val generation = socketGeneration
             setState(StatusStore.STATE_CONNECTING, if (reason == "service start") "正在连接" else "正在重新连接")
             val request = Request.Builder()
-                .url(AppConfig.websocketUrl(cursorStore.read()))
-                .header("Authorization", "Bearer $token")
+                .url(AppConfig.websocketUrl(session.ntfyWebsocketUrl, cursorStore.read()))
+                .header("Authorization", "Bearer ${session.ntfyToken}")
                 .header("User-Agent", "AgentWatch-Android/${BuildConfig.VERSION_NAME}")
                 .build()
             webSocket = client.newWebSocket(request, Listener(generation))
@@ -297,7 +309,8 @@ class WatchService : Service() {
             }
             "keepalive" -> Unit
             "message" -> {
-                if (message.topic != AppConfig.TOPIC || message.id.isBlank() || message.eventKey.isBlank()) return
+                val session = secretStore.session()
+                if (!session.isPrivate || message.topic != session.ntfyTopic || message.id.isBlank() || message.eventKey.isBlank()) return
                 val now = System.currentTimeMillis() / 1000L
                 if (!message.isForDevice(DeviceIdentity.notificationTarget(this))) {
                     cursorStore.advance(message.time)
@@ -308,10 +321,19 @@ class WatchService : Service() {
                     return
                 }
                 try {
-                    val notificationTimeMillis = if (message.time > 0L) {
-                        message.time * 1000L
-                    } else {
-                        System.currentTimeMillis()
+                    val historyResult = historyStore.insert(session.username, message)
+                    historyStore.cleanup(session.username, historySettings.retentionDays())
+                    if (historyResult == HistoryStore.InsertResult.INSERTED) {
+                        sendBroadcast(Intent(AppConfig.HISTORY_ACTION).setPackage(packageName))
+                    }
+                    if (shouldSuppressFromHistory(historyResult)) {
+                        cursorStore.advance(message.time)
+                        return
+                    }
+                    val notificationTimeMillis = when {
+                        message.sentAt > 0L -> message.sentAt * 1000L
+                        message.time > 0L -> message.time * 1000L
+                        else -> System.currentTimeMillis()
                     }
                     when (
                         val claim = dedupeStore.claim(
@@ -321,11 +343,17 @@ class WatchService : Service() {
                         )
                     ) {
                         EventDedupeStore.Claim.SHOWN -> {
+                            if (shouldRemoveUnexpectedInsert(EventDedupeStore.Claim.SHOWN, historyResult)) {
+                                historyStore.deleteOne(session.username, message.eventKey, remember = false)
+                            }
                             ackOutbox.enqueue(message.eventKey)
                             flushAcknowledgements()
                         }
                         EventDedupeStore.Claim.SUPPRESSED -> Unit
                         EventDedupeStore.Claim.DISPLAY_COMMITTED -> {
+                            if (shouldRemoveUnexpectedInsert(EventDedupeStore.Claim.DISPLAY_COMMITTED, historyResult)) {
+                                historyStore.deleteOne(session.username, message.eventKey, remember = false)
+                            }
                             queueAcknowledgementForCommittedDisplay(message.eventKey)
                             statusStore.markReceived()
                             flushAcknowledgements()
@@ -371,6 +399,7 @@ class WatchService : Service() {
      * a metadata-only notification is posted on a silent channel first.
      */
     private fun recoverIncompleteDeliveries(): Boolean = try {
+        val account = secretStore.session().username
         dedupeStore.incompleteDeliveries().forEach { delivery ->
             val active = renderer.isEventActive(delivery.eventKey)
             when (EventDedupeStore.recoveryAction(delivery.stage, active)) {
@@ -384,6 +413,7 @@ class WatchService : Service() {
                             delivery.eventKey,
                             delivery.source,
                             delivery.notificationTimeMillis,
+                            historyStore.find(account, delivery.eventKey),
                         )
                         commitDisplayedDelivery(delivery.eventKey)
                         statusStore.markReceived()
@@ -536,5 +566,21 @@ class WatchService : Service() {
             if (attempt <= 0) return 1
             return min(1 shl min(attempt, 6), 60)
         }
+
+        internal fun shouldSuppressFromHistory(result: HistoryStore.InsertResult): Boolean =
+            result == HistoryStore.InsertResult.DELETED
+
+        /**
+         * If delivery metadata proves an event was already handled, a newly
+         * inserted row can only be a replay after the user or retention policy
+         * removed that history. Do not resurrect it. SUPPRESSED is excluded:
+         * an event first received while its notification channel is blocked
+         * must remain visible in the in-app archive.
+         */
+        internal fun shouldRemoveUnexpectedInsert(
+            claim: EventDedupeStore.Claim,
+            result: HistoryStore.InsertResult,
+        ): Boolean = result == HistoryStore.InsertResult.INSERTED &&
+            claim in setOf(EventDedupeStore.Claim.SHOWN, EventDedupeStore.Claim.DISPLAY_COMMITTED)
     }
 }

@@ -8,7 +8,7 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action !in setOf(Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED)) return
         if (LogoutStateStore(context).isPending()) return
-        if (SecretStore(context).get(SecretStore.NTFY_TOKEN).isBlank()) return
+        if (!SecretStore(context).session().isPrivate) return
         try {
             context.startForegroundService(Intent(context, WatchService::class.java))
         } catch (_: Exception) {

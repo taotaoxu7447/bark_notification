@@ -1,8 +1,8 @@
 # Codex Watch Notifier
 
-This folder contains a Bark/ntfy notifier for local AI coding agents.
+This folder contains a Bark/AgentWatch notifier for local AI coding agents.
 
-Goal: when a local Codex, ZCode, Kimi Code, or Grok Build task completes, stops, needs attention, or aborts, send a push to the user's devices. Bark is recommended for iPhone and Apple Watch. Android uses the custom AgentWatch app over the project self-hosted ntfy WebSocket.
+Goal: when a local Codex, ZCode, Kimi Code, or Grok Build task completes, stops, needs attention, or aborts, send a push only to the user's own devices. Bark is optional for iPhone and Apple Watch. Android uses the custom AgentWatch app over an account-isolated self-hosted WebSocket.
 
 ## Platform Plan
 
@@ -22,11 +22,13 @@ For coworkers, publish three release artifacts and ask them to download the one 
 
 ## Files
 
+- `agentwatch.py`: cross-platform install/login/status/doctor/update/logout/uninstall CLI.
+- `agentwatch_core.py`: stable computer identity, OS credential storage, and strict private publish client.
 - `codex_watch_notifier.py`: Python monitor. Uses only the Python standard library.
 - `codex-watch-notifier.zsh`: wrapper that loads `~/.codex-watch-notifier/env`.
 - `install_launch_agent.zsh`: installs runtime copies into `~/.codex-watch-notifier/bin` and starts a user LaunchAgent.
 - `uninstall_launch_agent.zsh`: stops/removes the LaunchAgent.
-- `env.example`: template config. It includes the public self-hosted ntfy endpoint; copy it to `~/.codex-watch-notifier/env` and fill in a private Bark URL/key, ntfy publisher token, or webhook.
+- `env.example`: template config. It includes the public API endpoint; account passwords and computer tokens never belong in this file.
 - `android/`: custom Android receiver, persistent event dedupe/ACK outbox, source channels/icons, and release build script.
 - `deploy/agentwatch-registration/`: loopback registration/login/logout/test/ACK API plus Caddy and systemd examples.
 - Optional Bark icon/group: set `CODEX_BARK_ICON` and `CODEX_BARK_GROUP`. This repo includes `assets/codex-icon-large-v1.png`, available at `https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/codex-icon-large-v1.png`.
@@ -34,7 +36,7 @@ For coworkers, publish three release artifacts and ask them to download the one 
 - Kimi Code and Grok Build use `assets/kimi-icon-v1.png` and `assets/grok-icon-v1.png` as their default Bark icons. Override them with `KIMI_BARK_ICON` or `GROK_BARK_ICON`.
 - Kimi Code watches `~/.kimi-code/sessions/**/agents/main/wire.jsonl`. Its child agents are silent unless `KIMI_WATCH_NOTIFY_SUBAGENTS=1`.
 - Grok Build watches `~/.grok/sessions/**/events.jsonl`. Sessions with `parent_session_id` are silent unless `GROK_WATCH_NOTIFY_SUBAGENTS=1`.
-- ntfy settings: the self-hosted endpoint is `NTFY_URL=https://64.90.8.184:9444/agent-watch`. Optional per-tool overrides are `CODEX_NTFY_URL`, `ZCODE_NTFY_URL`, `KIMI_NTFY_URL`, and `GROK_NTFY_URL`. The endpoint/topic is public metadata, while `NTFY_TOKEN` remains private. The server defaults to deny-all and separates write-only publishers from read-only subscribers.
+- AgentWatch settings: `AGENTWATCH_API_BASE` is public metadata. `agentwatch login` uses a hidden password prompt once and stores only a per-computer token. `/publish` accepts no topic or user field. Legacy `NTFY_URL/NTFY_TOKEN` values are ignored to prevent duplicate shared-topic delivery.
 
 ## What It Monitors
 
@@ -81,14 +83,11 @@ There is no official structured complete-vs-attention-needed field in the observ
 Run these commands from this folder:
 
 ```bash
-mkdir -p ~/.codex-watch-notifier
-cp env.example ~/.codex-watch-notifier/env
-chmod 600 ~/.codex-watch-notifier/env
-$EDITOR ~/.codex-watch-notifier/env
 ./install_launch_agent.zsh
+~/.local/bin/agentwatch doctor
 ```
 
-If a previous `com.xutao.codex-watch-notifier` LaunchAgent exists, the installer will `bootout` it and install the current copy.
+If a previous `com.xutao.codex-watch-notifier` LaunchAgent exists, the installer stops it before prompting for the account and hidden password. Login success starts exactly one private watcher and sends no test notification.
 
 ## Ubuntu Install
 
@@ -97,10 +96,7 @@ Run these commands from the Ubuntu package folder:
 ```bash
 chmod +x install_systemd_user.sh uninstall_systemd_user.sh
 ./install_systemd_user.sh
-$EDITOR ~/.codex-watch-notifier/env
-./install_systemd_user.sh
-python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --doctor
-python3 ~/.codex-watch-notifier/bin/codex_watch_notifier.py --test
+~/.local/bin/agentwatch doctor
 ```
 
 If the service must run while the user is not logged in:
@@ -115,13 +111,12 @@ Run PowerShell from the Windows package folder:
 
 ```powershell
 .\install_task_scheduler.ps1
-notepad $env:USERPROFILE\.codex-watch-notifier\env
-.\install_task_scheduler.ps1
-py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --doctor
-py -3 $env:USERPROFILE\.codex-watch-notifier\bin\codex_watch_notifier.py --test
+& "$env:USERPROFILE\.local\bin\agentwatch.cmd" doctor
 ```
 
-The Windows package installs a scheduled task named `CodexWatchNotifier` that starts at logon.
+The Windows package installs a scheduled task named `CodexWatchNotifier`. It remains disabled until login and runs through a hidden PowerShell wrapper with stdout/stderr logs.
+
+For AI-driven setup, follow `AI_INSTALL.md`: run the platform installer with `--json --no-login`, pause for the user to run the hidden-prompt `agentwatch login`, then verify with `agentwatch doctor --json`.
 
 ## Test
 
@@ -134,7 +129,7 @@ Send one test notification through every configured channel:
 ./codex-watch-notifier.zsh --test-grok
 ```
 
-Expected: the configured Bark or ntfy client receives `Codex 测试提醒`. For Apple Watch, if the iPhone is locked and the Apple Watch is worn/unlocked, the watch should vibrate. For Android wearables, behavior depends on the phone's notification forwarding settings.
+Expected: the configured personal Bark client or logged-in AgentWatch account receives `Codex 测试提醒`. Install, update, and login never invoke these test commands automatically.
 
 Check service state:
 
@@ -157,16 +152,16 @@ tail -40 ~/.codex-watch-notifier/notifier.log
 Expected line:
 
 ```text
-watching /Users/<user>/.codex/sessions with channels=['bark', 'ntfy']
+watching /Users/<user>/.codex/sessions with channels=['bark', 'agentwatch']
 ```
 
 Run diagnostics:
 
 ```bash
-./codex-watch-notifier.zsh --doctor
+~/.local/bin/agentwatch doctor
 ```
 
-The doctor command checks the config file, Bark/ntfy setup, all supported tool log roots, state file, notifier log, LaunchAgent state on macOS, and current privacy settings.
+The unified doctor checks runtime files, account binding, the single background service, server health, and ignored legacy ntfy values. The watcher-level `--doctor` retains log-root and retry diagnostics.
 
 ## Verify Real Codex Completion
 
@@ -202,7 +197,9 @@ Keep these enabled only when the extra context is useful and acceptable for your
 
 Delivery retries are deliberately bounded. One event is sent at most twice, with a persisted delay before the second attempt. Bark receives the same stable `id` on both attempts so a retry updates or collapses the same notification where supported. Exhausted deliveries are recorded for `--doctor`; they are never retried in a loop.
 
-ntfy receives a stable `X-Sequence-ID`, protocol/source tags, and a public icon URL. AgentWatch persists the event key before notifying, uses timestamp-based WebSocket resume, and maintains a metadata-only ACK outbox. A server test carries a hashed target tag so only the initiating installation displays it. Do not remove these controls: preventing duplicate audible notifications is a product requirement.
+Successful channels are persisted per event and skipped during the second round. A local macOS banner cannot mask a failed AgentWatch/Bark delivery, while an already successful remote channel is not sent again.
+
+Private `/publish` receives a stable event ID, source, title, body, and optional priority only. The server derives user/topic from the Bearer computer token. AgentWatch persists the event before notifying, resumes its WebSocket safely, and maintains an ACK outbox. Do not remove these controls: preventing duplicate audible notifications is a product requirement.
 
 The long-running watcher and `--once`/`--replay-file` processing hold an OS-backed lock next to the state file. A second process exits without sending, so an installer restart or manual command cannot multiply the two-attempt allowance.
 
@@ -212,13 +209,13 @@ The long-running watcher and `--once`/`--replay-file` processing hold an OS-back
 ./uninstall_launch_agent.zsh
 ```
 
-This removes only the LaunchAgent plist. Config and logs remain in `~/.codex-watch-notifier`.
+This removes the background service and installed runtime. Account credentials, config, logs, and watcher state remain for an idempotent reinstall; `agentwatch logout` revokes the current computer token first.
 
 ## Important Notes
 
-- Do not print, commit, or share the Bark URL, Bark key, ntfy token, account password, or authentication database. The official self-hosted ntfy URL/topic is intentionally public.
+- Do not print, commit, or share the Bark URL, Bark key, computer token, account password, or authentication database. The self-hosted API base is intentionally public.
 - Do not remove first-run EOF baselining; otherwise the target Mac may receive many old Codex completion pushes.
 - Do not raise the hard two-attempt delivery cap or restore immediate retry loops; avoiding repeated phone alerts is a product requirement.
-- The current Android release is a trusted shared-broadcast design: every invited account can read the same `agent-watch` topic. Do not invite mutually untrusted users without first implementing per-user topics and ACLs.
+- Every account must have its own random topic and least-privilege ACL. A computer token is write-only for its bound account and must never specify topic/user in a publish request.
 - Keep `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` enabled unless you explicitly want old rewritten rollout history to be replayed.
 - If this Mac stores Codex rollout files somewhere other than `~/.codex/sessions`, find the actual `rollout-*.jsonl` location and set `--sessions-root` by adapting the LaunchAgent/wrapper.

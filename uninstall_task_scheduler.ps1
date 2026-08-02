@@ -1,8 +1,13 @@
 $ErrorActionPreference = "Stop"
 
-$Label = "CodexWatchNotifier"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Cli = Join-Path $ScriptDir "agentwatch.py"
+$Py = Get-Command py -ErrorAction SilentlyContinue
 
-Unregister-ScheduledTask -TaskName $Label -Confirm:$false -ErrorAction SilentlyContinue
-
-Write-Host "Stopped and removed scheduled task $Label"
-Write-Host "Config/logs under $env:USERPROFILE\.codex-watch-notifier were left in place."
+if ($Py) {
+    & $Py.Source -3 $Cli uninstall @args
+} else {
+    $Python = Get-Command python -ErrorAction Stop
+    & $Python.Source $Cli uninstall @args
+}
+exit $LASTEXITCODE

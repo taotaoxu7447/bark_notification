@@ -3,6 +3,7 @@ package io.github.taotaoxu7447.agentwatch
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -14,13 +15,19 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.Space
 import android.widget.TextView
@@ -30,13 +37,21 @@ import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
+    private enum class Page { MESSAGES, DEVICES, SETTINGS }
+
     private lateinit var secretStore: SecretStore
     private lateinit var statusStore: StatusStore
     private lateinit var registrationClient: RegistrationClient
     private lateinit var logoutStateStore: LogoutStateStore
+    private lateinit var historyStore: HistoryStore
+    private lateinit var historySettings: HistorySettings
 
     private lateinit var authPanel: LinearLayout
-    private lateinit var sessionPanel: LinearLayout
+    private lateinit var navigation: LinearLayout
+    private lateinit var pageContainer: LinearLayout
+    private lateinit var messagesPage: LinearLayout
+    private lateinit var devicesPage: LinearLayout
+    private lateinit var settingsPage: LinearLayout
     private lateinit var usernameInput: EditText
     private lateinit var passwordInput: EditText
     private lateinit var inviteInput: EditText
@@ -49,12 +64,28 @@ class MainActivity : Activity() {
     private lateinit var lastDeliveryText: TextView
     private lateinit var testButton: Button
     private lateinit var logoutButton: Button
+    private lateinit var searchInput: EditText
+    private lateinit var categoryRow: LinearLayout
+    private lateinit var messageList: LinearLayout
+    private lateinit var computerList: LinearLayout
+    private lateinit var historySizeText: TextView
+    private val navButtons = mutableMapOf<Page, Button>()
+    private var selectedPage = Page.MESSAGES
+    private var selectedSource: NtfyMessage.Source? = null
     private var receiverRegistered = false
     private var startAfterPermission = false
     private var logoutRequestInFlight = false
+    private var upgradeInFlight = false
+    private var computersInFlight = false
+    private var pendingEventId = ""
 
-    private val statusReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) = refreshStatus()
+    private val appReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                AppConfig.HISTORY_ACTION -> refreshMessages()
+                else -> refreshStatus()
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -63,23 +94,36 @@ class MainActivity : Activity() {
         statusStore = StatusStore(this)
         registrationClient = RegistrationClient(this)
         logoutStateStore = LogoutStateStore(this)
+        historyStore = HistoryStore(this)
+        historySettings = HistorySettings(this)
+        historyStore.cleanupAll(historySettings.retentionDays())
         NotificationRenderer(this).createChannels()
+        pendingEventId = intent.getStringExtra(EXTRA_EVENT_ID).orEmpty()
         setContentView(buildContent())
         refreshSession()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingEventId = intent.getStringExtra(EXTRA_EVENT_ID).orEmpty()
+        if (pendingEventId.isNotBlank()) showPage(Page.MESSAGES)
+        showPendingDetail()
     }
 
     @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onStart() {
         super.onStart()
         if (!receiverRegistered) {
-            val filter = IntentFilter(AppConfig.STATUS_ACTION)
+            val filter = IntentFilter().apply {
+                addAction(AppConfig.STATUS_ACTION)
+                addAction(AppConfig.HISTORY_ACTION)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(statusReceiver, filter, RECEIVER_NOT_EXPORTED)
+                registerReceiver(appReceiver, filter, RECEIVER_NOT_EXPORTED)
             } else {
                 @Suppress("DEPRECATION")
-                // The exported-state overload was introduced in API 33. This
-                // legacy branch only runs on older releases.
-                registerReceiver(statusReceiver, filter)
+                registerReceiver(appReceiver, filter)
             }
             receiverRegistered = true
         }
@@ -92,21 +136,32 @@ class MainActivity : Activity() {
             resumePendingLogout(userInitiated = false)
             return
         }
+        val session = secretStore.session()
+        if (SecretStore.legacyUpgradeRequired(session, DeviceIdentity.username(this))) {
+            upgradeLegacySession()
+            return
+        }
         if (
-            isConfigured() &&
+            session.isPrivate &&
             statusStore.snapshot().state != StatusStore.STATE_AUTH_FAILED &&
             notificationsAllowed()
         ) {
             startReceiverService()
         }
+        showPendingDetail()
     }
 
     override fun onStop() {
         if (receiverRegistered) {
-            unregisterReceiver(statusReceiver)
+            unregisterReceiver(appReceiver)
             receiverRegistered = false
         }
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        historyStore.close()
+        super.onDestroy()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -125,96 +180,193 @@ class MainActivity : Activity() {
     private fun buildContent(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(24), dp(22), dp(36))
+            setPadding(dp(20), dp(24), dp(20), dp(36))
             setBackgroundColor(Color.rgb(245, 247, 251))
         }
-
         root.addView(text("AgentWatch", 31f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) })
-        root.addView(text("任务完成，手机和手表立即提醒", 16f).apply {
+        root.addView(text("你的 AI 任务，送达到你的设备", 16f).apply {
             setTextColor(Color.rgb(77, 91, 124))
-            setPadding(0, dp(4), 0, dp(22))
+            setPadding(0, dp(4), 0, dp(18))
         })
-
-        val statusCard = card().apply {
-            addView(text("实时连接", 14f, bold = true).apply { setTextColor(Color.rgb(77, 91, 124)) })
-            statusText = text("未启动", 23f, bold = true).apply {
-                setTextColor(Color.rgb(20, 33, 61))
-                setPadding(0, dp(6), 0, 0)
-            }
-            addView(statusText)
-            statusDetailText = text("登录后会自动连接", 14f).apply {
-                setTextColor(Color.rgb(77, 91, 124))
-                setPadding(0, dp(5), 0, 0)
-            }
-            addView(statusDetailText)
-            lastDeliveryText = text("尚未收到送达回执", 13f).apply {
-                setTextColor(Color.rgb(103, 116, 143))
-                setPadding(0, dp(12), 0, 0)
-            }
-            addView(lastDeliveryText)
-        }
-        root.addView(statusCard)
-        root.addView(space(16))
-
-        authPanel = card().apply {
-            addView(sectionTitle("注册一次，后续自动连接"))
-            addView(helpText("服务器地址已经内置。新用户输入邀请代码、账号和密码即可；已有账号直接登录。"))
-            usernameInput = input("账号（3–32 位，首尾为字母或数字）")
-            addView(usernameInput)
-            passwordInput = input("密码（至少 12 位）").apply {
-                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            }
-            addView(passwordInput)
-            inviteInput = input("新用户邀请代码")
-            addView(inviteInput)
-            deviceNameInput = input("设备名称").apply { setText(DeviceIdentity.defaultName()) }
-            addView(deviceNameInput)
-            registerButton = primaryButton("注册并连接") { authenticate(register = true) }
-            addView(registerButton)
-            loginButton = secondaryButton("已有账号登录") { authenticate(register = false) }
-            addView(loginButton)
-        }
+        root.addView(buildStatusCard())
+        root.addView(space(14))
+        authPanel = buildAuthPanel()
         root.addView(authPanel)
-
-        sessionPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-
-            addView(card().apply {
-                addView(sectionTitle("当前设备"))
-                accountText = text("", 16f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) }
-                addView(accountText)
-                addView(helpText("${BuildConfig.SERVER_BASE_URL} · ${BuildConfig.NTFY_TOPIC}\n凭据仅加密保存在本机，不会显示在界面或日志中。"))
-                addView(primaryButton("重新连接") {
-                    startReceiverService(forceReconnect = true)
-                    toast("正在重新连接")
-                })
-                testButton = secondaryButton("发送一条端到端测试") { sendEndToEndTest() }
-                addView(testButton)
-                logoutButton = secondaryButton("退出并撤销此设备") { logout() }
-                addView(logoutButton)
-            })
-            addView(space(16))
-            addView(card().apply {
-                addView(sectionTitle("后台送达设置"))
-                addView(helpText("首次使用请允许通知、自启动，并把电池管理设为“完全允许后台行为”。这些系统选项必须由你亲自确认。"))
-                addView(primaryButton("打开通知设置") { BackgroundSettings.openNotificationSettings(this@MainActivity) })
-                addView(secondaryButton("打开自启动设置") { BackgroundSettings.openAutoStartSettings(this@MainActivity) })
-                addView(secondaryButton("打开电池设置") { BackgroundSettings.openBatterySettings(this@MainActivity) })
-            })
-            addView(space(16))
-            addView(card().apply {
-                addView(sectionTitle("提醒范围"))
-                addView(helpText("只显示 Codex、ZCode、Kimi Code、Grok Build 的主任务完成、异常或需要处理提醒。没有消息列表，也不会回放首次安装前的缓存。"))
-                addView(helpText("版本 ${BuildConfig.VERSION_NAME} · WebSocket only"))
-            })
-        }
-        root.addView(sessionPanel)
-
+        navigation = buildNavigation()
+        root.addView(navigation)
+        root.addView(space(12))
+        pageContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        messagesPage = buildMessagesPage()
+        devicesPage = buildDevicesPage()
+        settingsPage = buildSettingsPage()
+        pageContainer.addView(messagesPage)
+        pageContainer.addView(devicesPage)
+        pageContainer.addView(settingsPage)
+        root.addView(pageContainer)
+        showPage(Page.MESSAGES)
         return ScrollView(this).apply {
             isFillViewport = true
             addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
+    }
+
+    private fun buildStatusCard(): LinearLayout = card().apply {
+        addView(text("实时连接", 14f, bold = true).apply { setTextColor(Color.rgb(77, 91, 124)) })
+        statusText = text("未启动", 23f, bold = true).apply {
+            setTextColor(Color.rgb(20, 33, 61))
+            setPadding(0, dp(6), 0, 0)
+        }
+        addView(statusText)
+        statusDetailText = helpText("登录后会自动连接").apply { setPadding(0, dp(5), 0, 0) }
+        addView(statusDetailText)
+        lastDeliveryText = text("尚未收到送达回执", 13f).apply {
+            setTextColor(Color.rgb(103, 116, 143))
+            setPadding(0, dp(8), 0, 0)
+        }
+        addView(lastDeliveryText)
+    }
+
+    private fun buildAuthPanel(): LinearLayout = card().apply {
+        addView(sectionTitle("注册或登录"))
+        addView(helpText("每个账号都有独立通知通道。新用户需要邀请代码；已有账号直接登录。"))
+        usernameInput = input("账号（3–32 位）")
+        addView(usernameInput)
+        passwordInput = input("密码（至少 12 位）").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        addView(passwordInput)
+        inviteInput = input("新用户邀请代码")
+        addView(inviteInput)
+        deviceNameInput = input("手机或平板名称").apply { setText(DeviceIdentity.defaultName()) }
+        addView(deviceNameInput)
+        registerButton = primaryButton("注册并连接") { authenticate(register = true) }
+        addView(registerButton)
+        loginButton = secondaryButton("已有账号登录") { authenticate(register = false) }
+        addView(loginButton)
+    }
+
+    private fun buildNavigation(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        visibility = View.GONE
+        Page.entries.forEach { page ->
+            val label = when (page) {
+                Page.MESSAGES -> "消息"
+                Page.DEVICES -> "设备"
+                Page.SETTINGS -> "设置"
+            }
+            val nav = Button(this@MainActivity).apply {
+                text = label
+                isAllCaps = false
+                textSize = 15f
+                setTypeface(typeface, Typeface.BOLD)
+                setOnClickListener { showPage(page) }
+                layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                    marginStart = dp(3)
+                    marginEnd = dp(3)
+                }
+            }
+            navButtons[page] = nav
+            addView(nav)
+        }
+    }
+
+    private fun buildMessagesPage(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(card().apply {
+            addView(sectionTitle("本机历史消息"))
+            addView(helpText("正文只保存在此 App 的私有数据库中；服务器仅短期缓存以便断线补发。"))
+            searchInput = input("搜索标题、正文或电脑名称")
+            searchInput.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = refreshMessages()
+                override fun afterTextChanged(s: Editable?) = Unit
+            })
+            addView(searchInput)
+            categoryRow = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
+            addView(HorizontalScrollView(this@MainActivity).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(categoryRow)
+            })
+            addView(space(8))
+            addView(secondaryButton("清空当前分类") { confirmClearCurrentCategory() })
+        })
+        addView(space(12))
+        messageList = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+        addView(messageList)
+    }
+
+    private fun buildDevicesPage(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(card().apply {
+            addView(sectionTitle("当前移动设备"))
+            accountText = text("", 16f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) }
+            addView(accountText)
+            addView(helpText("此设备通过账号的私有 WebSocket 通道接收；其他账号没有读取权限。"))
+            addView(primaryButton("重新连接") {
+                startReceiverService(forceReconnect = true)
+                toast("正在重新连接")
+            })
+            testButton = secondaryButton("发送一条端到端测试") { sendEndToEndTest() }
+            addView(testButton)
+        })
+        addView(space(12))
+        addView(card().apply {
+            addView(sectionTitle("已登录电脑"))
+            addView(helpText("电脑使用账号密码登录后会显示在这里。撤销后，该电脑将立即失去发送权限。"))
+            addView(secondaryButton("刷新电脑列表") { loadComputers() })
+            computerList = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            addView(computerList)
+        })
+    }
+
+    private fun buildSettingsPage(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(card().apply {
+            addView(sectionTitle("历史保留"))
+            addView(helpText("默认保留 7 天。无论选择多久，每个账号最多保留最近 500 条，避免无限占用手机空间。"))
+            val radioGroup = RadioGroup(this@MainActivity).apply { orientation = RadioGroup.VERTICAL }
+            listOf(
+                1 to "1 天",
+                7 to "7 天（默认）",
+                30 to "30 天",
+                HistorySettings.PERMANENT to "永久（仍最多 500 条）",
+            ).forEach { (days, label) ->
+                radioGroup.addView(RadioButton(this@MainActivity).apply {
+                    id = View.generateViewId()
+                    tag = days
+                    text = label
+                    textSize = 15f
+                    isChecked = historySettings.retentionDays() == days
+                })
+            }
+            radioGroup.setOnCheckedChangeListener { group, checkedId ->
+                val days = group.findViewById<RadioButton>(checkedId)?.tag as? Int ?: return@setOnCheckedChangeListener
+                historySettings.setRetentionDays(days)
+                currentAccount().takeIf { it.isNotBlank() }?.let { historyStore.cleanup(it, days) }
+                refreshMessages()
+                refreshHistorySize()
+            }
+            addView(radioGroup)
+            historySizeText = helpText("")
+            addView(historySizeText)
+            addView(secondaryButton("清空全部历史") { confirmClearAllHistory() })
+        })
+        addView(space(12))
+        addView(card().apply {
+            addView(sectionTitle("后台送达设置"))
+            addView(helpText("请允许通知、自启动，并把电池管理设为完全允许后台行为。系统选项需要你亲自确认。"))
+            addView(primaryButton("打开通知设置") { BackgroundSettings.openNotificationSettings(this@MainActivity) })
+            addView(secondaryButton("打开自启动设置") { BackgroundSettings.openAutoStartSettings(this@MainActivity) })
+            addView(secondaryButton("打开电池设置") { BackgroundSettings.openBatterySettings(this@MainActivity) })
+        })
+        addView(space(12))
+        addView(card().apply {
+            addView(sectionTitle("账号"))
+            addView(helpText("登录凭据使用 Android Keystore 加密；历史正文不额外加密，但仅位于 App 私有目录且禁止备份。"))
+            logoutButton = secondaryButton("退出并撤销此设备") { askLogoutHistoryChoice() }
+            addView(logoutButton)
+            addView(helpText("版本 ${BuildConfig.VERSION_NAME} · 私有 WebSocket 通道"))
+        })
     }
 
     private fun authenticate(register: Boolean) {
@@ -248,23 +400,225 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun upgradeLegacySession() {
+        if (upgradeInFlight) return
+        val appToken = secretStore.get(SecretStore.APP_TOKEN)
+        if (appToken.isBlank()) return
+        upgradeInFlight = true
+        statusStore.update(StatusStore.STATE_CONNECTING, "正在把旧会话升级到账号私有通道")
+        refreshStatus()
+        registrationClient.upgradeSession(appToken) { result ->
+            runOnUiThread {
+                upgradeInFlight = false
+                result.onSuccess {
+                    saveSession(it)
+                    toast("已升级到账号私有通知通道")
+                }.onFailure { error ->
+                    statusStore.update(StatusStore.STATE_AUTH_FAILED, "旧会话升级失败，请使用账号密码重新登录")
+                    refreshSession()
+                    toast(error.message ?: "会话升级失败")
+                }
+            }
+        }
+    }
+
     private fun saveSession(session: RegistrationClient.AuthSession) {
-        val changedAccount = DeviceIdentity.username(this) != session.username ||
-            secretStore.get(SecretStore.NTFY_TOKEN) != session.ntfyToken
-        if (changedAccount) {
+        val previous = secretStore.session()
+        val changedChannel = previous.username != session.username || previous.ntfyTopic != session.ntfyTopic
+        if (changedChannel) {
             CursorStore(this).reset()
             EventDedupeStore(this).clear()
             AckOutbox(this).clear()
         }
-        secretStore.put(SecretStore.NTFY_TOKEN, session.ntfyToken)
-        secretStore.put(SecretStore.APP_TOKEN, session.appToken)
+        secretStore.saveSession(session.toSecretSession())
         DeviceIdentity.setUsername(this, session.username)
         logoutStateStore.clear()
         passwordInput.text.clear()
         inviteInput.text.clear()
+        statusStore.update(StatusStore.STATE_CONNECTING, "正在连接账号私有通道")
         refreshSession()
-        toast("登录成功，正在建立实时连接")
         ensurePermissionAndStart()
+    }
+
+    private fun showPage(page: Page) {
+        selectedPage = page
+        messagesPage.visibility = if (page == Page.MESSAGES) View.VISIBLE else View.GONE
+        devicesPage.visibility = if (page == Page.DEVICES) View.VISIBLE else View.GONE
+        settingsPage.visibility = if (page == Page.SETTINGS) View.VISIBLE else View.GONE
+        navButtons.forEach { (candidate, button) -> styleTab(button, candidate == page) }
+        when (page) {
+            Page.MESSAGES -> refreshMessages()
+            Page.DEVICES -> loadComputers()
+            Page.SETTINGS -> refreshHistorySize()
+        }
+    }
+
+    private fun refreshMessages() {
+        if (!::messageList.isInitialized || !secretStore.session().isPrivate) return
+        rebuildCategoryRow()
+        val account = currentAccount()
+        historyStore.cleanup(account, historySettings.retentionDays())
+        val entries = historyStore.entries(account, selectedSource, searchInput.text.toString())
+        messageList.removeAllViews()
+        if (entries.isEmpty()) {
+            messageList.addView(card().apply { addView(helpText("当前分类还没有历史消息。")) })
+        } else {
+            entries.forEach { entry ->
+                messageList.addView(historyRow(entry))
+                messageList.addView(space(8))
+            }
+        }
+        refreshHistorySize()
+        showPendingDetail()
+    }
+
+    private fun rebuildCategoryRow() {
+        categoryRow.removeAllViews()
+        val categories = listOf<Pair<NtfyMessage.Source?, String>>(null to "全部") +
+            NtfyMessage.Source.entries.map { source ->
+                source to if (source == NtfyMessage.Source.OTHER) "其他" else source.displayName
+            }
+        categories.forEach { (source, label) ->
+            val selected = source == selectedSource
+            categoryRow.addView(Button(this).apply {
+                text = label
+                isAllCaps = false
+                textSize = 13f
+                setTextColor(if (selected) Color.WHITE else Color.rgb(49, 92, 245))
+                background = pillBackground(selected)
+                setOnClickListener {
+                    selectedSource = source
+                    refreshMessages()
+                }
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42)).apply {
+                    marginEnd = dp(7)
+                }
+            })
+        }
+    }
+
+    private fun historyRow(entry: HistoryStore.Entry): LinearLayout = card().apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.TOP
+        setOnClickListener { showHistoryDetail(entry) }
+        addView(ImageView(this@MainActivity).apply {
+            setImageResource(sourceImage(entry.source))
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(12) }
+        })
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addView(text(entry.title, 16f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) })
+            val origin = entry.computerName.ifBlank { "未知电脑" }
+            addView(text("${entry.source.displayName} · $origin · ${formatTime(entry.receivedAt)}", 12f).apply {
+                setTextColor(Color.rgb(103, 116, 143))
+                setPadding(0, dp(3), 0, dp(5))
+            })
+            addView(text(entry.body.lineSequence().firstOrNull().orEmpty().take(180), 14f).apply {
+                setTextColor(Color.rgb(77, 91, 124))
+                maxLines = 3
+            })
+        })
+    }
+
+    private fun showHistoryDetail(entry: HistoryStore.Entry) {
+        val origin = entry.computerName.ifBlank { "未知电脑" }
+        AlertDialog.Builder(this)
+            .setTitle(entry.title)
+            .setMessage("${entry.source.displayName} · $origin\n${formatTime(entry.receivedAt)}\n\n${entry.body}")
+            .setPositiveButton("关闭", null)
+            .setNegativeButton("删除") { _, _ ->
+                historyStore.deleteOne(entry.account, entry.eventId)
+                refreshMessages()
+            }
+            .show()
+    }
+
+    private fun showPendingDetail() {
+        if (pendingEventId.isBlank() || !secretStore.session().isPrivate || !::messageList.isInitialized) return
+        val entry = historyStore.find(currentAccount(), pendingEventId) ?: return
+        pendingEventId = ""
+        intent.removeExtra(EXTRA_EVENT_ID)
+        showHistoryDetail(entry)
+    }
+
+    private fun confirmClearCurrentCategory() {
+        val label = selectedSource?.displayName ?: "全部"
+        AlertDialog.Builder(this)
+            .setTitle("清空${label}历史？")
+            .setMessage("此操作只删除当前账号在本机保存的消息，无法恢复。")
+            .setPositiveButton("清空") { _, _ ->
+                historyStore.deleteSource(currentAccount(), selectedSource)
+                refreshMessages()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun confirmClearAllHistory() {
+        AlertDialog.Builder(this)
+            .setTitle("清空全部历史？")
+            .setMessage("将删除当前账号在本机保存的所有消息。")
+            .setPositiveButton("清空") { _, _ ->
+                historyStore.deleteSource(currentAccount(), null)
+                refreshMessages()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun loadComputers() {
+        if (!::computerList.isInitialized || computersInFlight || selectedPage != Page.DEVICES) return
+        val token = secretStore.session().appToken
+        if (token.isBlank()) return
+        computersInFlight = true
+        computerList.removeAllViews()
+        computerList.addView(helpText("正在读取电脑列表…"))
+        registrationClient.listComputers(token) { result ->
+            runOnUiThread {
+                computersInFlight = false
+                computerList.removeAllViews()
+                result.onSuccess { computers ->
+                    if (computers.isEmpty()) {
+                        computerList.addView(helpText("尚无电脑登录。电脑安装完成后使用账号密码登录即可。"))
+                    } else {
+                        computers.forEach { computer -> computerList.addView(computerRow(computer)) }
+                    }
+                }.onFailure { error ->
+                    computerList.addView(helpText(error.message ?: "无法读取电脑列表"))
+                }
+            }
+        }
+    }
+
+    private fun computerRow(computer: RegistrationClient.Computer): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(10), 0, dp(5))
+        addView(text(computer.name, 16f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) })
+        val seen = computer.lastSeenAt.takeIf { it > 0 }?.times(1000L)?.let(::formatTime) ?: "尚未发送"
+        addView(helpText("${computer.platform} · 最近活动 $seen"))
+        addView(secondaryButton("撤销这台电脑") { confirmRevokeComputer(computer) })
+    }
+
+    private fun confirmRevokeComputer(computer: RegistrationClient.Computer) {
+        AlertDialog.Builder(this)
+            .setTitle("撤销 ${computer.name}？")
+            .setMessage("撤销后，这台电脑将不能再向你的设备发送消息，需要重新使用账号密码登录。")
+            .setPositiveButton("撤销") { _, _ -> revokeComputer(computer) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun revokeComputer(computer: RegistrationClient.Computer) {
+        registrationClient.revokeComputer(secretStore.session().appToken, computer.id) { result ->
+            runOnUiThread {
+                result.onSuccess {
+                    toast("已撤销 ${computer.name}")
+                    loadComputers()
+                }.onFailure { error -> toast(error.message ?: "撤销失败") }
+            }
+        }
     }
 
     private fun ensurePermissionAndStart() {
@@ -274,7 +628,7 @@ class MainActivity : Activity() {
         }
         if (runtimeNotificationPermissionGranted()) {
             statusStore.update(StatusStore.STATE_PERMISSION_REQUIRED, "系统通知总开关已关闭")
-            toast("请先点击“打开通知设置”并开启 AgentWatch 通知")
+            toast("请在设置中开启 AgentWatch 通知")
             refreshStatus()
             return
         }
@@ -285,15 +639,15 @@ class MainActivity : Activity() {
     }
 
     private fun startReceiverService(forceReconnect: Boolean = false) {
-        if (!isConfigured()) return
+        if (!secretStore.session().isPrivate) return
         if (!notificationsAllowed()) {
             ensurePermissionAndStart()
             return
         }
-        val intent = Intent(this, WatchService::class.java)
-        if (forceReconnect) intent.action = AppConfig.ACTION_RECONNECT
+        val serviceIntent = Intent(this, WatchService::class.java)
+        if (forceReconnect) serviceIntent.action = AppConfig.ACTION_RECONNECT
         try {
-            startForegroundService(intent)
+            startForegroundService(serviceIntent)
         } catch (_: Exception) {
             statusStore.update(StatusStore.STATE_ERROR, "系统阻止了后台服务，请检查自启动和电池设置")
         }
@@ -301,10 +655,10 @@ class MainActivity : Activity() {
 
     private fun sendEndToEndTest() {
         if (statusStore.snapshot().state != StatusStore.STATE_CONNECTED) {
-            toast("请等待首页显示“已连接”后再测试")
+            toast("请等待显示“已连接”后再测试")
             return
         }
-        val token = secretStore.get(SecretStore.APP_TOKEN)
+        val token = secretStore.session().appToken
         if (token.isBlank()) {
             toast("请重新登录")
             return
@@ -313,21 +667,30 @@ class MainActivity : Activity() {
         registrationClient.sendTest(token) { result ->
             runOnUiThread {
                 testButton.isEnabled = true
-                result.onSuccess {
-                    toast("测试已发出，等待 WebSocket 通知")
-                }.onFailure { error -> toast(error.message ?: "测试发送失败") }
+                result.onSuccess { toast("测试已发出，等待一条 WebSocket 通知") }
+                    .onFailure { error -> toast(error.message ?: "测试发送失败") }
             }
         }
     }
 
-    private fun logout() {
-        val appToken = secretStore.get(SecretStore.APP_TOKEN)
+    private fun askLogoutHistoryChoice() {
+        AlertDialog.Builder(this)
+            .setTitle("退出登录")
+            .setMessage("退出会撤销这台移动设备的服务器凭据。请选择如何处理本机历史。")
+            .setPositiveButton("保留历史") { _, _ -> logout(deleteHistory = false) }
+            .setNegativeButton("同时删除历史") { _, _ -> logout(deleteHistory = true) }
+            .setNeutralButton("取消", null)
+            .show()
+    }
+
+    private fun logout(deleteHistory: Boolean) {
+        val appToken = secretStore.session().appToken
         if (appToken.isBlank()) {
-            clearLocalSession()
+            clearLocalSession(deleteHistory)
             return
         }
         try {
-            logoutStateStore.markPending()
+            logoutStateStore.markPending(deleteHistory)
         } catch (_: IllegalStateException) {
             toast("无法保存退出状态，请释放存储空间后重试")
             return
@@ -341,18 +704,18 @@ class MainActivity : Activity() {
         if (logoutRequestInFlight) return
         val appToken = secretStore.get(SecretStore.APP_TOKEN)
         if (appToken.isBlank()) {
-            clearLocalSession()
+            clearLocalSession(logoutStateStore.deleteHistory())
             if (userInitiated) toast("已退出登录")
             return
         }
         logoutRequestInFlight = true
-        logoutButton.isEnabled = false
+        if (::logoutButton.isInitialized) logoutButton.isEnabled = false
         registrationClient.logout(appToken) { result ->
             runOnUiThread {
                 logoutRequestInFlight = false
-                logoutButton.isEnabled = true
+                if (::logoutButton.isInitialized) logoutButton.isEnabled = true
                 result.onSuccess {
-                    clearLocalSession()
+                    clearLocalSession(logoutStateStore.deleteHistory())
                     toast("此设备的服务器凭据已撤销")
                 }.onFailure { error ->
                     statusStore.update(StatusStore.STATE_ERROR, "服务器尚未确认退出；再次打开应用会自动重试")
@@ -362,8 +725,10 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun clearLocalSession() {
+    private fun clearLocalSession(deleteHistory: Boolean) {
+        val account = currentAccount()
         stopService(Intent(this, WatchService::class.java))
+        if (deleteHistory && account.isNotBlank()) historyStore.deleteSource(account, null)
         secretStore.clearSession()
         DeviceIdentity.clearUsername(this)
         CursorStore(this).reset()
@@ -375,21 +740,22 @@ class MainActivity : Activity() {
     }
 
     private fun refreshSession() {
-        val configured = isConfigured()
+        if (!::authPanel.isInitialized) return
+        val session = secretStore.session()
         val authenticationFailed = statusStore.snapshot().state == StatusStore.STATE_AUTH_FAILED
-        authPanel.visibility = if (configured && !authenticationFailed) View.GONE else View.VISIBLE
-        sessionPanel.visibility = if (configured) View.VISIBLE else View.GONE
-        if (configured) {
-            accountText.text = getString(
-                R.string.account_and_device,
-                DeviceIdentity.username(this),
-                DeviceIdentity.defaultName(),
-            )
+        authPanel.visibility = if (session.isPrivate && !authenticationFailed) View.GONE else View.VISIBLE
+        navigation.visibility = if (session.isPrivate) View.VISIBLE else View.GONE
+        pageContainer.visibility = if (session.isPrivate) View.VISIBLE else View.GONE
+        if (session.isPrivate) {
+            accountText.text = getString(R.string.account_and_device, session.username, DeviceIdentity.defaultName())
+            refreshMessages()
+            if (selectedPage == Page.DEVICES) loadComputers()
         }
         refreshStatus()
     }
 
     private fun refreshStatus() {
+        if (!::statusText.isInitialized) return
         val snapshot = statusStore.snapshot()
         statusText.text = when (snapshot.state) {
             StatusStore.STATE_CONNECTED -> "已连接"
@@ -408,7 +774,7 @@ class MainActivity : Activity() {
             },
         )
         statusDetailText.text = snapshot.detail.ifBlank {
-            if (isConfigured()) "等待接收服务状态" else "登录后会自动连接"
+            if (secretStore.session().isPrivate) "等待接收服务状态" else "登录后会自动连接"
         }
         lastDeliveryText.text = when {
             snapshot.lastAcknowledgedAt > 0L -> "服务器已收到送达回执：${formatTime(snapshot.lastAcknowledgedAt)}"
@@ -417,8 +783,13 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun isConfigured(): Boolean =
-        secretStore.get(SecretStore.NTFY_TOKEN).isNotBlank() && DeviceIdentity.username(this).isNotBlank()
+    private fun refreshHistorySize() {
+        if (!::historySizeText.isInitialized) return
+        val bytes = historyStore.databaseSizeBytes()
+        historySizeText.text = "本机历史数据库占用：${formatBytes(bytes)}"
+    }
+
+    private fun currentAccount(): String = secretStore.session().username.ifBlank { DeviceIdentity.username(this) }
 
     private fun runtimeNotificationPermissionGranted(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -431,6 +802,24 @@ class MainActivity : Activity() {
     private fun setAuthButtonsEnabled(enabled: Boolean) {
         registerButton.isEnabled = enabled
         loginButton.isEnabled = enabled
+    }
+
+    private fun styleTab(button: Button, selected: Boolean) {
+        button.setTextColor(if (selected) Color.WHITE else Color.rgb(49, 92, 245))
+        button.background = pillBackground(selected)
+    }
+
+    private fun pillBackground(selected: Boolean): GradientDrawable = GradientDrawable().apply {
+        setColor(if (selected) Color.rgb(49, 92, 245) else Color.rgb(237, 241, 255))
+        cornerRadius = dp(12).toFloat()
+    }
+
+    private fun sourceImage(source: NtfyMessage.Source): Int = when (source) {
+        NtfyMessage.Source.CODEX -> R.drawable.source_codex
+        NtfyMessage.Source.ZCODE -> R.drawable.source_zcode
+        NtfyMessage.Source.KIMI -> R.drawable.source_kimi
+        NtfyMessage.Source.GROK -> R.drawable.source_grok
+        NtfyMessage.Source.OTHER -> R.drawable.ic_notify_other
     }
 
     private fun card(): LinearLayout = LinearLayout(this).apply {
@@ -453,7 +842,7 @@ class MainActivity : Activity() {
     private fun helpText(value: String): TextView = text(value, 14f).apply {
         setTextColor(Color.rgb(77, 91, 124))
         setLineSpacing(0f, 1.15f)
-        setPadding(0, 0, 0, dp(12))
+        setPadding(0, 0, 0, dp(10))
     }
 
     private fun input(hintValue: String): EditText = EditText(this).apply {
@@ -481,14 +870,9 @@ class MainActivity : Activity() {
         gravity = Gravity.CENTER
         setTypeface(typeface, Typeface.BOLD)
         setTextColor(if (primary) Color.WHITE else Color.rgb(49, 92, 245))
-        background = GradientDrawable().apply {
-            setColor(if (primary) Color.rgb(49, 92, 245) else Color.rgb(237, 241, 255))
-            cornerRadius = dp(12).toFloat()
-        }
+        background = pillBackground(primary)
         setOnClickListener { action() }
-        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)).apply {
-            topMargin = dp(6)
-        }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)).apply { topMargin = dp(6) }
     }
 
     private fun text(value: String, size: Float, bold: Boolean = false): TextView = TextView(this).apply {
@@ -504,10 +888,17 @@ class MainActivity : Activity() {
     private fun formatTime(epochMillis: Long): String =
         SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date(epochMillis))
 
+    private fun formatBytes(bytes: Long): String = when {
+        bytes < 1024 -> "$bytes B"
+        bytes < 1024 * 1024 -> String.format(Locale.getDefault(), "%.1f KB", bytes / 1024.0)
+        else -> String.format(Locale.getDefault(), "%.1f MB", bytes / (1024.0 * 1024.0))
+    }
+
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
 
     companion object {
+        const val EXTRA_EVENT_ID = "event_id"
         private const val REQUEST_NOTIFICATIONS = 2001
     }
 }

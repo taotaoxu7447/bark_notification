@@ -241,7 +241,7 @@ class DeliveryRetryTests(unittest.TestCase):
         self.assertEqual(["A", "A"], delivery.calls)
         self.assertEqual("exhausted", exhausted["status"])
         self.assertEqual(2, exhausted["attempts"])
-        self.assertEqual("all_channels_failed", exhausted["last_result"])
+        self.assertEqual("incomplete_channels", exhausted["last_result"])
         self.assertIsNone(exhausted["next_retry_at"])
         self.assertEqual(path.stat().st_size, state["files"][str(path)]["offset"])
 

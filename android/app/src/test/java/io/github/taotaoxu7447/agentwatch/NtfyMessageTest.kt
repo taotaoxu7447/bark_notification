@@ -2,8 +2,10 @@ package io.github.taotaoxu7447.agentwatch
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
 
 class NtfyMessageTest {
     @Test
@@ -45,5 +47,88 @@ class NtfyMessageTest {
         assertTrue(message.isForDevice("device-a"))
         assertTrue(message.copy(tags = message.tags + "target_device-a").isForDevice("device-a"))
         assertFalse(message.copy(tags = message.tags + "target_device-b").isForDevice("device-a"))
+    }
+
+    @Test
+    fun v2EnvelopeCarriesComputerAndBodyIntoLocalHistory() {
+        val envelope = JSONObject()
+            .put("schema", "agentwatch_event_v2")
+            .put("event_id", "aw2-event")
+            .put("source", "KIMI")
+            .put("title", "Kimi 已完成")
+            .put("body", "完整正文")
+            .put("computer_id", "mac-1")
+            .put("computer_name", "工作 Mac")
+            .put("sent_at", 1_785_600_000L)
+        val wire = JSONObject()
+            .put("id", "ntfy-id")
+            .put("sequence_id", "aw2-event")
+            .put("event", "message")
+            .put("topic", "aw-0123456789abcdef0123456789abcdef")
+            .put("time", 1_785_600_001L)
+            .put("title", "wire title")
+            .put("message", envelope.toString())
+            .put("tags", org.json.JSONArray(listOf("agentwatch_v2", "source_kimi")))
+        val parsed = requireNotNull(NtfyMessage.parse(wire.toString()))
+        assertEquals("aw2-event", parsed.eventKey)
+        assertEquals("完整正文", parsed.message)
+        assertEquals("工作 Mac", parsed.computerName)
+        assertEquals(NtfyMessage.Source.KIMI, parsed.source)
+    }
+
+    @Test
+    fun jsonLookingV1BodyIsNotTrustedWithoutMatchingV2Metadata() {
+        val wire = JSONObject()
+            .put("id", "old")
+            .put("sequence_id", "old")
+            .put("event", "message")
+            .put("topic", "legacy")
+            .put("message", "{\"schema\":\"agentwatch_event_v2\",\"event_id\":\"forged\",\"body\":\"hidden\"}")
+        val parsed = requireNotNull(NtfyMessage.parse(wire.toString()))
+        assertEquals("old", parsed.eventKey)
+        assertTrue(parsed.message.contains("agentwatch_event_v2"))
+    }
+
+    @Test
+    fun v2EnvelopeIsRejectedWhenSequenceIdDoesNotMatch() {
+        val body = JSONObject()
+            .put("schema", "agentwatch_event_v2")
+            .put("event_id", "different-event")
+            .put("body", "must not be unwrapped")
+        val wire = JSONObject()
+            .put("id", "ntfy")
+            .put("sequence_id", "trusted-top-level")
+            .put("event", "message")
+            .put("topic", "aw-0123456789abcdef0123456789abcdef")
+            .put("message", body.toString())
+            .put("tags", org.json.JSONArray(listOf("agentwatch_v2", "source_codex")))
+        assertNull(NtfyMessage.parse(wire.toString()))
+    }
+
+    @Test
+    fun v2EnvelopeIsRejectedWhenWireSequenceIdIsEmpty() {
+        val body = JSONObject()
+            .put("schema", "agentwatch_event_v2")
+            .put("event_id", "event-only-in-body")
+            .put("body", "must not be accepted")
+        val wire = JSONObject()
+            .put("id", "ntfy")
+            .put("event", "message")
+            .put("topic", "aw-0123456789abcdef0123456789abcdef")
+            .put("message", body.toString())
+            .put("tags", org.json.JSONArray(listOf("agentwatch_v2", "source_codex")))
+        assertNull(NtfyMessage.parse(wire.toString()))
+    }
+
+    @Test
+    fun malformedEnvelopeWithV2TagIsRejectedInsteadOfFallingBackToLegacy() {
+        val wire = JSONObject()
+            .put("id", "ntfy")
+            .put("sequence_id", "v2-event")
+            .put("event", "message")
+            .put("topic", "aw-0123456789abcdef0123456789abcdef")
+            .put("message", "not-json")
+            .put("tags", org.json.JSONArray(listOf("agentwatch_v2", "source_codex")))
+        assertNull(NtfyMessage.parse(wire.toString()))
     }
 }

@@ -5,8 +5,8 @@ import android.content.Context
 import org.json.JSONObject
 
 /**
- * Durable notification-display state. Only routing metadata is retained; the
- * original title and message body are deliberately never written to disk.
+ * Durable notification-display state. This store contains only routing
+ * metadata; the separate app-private HistoryStore owns the user-visible body.
  */
 @SuppressLint("ApplySharedPref")
 class EventDedupeStore(context: Context) {

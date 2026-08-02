@@ -14,6 +14,9 @@ data class NtfyMessage(
     val priority: Int,
     val tags: Set<String>,
     val source: Source,
+    val computerId: String = "",
+    val computerName: String = "",
+    val sentAt: Long = 0L,
 ) {
     val eventKey: String get() = sequenceId.ifBlank { id }
 
@@ -46,19 +49,46 @@ data class NtfyMessage(
                     }
                 }
             }
-            val title = json.optString("title")
+            val wireTitle = json.optString("title")
+            val wireBody = json.optString("message")
+            val wireSequenceId = json.optString("sequence_id")
+            val envelope = if ("agentwatch_v2" in tags) {
+                if (wireSequenceId.isBlank()) return null
+                val candidate = try {
+                    JSONObject(wireBody)
+                } catch (_: Exception) {
+                    return null
+                }
+                if (
+                    candidate.optString("schema") != "agentwatch_event_v2" ||
+                    candidate.optString("event_id").isBlank() ||
+                    candidate.optString("event_id") != wireSequenceId
+                ) {
+                    return null
+                }
+                candidate
+            } else {
+                null
+            }
+            val title = envelope?.optString("title")?.ifBlank { wireTitle } ?: wireTitle
+            val eventId = envelope?.optString("event_id").orEmpty()
+            val sourceKey = envelope?.optString("source")?.lowercase().orEmpty()
+            val source = if (sourceKey in Source.entries.map { it.key }) sourceForKey(sourceKey) else inferSource(tags, title)
             NtfyMessage(
                 id = json.optString("id"),
-                sequenceId = json.optString("sequence_id"),
+                sequenceId = eventId.ifBlank { wireSequenceId },
                 event = json.optString("event"),
                 topic = json.optString("topic"),
                 time = json.optLong("time"),
                 expires = json.optLong("expires"),
                 title = title,
-                message = json.optString("message"),
+                message = envelope?.optString("body") ?: wireBody,
                 priority = json.optInt("priority", 3),
                 tags = tags,
-                source = inferSource(tags, title),
+                source = source,
+                computerId = envelope?.optString("computer_id").orEmpty(),
+                computerName = envelope?.optString("computer_name").orEmpty(),
+                sentAt = envelope?.optLong("sent_at") ?: 0L,
             )
         } catch (_: Exception) {
             null
@@ -76,5 +106,8 @@ data class NtfyMessage(
                 else -> Source.OTHER
             }
         }
+
+        internal fun sourceForKey(key: String): Source =
+            Source.entries.firstOrNull { it.key == key.lowercase() } ?: Source.OTHER
     }
 }

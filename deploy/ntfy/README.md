@@ -1,15 +1,17 @@
 # HK_VPS ntfy deployment
 
-The official project subscription endpoint is:
+The public relay base is:
 
 ```text
-https://64.90.8.184:9444/agent-watch
+https://64.90.8.184:9444
 ```
 
-The URL and topic are public metadata. They are not credentials. The server uses
-`auth-default-access: deny-all`; publishers receive a write-only account/token and
-Android clients receive a separate read-only account. Never commit a token,
-password, password hash, `user.db`, or `cache.db`.
+The server uses `auth-default-access: deny-all`. v0.2 creates a random private
+topic and a separate non-admin read-only ntfy principal for every AgentWatch
+account. Topic names are not authorization: only the account's per-installation
+read tokens may subscribe. The internal publisher remains non-admin and receives
+an exact write-only ACL for each private topic. Never commit a topic together
+with a token, password, password hash, `user.db`, or `cache.db`.
 
 ## Production layout
 
@@ -19,29 +21,31 @@ password, password hash, `user.db`, or `cache.db`.
 - the persistent nftables policy allows TCP/UDP `9444`; port `2586` remains loopback-only
 - the existing sing-box listeners on `443` and Caddy site on `9443` are unchanged
 - messages are cached for at most six hours; attachments and the web console are disabled
-- `agent-watch-publisher` has `wo` access to `agent-watch`
-- `agent-watch-subscriber` has `ro` access to `agent-watch`
+- `agent-watch-publisher` has exact `wo` ACLs for provisioned private topics
+- every random `awu...` account principal has `ro` access to exactly one topic
+- legacy `agent-watch` ACLs remain only during the controlled v0.1 migration
 
 The live server files are based on `server.yml.example`, `Caddyfile.example`, and
 `hardening.conf.example`. Caddy configuration must be validated before reload.
 
 ## Client setup
 
-New repository installs already inherit the official URL from `env.example`.
-Existing installs must set both values in their private configuration:
+New desktop installs log in through the AgentWatch CLI. They receive an opaque
+computer token for the AgentWatch `/publish` API, not an ntfy token or topic.
+Android registration/login receives its private relay URL, topic, and read token
+dynamically. Users must not configure a shared topic manually.
+
+The following direct ntfy configuration is legacy-only and must not be issued
+to new computers:
 
 ```bash
 NTFY_URL=https://64.90.8.184:9444/agent-watch
 NTFY_TOKEN=<publisher-token-from-administrator>
 ```
 
-On Android, add the server `https://64.90.8.184:9444`, sign in with the read-only
-subscriber account supplied privately by the administrator, and subscribe to
-`agent-watch`. Do not reuse publisher credentials on a receiving device.
-On ColorOS and similar systems, set ntfy's power-use management to fully allow
-background behavior; the standard battery-optimization exemption alone may not
-prevent the vendor freezer from stopping the live subscription. Enable
-WebSockets when the ntfy client offers it; the Caddy proxy supports the upgrade.
+The custom AgentWatch Android app uses authenticated WebSockets. On ColorOS and
+similar systems, users must still allow background behavior/autostart; the
+standard battery-optimization exemption alone may not prevent a vendor freezer.
 
 ## Access administration
 
@@ -54,10 +58,11 @@ sudo -u ntfy -- /usr/bin/ntfy access
 sudo -u ntfy -- /usr/bin/ntfy token list agent-watch-publisher
 ```
 
-Tokens inherit all permissions of their user, so each automation should use a
-dedicated non-admin user with only the required topic ACL. Rotate a publisher
-token by adding a replacement, updating clients, verifying one bounded test, and
-then removing the old token.
+Tokens inherit all permissions of their user. Never make the publisher or a
+random subscriber principal an admin. The registration service safely supplies
+the random internal ntfy-user password through `NTFY_PASSWORD`, then creates an
+exact reader ACL and publisher writer ACL. See the registration-service README
+for per-device legacy audit/revocation and the guarded final shared-ACL reset.
 
 ## Verification and rollback
 
@@ -70,6 +75,12 @@ sudo systemctl is-active ntfy caddy
 sudo ss -lntp
 curl --fail --silent --show-error https://64.90.8.184:9444/v1/health
 ```
+
+For one provisioned private topic, also verify anonymous read/write are 403,
+the installation token reads but cannot write, and the publisher token writes
+but cannot read. Use one labelled notification for this preflight; repeated
+tests create needless mobile alerts. A user/token from another account must
+receive 403 for this topic.
 
 The server health timer also checks `ntfy`, loopback port `2586`, Caddy, and public
 port `9444`. The Caddy site does not enable an access log, so Authorization headers

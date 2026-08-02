@@ -43,7 +43,13 @@ USERNAME_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9_.-]{1,30}[a-z0-9])?\Z")
 DEVICE_ID_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{6,126}[A-Za-z0-9])?\Z")
 SEQUENCE_ID_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,126}[A-Za-z0-9])?\Z")
 APP_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
+COMPUTER_TOKEN_PATTERN = re.compile(r"awc_[A-Za-z0-9_-]{32,128}\Z")
 TEST_SOURCES = frozenset({"codex", "zcode", "kimi", "grok", "other"})
+NTFY_PRIORITIES = frozenset({"min", "low", "default", "high", "max"})
+PRIVATE_TOPIC_PATTERN = re.compile(r"aw-[0-9a-f]{32}\Z")
+PRIVATE_PRINCIPAL_PATTERN = re.compile(r"awu[0-9a-f]{24}\Z")
+COMPUTER_TOKEN_TTL_SECONDS = 0  # Revocation-based by default; no silent expiry.
+MAX_NTFY_MESSAGE_BYTES = 3900
 
 
 def device_target_tag(device_id: str) -> str:
@@ -75,16 +81,20 @@ class Config:
     publisher_token: str
     ntfy_binary: str = "/usr/bin/ntfy"
     ntfy_config_file: str = "/etc/ntfy/server.yml"
+    # Kept only while v0.1 Android installations migrate one by one.
     ntfy_subscriber_user: str = "agent-watch-subscriber"
+    ntfy_publisher_user: str = "agent-watch-publisher"
     ntfy_internal_url: str = "http://127.0.0.1:2586/agent-watch"
     ntfy_public_url: str = "https://64.90.8.184:9444/agent-watch"
     topic: str = "agent-watch"
     max_request_body: int = 16 * 1024
     max_users: int = 32
     max_devices_per_user: int = 32
-    # ntfy currently caps one user's tokens at 60. Keep headroom for the
-    # create-before-revoke rotation and for a bounded number of stale tokens.
-    max_devices_total: int = 50
+    # ntfy caps each private subscriber principal at 60 tokens. The per-user
+    # device cap leaves headroom for create-before-revoke rotation.
+    max_devices_total: int = 512
+    max_computers_per_user: int = 64
+    computer_token_ttl_seconds: int = COMPUTER_TOKEN_TTL_SECONDS
     scrypt_n: int = 2**14
     scrypt_r: int = 8
     scrypt_p: int = 1
@@ -110,6 +120,9 @@ class Config:
             ntfy_subscriber_user=values.get(
                 "AGENTWATCH_NTFY_SUBSCRIBER_USER", "agent-watch-subscriber"
             ),
+            ntfy_publisher_user=values.get(
+                "AGENTWATCH_NTFY_PUBLISHER_USER", "agent-watch-publisher"
+            ),
             ntfy_internal_url=values.get(
                 "AGENTWATCH_NTFY_INTERNAL_URL", "http://127.0.0.1:2586/agent-watch"
             ),
@@ -126,8 +139,11 @@ class Config:
             raise ValueError("AGENTWATCH_NTFY_BINARY must be an absolute path")
         if not Path(self.ntfy_config_file).is_absolute():
             raise ValueError("AGENTWATCH_NTFY_CONFIG_FILE must be an absolute path")
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.ntfy_subscriber_user):
-            raise ValueError("invalid ntfy subscriber username")
+        for username in (self.ntfy_subscriber_user, self.ntfy_publisher_user):
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", username):
+                raise ValueError("invalid ntfy service username")
+        if self.ntfy_subscriber_user == self.ntfy_publisher_user:
+            raise ValueError("ntfy subscriber and publisher users must be distinct")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.topic):
             raise ValueError("invalid ntfy topic")
         internal = urllib.parse.urlsplit(self.ntfy_internal_url)
@@ -147,6 +163,26 @@ class Config:
             raise ValueError("AGENTWATCH_NTFY_PUBLIC_URL must be an HTTPS URL without credentials")
         if public.query or public.fragment or public.path.rstrip("/") != f"/{self.topic}":
             raise ValueError("AGENTWATCH_NTFY_PUBLIC_URL must point to the configured topic")
+        if self.computer_token_ttl_seconds != 0 and not (
+            3600 <= self.computer_token_ttl_seconds <= 2 * 365 * 24 * 60 * 60
+        ):
+            raise ValueError("computer token lifetime is outside the supported range")
+
+    @staticmethod
+    def _topic_url(base_topic_url: str, topic: str) -> str:
+        if not PRIVATE_TOPIC_PATTERN.fullmatch(topic):
+            raise ValueError("invalid private topic")
+        parsed = urllib.parse.urlsplit(base_topic_url)
+        prefix, _, _legacy_topic = parsed.path.rstrip("/").rpartition("/")
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, f"{prefix}/{topic}", "", "")
+        )
+
+    def private_internal_url(self, topic: str) -> str:
+        return self._topic_url(self.ntfy_internal_url, topic)
+
+    def private_public_url(self, topic: str) -> str:
+        return self._topic_url(self.ntfy_public_url, topic)
 
 
 class PasswordHasher:
@@ -228,7 +264,8 @@ class Database:
                     device_name TEXT NOT NULL,
                     app_token_hash BLOB NOT NULL UNIQUE CHECK(length(app_token_hash) = 32),
                     created_at INTEGER NOT NULL,
-                    last_login_at INTEGER NOT NULL
+                    last_login_at INTEGER NOT NULL,
+                    private_ready_at INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS delivery_acks (
@@ -243,10 +280,53 @@ class Database:
                     ON delivery_acks(acknowledged_at);
                 """
             )
+            # v0.2 is an in-place, nullable-first migration. Existing v0.1
+            # sessions stay usable until that installation calls login or
+            # /session/upgrade and receives its private subscription token.
+            user_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(users)").fetchall()
+            }
+            for name, declaration in (
+                ("private_topic", "TEXT COLLATE BINARY"),
+                ("ntfy_subscriber_user", "TEXT COLLATE BINARY"),
+                ("channel_created_at", "INTEGER"),
+            ):
+                if name not in user_columns:
+                    connection.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
+            device_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(devices)").fetchall()
+            }
+            if "private_ready_at" not in device_columns:
+                connection.execute("ALTER TABLE devices ADD COLUMN private_ready_at INTEGER")
+            connection.executescript(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS users_private_topic_idx
+                    ON users(private_topic) WHERE private_topic IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS users_ntfy_subscriber_user_idx
+                    ON users(ntfy_subscriber_user) WHERE ntfy_subscriber_user IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS computers (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    computer_id TEXT NOT NULL UNIQUE COLLATE BINARY,
+                    computer_name TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    token_hash BLOB NOT NULL UNIQUE CHECK(length(token_hash) = 32),
+                    created_at INTEGER NOT NULL,
+                    last_login_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    revoked_at INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS computers_user_active_idx
+                    ON computers(user_id, revoked_at, last_seen_at);
+                """
+            )
             connection.execute(
                 "DELETE FROM delivery_acks WHERE acknowledged_at < ?",
                 (int(time.time()) - ACK_RETENTION_SECONDS,),
             )
+            connection.execute("PRAGMA user_version = 2")
             connection.commit()
         try:
             os.chmod(self.path, 0o600)
@@ -270,6 +350,12 @@ class IssuedNtfyToken:
     previous_values: tuple[str, ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class ProvisionedNtfyChannel:
+    subscriber_user: str
+    topic: str
+
+
 Runner = Callable[[list[str], Mapping[str, str], float], subprocess.CompletedProcess[str]]
 
 
@@ -289,27 +375,37 @@ def _default_runner(
 
 
 class NtfyTokenManager:
-    """Creates one ntfy read token per installation and rotates it on login."""
+    """Provision isolated ntfy readers and per-installation read tokens.
+
+    The random password used to create an ntfy principal exists only in the
+    child process environment. It is neither an argv item nor application data:
+    Android authenticates exclusively with a per-installation ntfy token.
+    """
 
     def __init__(self, config: Config, runner: Runner = _default_runner) -> None:
         self.config = config
         self.runner = runner
         self._lock = threading.Lock()
 
-    def _environment(self) -> dict[str, str]:
+    def _environment(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         # Deliberately do not pass the service environment to ntfy: it contains
         # the invite code and private publisher token.
-        return {
+        environment = {
             "HOME": "/var/lib/ntfy",
             "LANG": "C.UTF-8",
             "PATH": "/usr/bin:/bin",
             "NTFY_CONFIG_FILE": self.config.ntfy_config_file,
         }
+        if extra:
+            environment.update(extra)
+        return environment
 
-    def _run(self, arguments: list[str]) -> str:
+    def _run(self, arguments: list[str], extra_environment: Mapping[str, str] | None = None) -> str:
         try:
             result = self.runner(
-                [self.config.ntfy_binary, *arguments], self._environment(), 10.0
+                [self.config.ntfy_binary, *arguments],
+                self._environment(extra_environment),
+                10.0,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ProvisioningError("ntfy command could not be executed") from exc
@@ -332,17 +428,76 @@ class NtfyTokenManager:
                 matches.append(match.group(1))
         return tuple(matches)
 
-    def issue(self, device_id: str) -> IssuedNtfyToken:
+    def provision_channel(self, subscriber_user: str, topic: str) -> ProvisionedNtfyChannel:
+        if not PRIVATE_PRINCIPAL_PATTERN.fullmatch(subscriber_user):
+            raise ProvisioningError("private subscriber principal is invalid")
+        if not PRIVATE_TOPIC_PATTERN.fullmatch(topic):
+            raise ProvisioningError("private topic is invalid")
+        password = secrets.token_urlsafe(36)
+        user_created = False
+        with self._lock:
+            try:
+                self._run(
+                    ["user", "add", "--role=user", subscriber_user],
+                    {"NTFY_PASSWORD": password},
+                )
+                user_created = True
+                self._run(["access", subscriber_user, topic, "ro"])
+                self._run(["access", self.config.ntfy_publisher_user, topic, "wo"])
+            except ProvisioningError:
+                # Reset even if `access` returned an error: the CLI may have
+                # committed its SQLite transaction before its process failed.
+                try:
+                    self._run(
+                        ["access", "--reset", self.config.ntfy_publisher_user, topic]
+                    )
+                except ProvisioningError:
+                    logging.getLogger("agentwatch-registration").warning(
+                        "ntfy_channel_publisher_acl_rollback_failed"
+                    )
+                if user_created:
+                    try:
+                        self._run(["user", "del", subscriber_user])
+                    except ProvisioningError:
+                        logging.getLogger("agentwatch-registration").warning(
+                            "ntfy_channel_user_rollback_failed"
+                        )
+                raise
+            finally:
+                # Avoid accidentally reusing the random password in this process.
+                password = ""
+        return ProvisionedNtfyChannel(subscriber_user, topic)
+
+    def rollback_channel(self, channel: ProvisionedNtfyChannel) -> None:
+        with self._lock:
+            try:
+                self._run(
+                    ["access", "--reset", self.config.ntfy_publisher_user, channel.topic]
+                )
+            except ProvisioningError:
+                logging.getLogger("agentwatch-registration").warning(
+                    "ntfy_channel_publisher_acl_rollback_failed"
+                )
+            try:
+                self._run(["user", "del", channel.subscriber_user])
+            except ProvisioningError:
+                logging.getLogger("agentwatch-registration").warning(
+                    "ntfy_channel_user_rollback_failed"
+                )
+
+    def issue(self, subscriber_user: str, device_id: str) -> IssuedNtfyToken:
+        if not PRIVATE_PRINCIPAL_PATTERN.fullmatch(subscriber_user):
+            raise ProvisioningError("private subscriber principal is invalid")
         label = self._label(device_id)
         with self._lock:
-            listed = self._run(["token", "list", self.config.ntfy_subscriber_user])
+            listed = self._run(["token", "list", subscriber_user])
             previous = self._tokens_with_label(listed, label)
             created = self._run(
                 [
                     "token",
                     "add",
                     f"--label={label}",
-                    self.config.ntfy_subscriber_user,
+                    subscriber_user,
                 ]
             )
             tokens = TOKEN_PATTERN.findall(created)
@@ -350,66 +505,132 @@ class NtfyTokenManager:
                 raise ProvisioningError("ntfy returned an unexpected token response")
             return IssuedNtfyToken(tokens[0], label, previous)
 
-    def _remove(self, token: str) -> None:
-        self._run(["token", "remove", self.config.ntfy_subscriber_user, token])
+    def _remove(self, subscriber_user: str, token: str) -> None:
+        self._run(["token", "remove", subscriber_user, token])
 
-    def rollback(self, issued: IssuedNtfyToken) -> None:
+    def rollback(self, subscriber_user: str, issued: IssuedNtfyToken) -> None:
         try:
-            self._remove(issued.value)
+            self._remove(subscriber_user, issued.value)
         except ProvisioningError:
             logging.getLogger("agentwatch-registration").warning(
                 "ntfy_token_rollback_failed"
             )
 
-    def finalize(self, issued: IssuedNtfyToken) -> None:
+    def finalize(self, subscriber_user: str, issued: IssuedNtfyToken) -> None:
         for previous in issued.previous_values:
             if hmac.compare_digest(previous, issued.value):
                 continue
             try:
-                self._remove(previous)
+                self._remove(subscriber_user, previous)
             except ProvisioningError:
                 logging.getLogger("agentwatch-registration").warning(
                     "ntfy_old_token_cleanup_failed"
                 )
 
-    def revoke_device(self, device_id: str) -> int:
+    def revoke_device(self, subscriber_user: str, device_id: str) -> int:
         """Remove every ntfy token bearing one installation's derived label."""
         label = self._label(device_id)
         with self._lock:
-            listed = self._run(["token", "list", self.config.ntfy_subscriber_user])
+            listed = self._run(["token", "list", subscriber_user])
             tokens = self._tokens_with_label(listed, label)
             for token in tokens:
-                self._remove(token)
+                self._remove(subscriber_user, token)
             return len(tokens)
+
+    def revoke_legacy_device(self, device_id: str) -> int:
+        return self.revoke_device(self.config.ntfy_subscriber_user, device_id)
+
+    def legacy_token_count(self, device_id: str) -> int:
+        label = self._label(device_id)
+        with self._lock:
+            listed = self._run(["token", "list", self.config.ntfy_subscriber_user])
+            return len(self._tokens_with_label(listed, label))
+
+    def audit_channel_acl(self, subscriber_user: str, topic: str) -> tuple[bool, bool]:
+        if not PRIVATE_PRINCIPAL_PATTERN.fullmatch(subscriber_user):
+            return False, False
+        if not PRIVATE_TOPIC_PATTERN.fullmatch(topic):
+            return False, False
+        with self._lock:
+            subscriber_access = self._run(["access", subscriber_user])
+            publisher_access = self._run(["access", self.config.ntfy_publisher_user])
+
+        def entries(output: str) -> list[tuple[str, str]]:
+            parsed: list[tuple[str, str]] = []
+            for line in output.splitlines():
+                match = re.fullmatch(
+                    r"-\s+(read-only|write-only|read-write|no) access to topic ([A-Za-z0-9_*.-]+)",
+                    line.strip().lower(),
+                )
+                if match:
+                    parsed.append((match.group(1), match.group(2)))
+            return parsed
+
+        subscriber_entries = entries(subscriber_access)
+        publisher_entries = entries(publisher_access)
+        subscriber_is_user = "(admin)" not in subscriber_access.lower()
+        publisher_is_user = "(admin)" not in publisher_access.lower()
+        publisher_entries_are_bounded = all(
+            mode == "write-only"
+            and (candidate == self.config.topic or PRIVATE_TOPIC_PATTERN.fullmatch(candidate))
+            for mode, candidate in publisher_entries
+        )
+        return (
+            subscriber_is_user and subscriber_entries == [("read-only", topic)],
+            publisher_is_user
+            and publisher_entries_are_bounded
+            and ("write-only", topic) in publisher_entries,
+        )
+
+    def reset_legacy_acls(self) -> None:
+        with self._lock:
+            self._run(
+                ["access", "--reset", self.config.ntfy_subscriber_user, self.config.topic]
+            )
+            self._run(
+                ["access", "--reset", self.config.ntfy_publisher_user, self.config.topic]
+            )
 
 
 class NtfyPublisher:
     def __init__(
         self,
-        url: str,
+        legacy_url: str,
         publisher_token: str,
         opener: Callable[..., Any] = urllib.request.urlopen,
     ) -> None:
-        self.url = url
+        self.legacy_url = legacy_url
         self.publisher_token = publisher_token
         self.opener = opener
 
-    def publish_test(self, source: str, target: str) -> str:
-        if source not in TEST_SOURCES:
-            raise ValueError("unsupported test notification source")
-        if not re.fullmatch(r"target_[0-9a-f]{24}", target):
-            raise ValueError("invalid test notification target")
-        sequence_id = f"aw1_server_test_{secrets.token_hex(12)}"
+    def _topic_url(self, topic: str) -> str:
+        parsed = urllib.parse.urlsplit(self.legacy_url)
+        prefix, _, _legacy_topic = parsed.path.rstrip("/").rpartition("/")
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, f"{prefix}/{topic}", "", "")
+        )
+
+    def _publish(
+        self,
+        topic: str,
+        message: bytes,
+        title: str,
+        tags: tuple[str, ...],
+        priority: str,
+        sequence_id: str,
+    ) -> None:
+        if not PRIVATE_TOPIC_PATTERN.fullmatch(topic):
+            raise ValueError("invalid private topic")
+        query = urllib.parse.urlencode(
+            {"title": title, "tags": ",".join(tags), "priority": priority}
+        )
         request = urllib.request.Request(
-            self.url,
-            data=b"AgentWatch connection test",
+            f"{self._topic_url(topic)}?{query}",
+            data=message,
             method="POST",
             headers={
                 "Authorization": f"Bearer {self.publisher_token}",
                 "Content-Type": "text/plain; charset=utf-8",
-                "X-Title": "AgentWatch test",
-                "X-Tags": f"white_check_mark,agentwatch_v1,source_{source},{target}",
-                "X-Priority": "default",
                 "X-Sequence-ID": sequence_id,
             },
         )
@@ -418,10 +639,61 @@ class NtfyPublisher:
                 status = int(getattr(response, "status", 200))
                 response.read(4096)
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
-            raise PublishError("ntfy test publish failed") from exc
+            raise PublishError("ntfy publish failed") from exc
         if not 200 <= status < 300:
-            raise PublishError("ntfy test publish returned a non-success status")
+            raise PublishError("ntfy publish returned a non-success status")
+
+    def publish_test(self, topic: str, source: str, target: str) -> str:
+        if source not in TEST_SOURCES:
+            raise ValueError("unsupported test notification source")
+        if not re.fullmatch(r"target_[0-9a-f]{24}", target):
+            raise ValueError("invalid test notification target")
+        sequence_id = f"aw2_server_test_{secrets.token_hex(12)}"
+        message = json.dumps(
+            {
+                "schema": "agentwatch_event_v2",
+                "event_id": sequence_id,
+                "source": source,
+                "title": "AgentWatch test",
+                "body": "AgentWatch connection test",
+                "computer_id": "server-test",
+                "computer_name": "AgentWatch",
+                "sent_at": int(time.time()),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self._publish(
+            topic,
+            message,
+            "AgentWatch test",
+            ("white_check_mark", "agentwatch_v2", f"source_{source}", target),
+            "default",
+            sequence_id,
+        )
         return sequence_id
+
+    def publish_event(
+        self,
+        topic: str,
+        event_id: str,
+        source: str,
+        title: str,
+        message: bytes,
+        priority: str,
+    ) -> None:
+        if source not in TEST_SOURCES:
+            raise ValueError("unsupported notification source")
+        if priority not in NTFY_PRIORITIES:
+            raise ValueError("unsupported notification priority")
+        self._publish(
+            topic,
+            message,
+            title,
+            ("agentwatch_v2", f"source_{source}"),
+            priority,
+            event_id,
+        )
 
 
 class SlidingWindowLimiter:
@@ -563,6 +835,38 @@ class AgentWatchApplication:
             raise ApiError(400, "invalid_device_name", "Device name contains control characters")
         return name
 
+    @classmethod
+    def _computer_id(cls, value: Any) -> str:
+        computer_id = cls._string(value, "computer_id")
+        if not 8 <= len(computer_id) <= 128 or not DEVICE_ID_PATTERN.fullmatch(computer_id):
+            raise ApiError(
+                400, "invalid_computer_id", "Computer ID must contain 8-128 safe ASCII characters"
+            )
+        return computer_id
+
+    @classmethod
+    def _computer_name(cls, value: Any) -> str:
+        try:
+            return cls._device_name(value)
+        except ApiError as exc:
+            raise ApiError(400, "invalid_computer_name", exc.message.replace("Device", "Computer")) from exc
+
+    @classmethod
+    def _platform(cls, value: Any) -> str:
+        platform = cls._string(value, "platform").lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", platform):
+            raise ApiError(400, "invalid_platform", "Platform is invalid")
+        return platform
+
+    @classmethod
+    def _notification_text(cls, value: Any, field: str, max_characters: int) -> str:
+        text = unicodedata.normalize("NFC", cls._string(value, field)).strip()
+        if not 1 <= len(text) <= max_characters:
+            raise ApiError(400, f"invalid_{field}", f"{field} is empty or too long")
+        if "\x00" in text:
+            raise ApiError(400, f"invalid_{field}", f"{field} contains a null character")
+        return text
+
     def _check_rate(self, key: str, limit: int, window: float) -> None:
         if not self.limiter.allow(key, limit, window):
             raise ApiError(429, "rate_limited", "Too many requests; try again later")
@@ -574,6 +878,12 @@ class AgentWatchApplication:
             f"{API_PREFIX}/logout": (10, 300.0),
             f"{API_PREFIX}/test": (30, 60.0),
             f"{API_PREFIX}/ack": (600, 60.0),
+            f"{API_PREFIX}/session/upgrade": (30, 300.0),
+            f"{API_PREFIX}/computers/login": (30, 300.0),
+            f"{API_PREFIX}/computers": (120, 60.0),
+            f"{API_PREFIX}/computers/revoke": (30, 300.0),
+            f"{API_PREFIX}/computers/logout": (30, 300.0),
+            f"{API_PREFIX}/publish": (600, 60.0),
             f"{API_PREFIX}/health": (120, 60.0),
         }
         route_key = path if path in rules else "unknown"
@@ -584,13 +894,15 @@ class AgentWatchApplication:
         self._check_rate(f"ip:{client_ip}:{route_key}", limit, window)
 
     @staticmethod
-    def _bearer(headers: Mapping[str, str]) -> str:
+    def _bearer(
+        headers: Mapping[str, str], pattern: re.Pattern[str] = APP_TOKEN_PATTERN
+    ) -> str:
         authorization = headers.get("authorization", "")
         if len(authorization) > 256:
             raise ApiError(401, "unauthorized", "Valid app token required")
         parts = authorization.split()
-        if len(parts) != 2 or parts[0].lower() != "bearer" or not APP_TOKEN_PATTERN.fullmatch(parts[1]):
-            raise ApiError(401, "unauthorized", "Valid app token required")
+        if len(parts) != 2 or parts[0].lower() != "bearer" or not pattern.fullmatch(parts[1]):
+            raise ApiError(401, "unauthorized", "Valid bearer token required")
         return parts[1]
 
     def _authenticate_app(self, headers: Mapping[str, str]) -> sqlite3.Row:
@@ -601,7 +913,8 @@ class AgentWatchApplication:
             rows = connection.execute(
                 """
                 SELECT devices.id AS device_row_id, devices.device_id, devices.user_id, users.username,
-                       devices.app_token_hash
+                       devices.app_token_hash, devices.private_ready_at,
+                       users.private_topic, users.ntfy_subscriber_user
                 FROM devices JOIN users ON users.id = devices.user_id
                 """
             ).fetchall()
@@ -624,8 +937,105 @@ class AgentWatchApplication:
             raise ApiError(503, "database_error", "Device session could not be updated") from exc
         return selected
 
-    def _client_credentials(self, username: str, device_id: str, ntfy_token: str, app_token: str) -> Response:
-        parsed = urllib.parse.urlsplit(self.config.ntfy_public_url)
+    def _authenticate_computer(self, headers: Mapping[str, str]) -> sqlite3.Row:
+        token = self._bearer(headers, COMPUTER_TOKEN_PATTERN)
+        candidate = hashlib.sha256(token.encode("ascii")).digest()
+        selected: sqlite3.Row | None = None
+        with closing(self.database.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT computers.id AS computer_row_id, computers.user_id,
+                       computers.computer_id, computers.computer_name, computers.platform,
+                       computers.token_hash, computers.expires_at, computers.revoked_at,
+                       users.username, users.private_topic
+                FROM computers JOIN users ON users.id = computers.user_id
+                """
+            ).fetchall()
+        if not rows:
+            hmac.compare_digest(candidate, bytes(32))
+        for row in rows:
+            if hmac.compare_digest(candidate, bytes(row["token_hash"])):
+                selected = row
+        now = int(time.time())
+        if (
+            selected is None
+            or selected["revoked_at"] is not None
+            or (0 < int(selected["expires_at"]) <= now)
+            or not selected["private_topic"]
+        ):
+            raise ApiError(401, "unauthorized", "Valid computer token required")
+        return selected
+
+    @staticmethod
+    def _new_private_channel() -> ProvisionedNtfyChannel:
+        return ProvisionedNtfyChannel(
+            subscriber_user=f"awu{secrets.token_hex(12)}",
+            topic=f"aw-{secrets.token_hex(16)}",
+        )
+
+    def _prepare_private_channel(
+        self, user_id: int
+    ) -> tuple[ProvisionedNtfyChannel, bool]:
+        with closing(self.database.connect()) as connection:
+            user = connection.execute(
+                """
+                SELECT id, username, private_topic, ntfy_subscriber_user
+                FROM users WHERE id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+        if user is None:
+            raise ApiError(401, "unauthorized", "Account no longer exists")
+        if user["private_topic"] and user["ntfy_subscriber_user"]:
+            return (
+                ProvisionedNtfyChannel(
+                    str(user["ntfy_subscriber_user"]), str(user["private_topic"])
+                ),
+                False,
+            )
+        if bool(user["private_topic"]) != bool(user["ntfy_subscriber_user"]):
+            raise ApiError(503, "migration_incomplete", "Private channel migration needs repair")
+
+        channel = self._new_private_channel()
+        try:
+            self.token_manager.provision_channel(channel.subscriber_user, channel.topic)
+        except ProvisioningError as exc:
+            raise ApiError(
+                503, "provisioning_failed", "Private channel could not be provisioned"
+            ) from exc
+        return channel, True
+
+    @staticmethod
+    def _commit_prepared_channel(
+        connection: sqlite3.Connection,
+        user_id: int,
+        channel: ProvisionedNtfyChannel,
+        is_new: bool,
+        now: int,
+    ) -> None:
+        if not is_new:
+            return
+        cursor = connection.execute(
+            """
+            UPDATE users
+            SET private_topic = ?, ntfy_subscriber_user = ?, channel_created_at = ?
+            WHERE id = ? AND private_topic IS NULL AND ntfy_subscriber_user IS NULL
+            """,
+            (channel.topic, channel.subscriber_user, now, user_id),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError("channel migration raced or became inconsistent")
+
+    def _client_credentials(
+        self,
+        username: str,
+        device_id: str,
+        private_topic: str,
+        ntfy_token: str,
+        app_token: str,
+    ) -> Response:
+        public_url = self.config.private_public_url(private_topic)
+        parsed = urllib.parse.urlsplit(public_url)
         websocket_scheme = "wss" if parsed.scheme == "https" else "ws"
         websocket_url = urllib.parse.urlunsplit(
             (websocket_scheme, parsed.netloc, parsed.path.rstrip("/") + "/ws", "", "")
@@ -633,12 +1043,12 @@ class AgentWatchApplication:
         return Response(
             200,
             {
-                "api_version": 1,
+                "api_version": 2,
                 "username": username,
                 "device_id": device_id,
-                "ntfy_url": self.config.ntfy_public_url,
+                "ntfy_url": public_url,
                 "ntfy_ws_url": websocket_url,
-                "ntfy_topic": self.config.topic,
+                "ntfy_topic": private_topic,
                 "target_tag": device_target_tag(device_id),
                 "ntfy_token": ntfy_token,
                 "app_token": app_token,
@@ -675,9 +1085,17 @@ class AgentWatchApplication:
 
             app_token = secrets.token_urlsafe(32)
             app_token_hash = hashlib.sha256(app_token.encode("ascii")).digest()
+            channel = self._new_private_channel()
+            channel_provisioned = False
             try:
-                issued = self.token_manager.issue(device_id)
+                self.token_manager.provision_channel(channel.subscriber_user, channel.topic)
+                channel_provisioned = True
+                issued = self.token_manager.issue(channel.subscriber_user, device_id)
             except ProvisioningError as exc:
+                # provision_channel performs its own partial rollback. If the
+                # subsequent token issue failed, remove the completed channel.
+                if channel_provisioned:
+                    self.token_manager.rollback_channel(channel)
                 raise ApiError(503, "provisioning_failed", "Device credentials could not be provisioned") from exc
             now = int(time.time())
             try:
@@ -685,24 +1103,41 @@ class AgentWatchApplication:
                     connection.execute("BEGIN IMMEDIATE")
                     cursor = connection.execute(
                         """
-                        INSERT INTO users(username, password_salt, password_hash, created_at)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO users(
+                            username, password_salt, password_hash, created_at,
+                            private_topic, ntfy_subscriber_user, channel_created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (username, salt, password_hash, now),
+                        (
+                            username,
+                            salt,
+                            password_hash,
+                            now,
+                            channel.topic,
+                            channel.subscriber_user,
+                            now,
+                        ),
                     )
                     connection.execute(
                         """
-                        INSERT INTO devices(user_id, device_id, device_name, app_token_hash, created_at, last_login_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO devices(
+                            user_id, device_id, device_name, app_token_hash,
+                            created_at, last_login_at, private_ready_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (cursor.lastrowid, device_id, device_name, app_token_hash, now, now),
+                        (cursor.lastrowid, device_id, device_name, app_token_hash, now, now, now),
                     )
                     connection.commit()
             except sqlite3.Error as exc:
-                self.token_manager.rollback(issued)
+                self.token_manager.rollback(channel.subscriber_user, issued)
+                self.token_manager.rollback_channel(channel)
                 raise ApiError(503, "database_error", "Registration could not be saved") from exc
-            self.token_manager.finalize(issued)
-            response = self._client_credentials(username, device_id, issued.value, app_token)
+            self.token_manager.finalize(channel.subscriber_user, issued)
+            response = self._client_credentials(
+                username, device_id, channel.topic, issued.value, app_token
+            )
             return dataclasses.replace(response, status=201)
 
     def _login(self, raw: bytes) -> Response:
@@ -745,34 +1180,128 @@ class AgentWatchApplication:
                 if not existing and total_devices >= self.config.max_devices_total:
                     raise ApiError(409, "capacity_reached", "Registration capacity has been reached")
 
+            channel, channel_is_new = self._prepare_private_channel(int(user["id"]))
             app_token = secrets.token_urlsafe(32)
             app_token_hash = hashlib.sha256(app_token.encode("ascii")).digest()
             try:
-                issued = self.token_manager.issue(device_id)
+                issued = self.token_manager.issue(channel.subscriber_user, device_id)
             except ProvisioningError as exc:
+                if channel_is_new:
+                    self.token_manager.rollback_channel(channel)
                 raise ApiError(503, "provisioning_failed", "Device credentials could not be provisioned") from exc
             now = int(time.time())
             try:
                 with closing(self.database.connect()) as connection:
                     connection.execute("BEGIN IMMEDIATE")
+                    self._commit_prepared_channel(
+                        connection, int(user["id"]), channel, channel_is_new, now
+                    )
                     connection.execute(
                         """
-                        INSERT INTO devices(user_id, device_id, device_name, app_token_hash, created_at, last_login_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO devices(
+                            user_id, device_id, device_name, app_token_hash,
+                            created_at, last_login_at, private_ready_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(device_id) DO UPDATE SET
                             device_name = excluded.device_name,
                             app_token_hash = excluded.app_token_hash,
-                            last_login_at = excluded.last_login_at
+                            last_login_at = excluded.last_login_at,
+                            private_ready_at = excluded.private_ready_at
                         WHERE devices.user_id = excluded.user_id
                         """,
-                        (user["id"], device_id, device_name, app_token_hash, now, now),
+                        (user["id"], device_id, device_name, app_token_hash, now, now, now),
                     )
                     connection.commit()
             except sqlite3.Error as exc:
-                self.token_manager.rollback(issued)
+                self.token_manager.rollback(channel.subscriber_user, issued)
+                if channel_is_new:
+                    self.token_manager.rollback_channel(channel)
                 raise ApiError(503, "database_error", "Login could not be saved") from exc
-            self.token_manager.finalize(issued)
-            return self._client_credentials(username, device_id, issued.value, app_token)
+            self.token_manager.finalize(channel.subscriber_user, issued)
+            # The new private token is durable at this point. Failure to remove
+            # the v0.1 shared token must not invalidate the successful login.
+            try:
+                self.token_manager.revoke_legacy_device(device_id)
+            except ProvisioningError:
+                self.logger.warning("ntfy_legacy_token_cleanup_failed")
+            return self._client_credentials(
+                username,
+                device_id,
+                channel.topic,
+                issued.value,
+                app_token,
+            )
+
+    def _session_upgrade(self, raw: bytes, headers: Mapping[str, str]) -> Response:
+        self._decode_object(raw, set())
+        app_token = self._bearer(headers)
+        device = self._authenticate_app(headers)
+        self._check_rate(f"device:{device['device_row_id']}:upgrade", 5, 300.0)
+        with self._provisioning_lock:
+            with closing(self.database.connect()) as connection:
+                current = connection.execute(
+                    "SELECT app_token_hash FROM devices WHERE id = ?",
+                    (device["device_row_id"],),
+                ).fetchone()
+            if current is None or not hmac.compare_digest(
+                bytes(current["app_token_hash"]), bytes(device["app_token_hash"])
+            ):
+                raise ApiError(401, "session_replaced", "Device session is no longer current")
+            channel, channel_is_new = self._prepare_private_channel(int(device["user_id"]))
+            try:
+                issued = self.token_manager.issue(
+                    channel.subscriber_user, str(device["device_id"])
+                )
+            except ProvisioningError as exc:
+                if channel_is_new:
+                    self.token_manager.rollback_channel(channel)
+                raise ApiError(
+                    503, "provisioning_failed", "Private credentials could not be provisioned"
+                ) from exc
+            try:
+                with closing(self.database.connect()) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._commit_prepared_channel(
+                        connection,
+                        int(device["user_id"]),
+                        channel,
+                        channel_is_new,
+                        int(time.time()),
+                    )
+                    ready = connection.execute(
+                        """
+                        UPDATE devices SET private_ready_at = ?
+                        WHERE id = ? AND app_token_hash = ?
+                        """,
+                        (
+                            int(time.time()),
+                            device["device_row_id"],
+                            bytes(device["app_token_hash"]),
+                        ),
+                    )
+                    if ready.rowcount != 1:
+                        raise sqlite3.IntegrityError("device session changed during upgrade")
+                    connection.commit()
+            except sqlite3.Error as exc:
+                self.token_manager.rollback(channel.subscriber_user, issued)
+                if channel_is_new:
+                    self.token_manager.rollback_channel(channel)
+                raise ApiError(
+                    503, "database_error", "Private channel migration could not be saved"
+                ) from exc
+            self.token_manager.finalize(channel.subscriber_user, issued)
+            try:
+                self.token_manager.revoke_legacy_device(str(device["device_id"]))
+            except ProvisioningError:
+                self.logger.warning("ntfy_legacy_token_cleanup_failed")
+            return self._client_credentials(
+                str(device["username"]),
+                str(device["device_id"]),
+                channel.topic,
+                issued.value,
+                app_token,
+            )
 
     def _logout(self, raw: bytes, headers: Mapping[str, str]) -> Response:
         self._decode_object(raw, set())
@@ -789,7 +1318,14 @@ class AgentWatchApplication:
             ):
                 raise ApiError(401, "session_replaced", "Device session is no longer current")
             try:
-                self.token_manager.revoke_device(device["device_id"])
+                # Remove the legacy token first. If that cleanup fails, keep
+                # the working private subscription and app session intact.
+                self.token_manager.revoke_legacy_device(str(device["device_id"]))
+                subscriber_user = device["ntfy_subscriber_user"]
+                if subscriber_user:
+                    self.token_manager.revoke_device(
+                        str(subscriber_user), str(device["device_id"])
+                    )
             except ProvisioningError as exc:
                 raise ApiError(503, "logout_failed", "Device credentials could not be revoked") from exc
             try:
@@ -813,11 +1349,15 @@ class AgentWatchApplication:
         if source not in TEST_SOURCES:
             raise ApiError(400, "invalid_source", "source is invalid")
         device = self._authenticate_app(headers)
+        if not device["private_topic"] or device["private_ready_at"] is None:
+            raise ApiError(409, "upgrade_required", "Device must upgrade to a private channel")
         self._check_rate("global:test", 10, 60.0)
         self._check_rate(f"device:{device['device_row_id']}:test", 3, 60.0)
         target = device_target_tag(device["device_id"])
         try:
-            sequence_id = self.publisher.publish_test(source, target)
+            sequence_id = self.publisher.publish_test(
+                str(device["private_topic"]), source, target
+            )
         except PublishError as exc:
             raise ApiError(502, "publish_failed", "Test notification could not be published") from exc
         # `sequence_id` is retained for older clients; Android treats the same
@@ -831,6 +1371,276 @@ class AgentWatchApplication:
                 "target_tag": target,
             },
         )
+
+    def _computer_login(self, raw: bytes) -> Response:
+        payload = self._decode_object(
+            raw, {"username", "password", "computer_id", "computer_name", "platform"}
+        )
+        username = self._username(payload["username"])
+        password = self._password(payload["password"])
+        computer_id = self._computer_id(payload["computer_id"])
+        computer_name = self._computer_name(payload["computer_name"])
+        platform = self._platform(payload["platform"])
+        username_key = hashlib.sha256(username.encode("ascii")).hexdigest()[:20]
+        self._check_rate(f"account:{username_key}:computer-login", 10, 300.0)
+
+        with closing(self.database.connect()) as connection:
+            user = connection.execute(
+                """
+                SELECT id, password_salt, password_hash, private_topic, ntfy_subscriber_user
+                FROM users WHERE username = ?
+                """,
+                (username,),
+            ).fetchone()
+        try:
+            valid = self.hasher.verify(
+                password,
+                bytes(user["password_salt"]) if user else None,
+                bytes(user["password_hash"]) if user else None,
+            )
+        except RuntimeError as exc:
+            raise ApiError(503, "auth_busy", "Authentication is temporarily unavailable") from exc
+        if not valid or user is None:
+            raise ApiError(401, "invalid_credentials", "Username or password is incorrect")
+        if not user["private_topic"] and not user["ntfy_subscriber_user"]:
+            raise ApiError(
+                409,
+                "app_upgrade_required",
+                "Open the updated AgentWatch app before adding a computer",
+            )
+        if not user["private_topic"] or not user["ntfy_subscriber_user"]:
+            raise ApiError(503, "migration_incomplete", "Private channel migration needs repair")
+
+        with self._provisioning_lock:
+            with closing(self.database.connect()) as connection:
+                unmigrated_devices = connection.execute(
+                    "SELECT count(*) FROM devices WHERE user_id = ? AND private_ready_at IS NULL",
+                    (user["id"],),
+                ).fetchone()[0]
+                if unmigrated_devices:
+                    raise ApiError(
+                        409,
+                        "app_upgrade_required",
+                        "Open AgentWatch on every registered mobile device before adding a computer",
+                    )
+                existing = connection.execute(
+                    "SELECT user_id, created_at, revoked_at FROM computers WHERE computer_id = ?",
+                    (computer_id,),
+                ).fetchone()
+                if existing and int(existing["user_id"]) != int(user["id"]):
+                    raise ApiError(409, "computer_conflict", "Computer belongs to another account")
+                active_count = connection.execute(
+                    "SELECT count(*) FROM computers WHERE user_id = ? AND revoked_at IS NULL",
+                    (user["id"],),
+                ).fetchone()[0]
+                creates_active_slot = existing is None or existing["revoked_at"] is not None
+                if creates_active_slot and active_count >= self.config.max_computers_per_user:
+                    raise ApiError(
+                        409,
+                        "computer_capacity_reached",
+                        "Account computer capacity has been reached",
+                    )
+
+            computer_token = "awc_" + secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(computer_token.encode("ascii")).digest()
+            now = int(time.time())
+            expires_at = (
+                now + self.config.computer_token_ttl_seconds
+                if self.config.computer_token_ttl_seconds
+                else 0
+            )
+            created_at = int(existing["created_at"]) if existing else now
+            try:
+                with closing(self.database.connect()) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        """
+                        INSERT INTO computers(
+                            user_id, computer_id, computer_name, platform, token_hash,
+                            created_at, last_login_at, last_seen_at, expires_at, revoked_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                        ON CONFLICT(computer_id) DO UPDATE SET
+                            computer_name = excluded.computer_name,
+                            platform = excluded.platform,
+                            token_hash = excluded.token_hash,
+                            last_login_at = excluded.last_login_at,
+                            last_seen_at = excluded.last_seen_at,
+                            expires_at = excluded.expires_at,
+                            revoked_at = NULL
+                        WHERE computers.user_id = excluded.user_id
+                        """,
+                        (
+                            user["id"],
+                            computer_id,
+                            computer_name,
+                            platform,
+                            token_hash,
+                            created_at,
+                            now,
+                            now,
+                            expires_at,
+                        ),
+                    )
+                    connection.commit()
+            except sqlite3.Error as exc:
+                raise ApiError(503, "database_error", "Computer login could not be saved") from exc
+        return Response(
+            200,
+            {
+                "api_version": 2,
+                "username": username,
+                "computer_id": computer_id,
+                "computer_name": computer_name,
+                "platform": platform,
+                "computer_token": computer_token,
+                "created_at": created_at,
+                "last_seen_at": now,
+                "expires_at": expires_at,
+            },
+        )
+
+    def _computers(self, headers: Mapping[str, str]) -> Response:
+        device = self._authenticate_app(headers)
+        with closing(self.database.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT computer_id, computer_name, platform, created_at, last_seen_at
+                FROM computers
+                WHERE user_id = ? AND revoked_at IS NULL
+                ORDER BY last_seen_at DESC, id DESC
+                """,
+                (device["user_id"],),
+            ).fetchall()
+        return Response(
+            200,
+            {
+                "api_version": 2,
+                "computers": [
+                    {
+                        "computer_id": row["computer_id"],
+                        "computer_name": row["computer_name"],
+                        "platform": row["platform"],
+                        "created_at": row["created_at"],
+                        "last_seen_at": row["last_seen_at"],
+                    }
+                    for row in rows
+                ],
+            },
+        )
+
+    def _computer_revoke(self, raw: bytes, headers: Mapping[str, str]) -> Response:
+        payload = self._decode_object(raw, {"computer_id"})
+        computer_id = self._computer_id(payload["computer_id"])
+        device = self._authenticate_app(headers)
+        self._check_rate(f"device:{device['device_row_id']}:computer-revoke", 10, 300.0)
+        now = int(time.time())
+        replacement_hash = hashlib.sha256(secrets.token_bytes(32)).digest()
+        try:
+            with closing(self.database.connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    UPDATE computers
+                    SET revoked_at = ?, token_hash = ?
+                    WHERE user_id = ? AND computer_id = ? AND revoked_at IS NULL
+                    """,
+                    (now, replacement_hash, device["user_id"], computer_id),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    raise ApiError(404, "computer_not_found", "Computer was not found")
+                connection.commit()
+        except sqlite3.Error as exc:
+            raise ApiError(503, "database_error", "Computer could not be revoked") from exc
+        return Response(200, {"ok": True})
+
+    def _computer_logout(self, raw: bytes, headers: Mapping[str, str]) -> Response:
+        self._decode_object(raw, set())
+        computer = self._authenticate_computer(headers)
+        self._check_rate(f"computer:{computer['computer_row_id']}:logout", 5, 300.0)
+        now = int(time.time())
+        replacement_hash = hashlib.sha256(secrets.token_bytes(32)).digest()
+        try:
+            with closing(self.database.connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    UPDATE computers SET revoked_at = ?, token_hash = ?
+                    WHERE id = ? AND token_hash = ? AND revoked_at IS NULL
+                    """,
+                    (
+                        now,
+                        replacement_hash,
+                        computer["computer_row_id"],
+                        bytes(computer["token_hash"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    raise ApiError(401, "session_replaced", "Computer session is no longer current")
+                connection.commit()
+        except sqlite3.Error as exc:
+            raise ApiError(503, "database_error", "Computer logout could not be saved") from exc
+        return Response(200, {"ok": True})
+
+    def _publish(self, raw: bytes, headers: Mapping[str, str]) -> Response:
+        payload = self._decode_object(
+            raw, {"event_id", "source", "title", "body"}, {"priority"}
+        )
+        event_id = self._string(payload["event_id"], "event_id")
+        if not SEQUENCE_ID_PATTERN.fullmatch(event_id):
+            raise ApiError(400, "invalid_event_id", "Event ID is invalid")
+        source = self._string(payload["source"], "source").lower()
+        if source not in TEST_SOURCES:
+            raise ApiError(400, "invalid_source", "source is invalid")
+        title = self._notification_text(payload["title"], "title", 160)
+        body = self._notification_text(payload["body"], "body", 3200)
+        priority = self._string(payload.get("priority", "default"), "priority").lower()
+        if priority not in NTFY_PRIORITIES:
+            raise ApiError(400, "invalid_priority", "priority is invalid")
+        computer = self._authenticate_computer(headers)
+        self._check_rate("global:publish", 1000, 60.0)
+        self._check_rate(f"user:{computer['user_id']}:publish", 120, 60.0)
+        self._check_rate(f"computer:{computer['computer_row_id']}:publish", 120, 60.0)
+        now = int(time.time())
+        envelope = {
+            "schema": "agentwatch_event_v2",
+            "event_id": event_id,
+            "source": source,
+            "title": title,
+            "body": body,
+            "computer_id": computer["computer_id"],
+            "computer_name": computer["computer_name"],
+            "sent_at": now,
+        }
+        encoded = json.dumps(
+            envelope, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > MAX_NTFY_MESSAGE_BYTES:
+            raise ApiError(413, "message_too_large", "Notification is too large")
+        try:
+            self.publisher.publish_event(
+                str(computer["private_topic"]),
+                event_id,
+                source,
+                title,
+                encoded,
+                priority,
+            )
+        except PublishError as exc:
+            raise ApiError(502, "publish_failed", "Notification could not be published") from exc
+        try:
+            with closing(self.database.connect()) as connection:
+                connection.execute(
+                    "UPDATE computers SET last_seen_at = ? WHERE id = ?",
+                    (now, computer["computer_row_id"]),
+                )
+                connection.commit()
+        except sqlite3.Error:
+            # The message was already accepted by ntfy. Returning an error here
+            # would encourage a duplicate retry for mere inventory metadata.
+            self.logger.warning("computer_last_seen_update_failed")
+        return Response(202, {"ok": True, "event_id": event_id})
 
     def _ack(self, raw: bytes, headers: Mapping[str, str]) -> Response:
         payload = self._decode_object(
@@ -908,18 +1718,30 @@ class AgentWatchApplication:
             if not self.database.healthy():
                 return Response(503, {"ok": False})
             return Response(200, {"ok": True})
+        if method == "GET" and path == f"{API_PREFIX}/computers":
+            return self._computers(headers)
         if method != "POST":
             raise ApiError(405, "method_not_allowed", "Method is not allowed")
         if path == f"{API_PREFIX}/register":
             return self._register(raw)
         if path == f"{API_PREFIX}/login":
             return self._login(raw)
+        if path == f"{API_PREFIX}/session/upgrade":
+            return self._session_upgrade(raw, headers)
         if path == f"{API_PREFIX}/logout":
             return self._logout(raw, headers)
         if path == f"{API_PREFIX}/test":
             return self._test(raw, headers)
         if path == f"{API_PREFIX}/ack":
             return self._ack(raw, headers)
+        if path == f"{API_PREFIX}/computers/login":
+            return self._computer_login(raw)
+        if path == f"{API_PREFIX}/computers/revoke":
+            return self._computer_revoke(raw, headers)
+        if path == f"{API_PREFIX}/computers/logout":
+            return self._computer_logout(raw, headers)
+        if path == f"{API_PREFIX}/publish":
+            return self._publish(raw, headers)
         raise ApiError(404, "not_found", "Endpoint was not found")
 
 

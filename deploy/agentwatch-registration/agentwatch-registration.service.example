@@ -21,7 +21,7 @@ Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=15s
 
-# The service runs as ntfy because `ntfy token add` must update ntfy's auth DB.
+# The service runs as ntfy because `ntfy user/access/token` updates ntfy's auth DB.
 # Its only writable paths are its SQLite state and the existing ntfy state.
 ProtectSystem=strict
 ProtectHome=true

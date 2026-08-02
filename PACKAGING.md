@@ -9,8 +9,11 @@ signing key is not part of the platform packages and must never enter Git.
 
 All packages include:
 
+- `agentwatch.py`
+- `agentwatch_core.py`
 - `codex_watch_notifier.py`
 - `env.example`
+- `AI_INSTALL.md`
 - `assets/`
 - platform README
 
@@ -47,9 +50,12 @@ Install flow:
 
 ```bash
 ./install_launch_agent.zsh
-./codex-watch-notifier.zsh --doctor
-./codex-watch-notifier.zsh --test
+~/.local/bin/agentwatch doctor
 ```
+
+The installer prompts for the AgentWatch account and a hidden password. It does
+not send a test notification. AI-driven installs use `--json --no-login`, then
+pause so the user can personally run `agentwatch login`.
 
 ## Ubuntu Package
 
@@ -75,14 +81,13 @@ Install flow:
 
 ```bash
 ./install_systemd_user.sh
-python3 codex_watch_notifier.py --doctor
-python3 codex_watch_notifier.py --test
+~/.local/bin/agentwatch doctor
 ```
 
 Notes:
 
 - If the machine must run without an active desktop login, enable lingering with `loginctl enable-linger "$USER"`.
-- macOS local notifications are not available; Bark and ntfy remain the primary cross-device channels.
+- macOS local notifications are not available; AgentWatch private publish and optional personal Bark remain the cross-device channels.
 
 ## Windows Package
 
@@ -108,22 +113,21 @@ Install flow:
 
 ```powershell
 .\install_task_scheduler.ps1
-py .\codex_watch_notifier.py --doctor
-py .\codex_watch_notifier.py --test
+& "$env:USERPROFILE\.local\bin\agentwatch.cmd" doctor
 ```
 
 Notes:
 
 - Paths in `env` may use Windows paths, for example `C:\Users\<name>\.codex\sessions`.
-- macOS local notifications are not available; Bark and ntfy remain the primary cross-device channels.
+- The scheduled task launches a hidden PowerShell wrapper and appends stdout/stderr to private runtime logs.
 
 ## Internal Release Checklist
 
 Before each internal release:
 
 1. Run `python3 -m py_compile codex_watch_notifier.py`.
-2. Run `--doctor` on macOS.
-3. Smoke test configured notification channels with `--test`.
+2. Run `agentwatch doctor --json` on each platform fixture.
+3. Confirm install/update/login do not automatically send any test notification.
 4. Confirm first-run baseline does not replay old Codex, ZCode, Kimi Code, or Grok Build history.
 5. Build all three package files from the same git commit.
 6. Tag the commit, for example `v0.1.0-internal`.

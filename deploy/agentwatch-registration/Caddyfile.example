@@ -5,7 +5,7 @@ https://64.90.8.184:9444 {
 	tls /etc/letsencrypt/live/64.90.8.184/fullchain.pem /etc/letsencrypt/live/64.90.8.184/privkey.pem
 
 	# ntfy v2.26.3 account tokens can enumerate, create, and revoke every
-	# token on their shared account. The custom WebSocket client does not use
+	# token on its ntfy principal. The custom WebSocket client does not use
 	# this API, so it must never be exposed for subscriber tokens.
 	handle /v1/account* {
 		respond 404

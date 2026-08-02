@@ -2,6 +2,8 @@ package io.github.taotaoxu7447.agentwatch
 
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 
 class WatchServiceTest {
     @Test
@@ -41,6 +43,34 @@ class WatchServiceTest {
                 isCurrentDefault = false,
                 hadInternet = true,
                 hasInternet = false,
+            ),
+        )
+    }
+
+    @Test
+    fun deletedHistoryTombstoneSuppressesReplayEvenAfterDedupeTrim() {
+        assertTrue(WatchService.shouldSuppressFromHistory(HistoryStore.InsertResult.DELETED))
+        assertFalse(WatchService.shouldSuppressFromHistory(HistoryStore.InsertResult.EXISTS))
+    }
+
+    @Test
+    fun replayDoesNotResurrectDeletedHistoryButFirstSuppressedDeliveryIsKept() {
+        assertTrue(
+            WatchService.shouldRemoveUnexpectedInsert(
+                EventDedupeStore.Claim.SHOWN,
+                HistoryStore.InsertResult.INSERTED,
+            ),
+        )
+        assertTrue(
+            WatchService.shouldRemoveUnexpectedInsert(
+                EventDedupeStore.Claim.DISPLAY_COMMITTED,
+                HistoryStore.InsertResult.INSERTED,
+            ),
+        )
+        assertFalse(
+            WatchService.shouldRemoveUnexpectedInsert(
+                EventDedupeStore.Claim.SUPPRESSED,
+                HistoryStore.InsertResult.INSERTED,
             ),
         )
     }

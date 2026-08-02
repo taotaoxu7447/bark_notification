@@ -16,6 +16,8 @@ from typing import Any, Callable
 import urllib.parse
 import urllib.request
 
+from agentwatch_core import AgentWatchApi, ApiError, ComputerTokenStore, load_or_create_machine, stable_event_id
+
 
 DEFAULT_STATE = "~/.codex-watch-notifier/state.json"
 DEFAULT_LOG = "~/.codex-watch-notifier/notifier.log"
@@ -73,7 +75,12 @@ def load_env_file(path: Path) -> None:
 
 
 def default_env_path() -> Path:
-    return expand_path(os.getenv("CODEX_WATCH_ENV", os.getenv("CODEX_WATCH_CONFIG_DIR", "~/.codex-watch-notifier") + "/env"))
+    config_root = (
+        os.getenv("CODEX_WATCH_CONFIG_DIR")
+        or os.getenv("AGENTWATCH_CONFIG_DIR")
+        or "~/.codex-watch-notifier"
+    )
+    return expand_path(os.getenv("CODEX_WATCH_ENV", config_root + "/env"))
 
 
 def utc_to_local(value: Any) -> str:
@@ -369,17 +376,18 @@ class Notifier:
     def __init__(self, dry_run: bool, log: Logger) -> None:
         self.dry_run = dry_run
         self.log = log
+        self.computer = load_or_create_machine()
+        self.computer_token = ComputerTokenStore(self.computer["computer_id"]).load()
         self.channels = self._discover_channels()
+        self.completed_channels: set[str] = set()
+        self.last_successful_channels: set[str] = set()
 
     def _discover_channels(self) -> list[str]:
         channels: list[str] = []
         if os.getenv("BARK_URL") or os.getenv("BARK_KEY"):
             channels.append("bark")
-        if any(
-            os.getenv(name)
-            for name in ("NTFY_URL", "CODEX_NTFY_URL", "ZCODE_NTFY_URL", "KIMI_NTFY_URL", "GROK_NTFY_URL")
-        ):
-            channels.append("ntfy")
+        if self.computer_token:
+            channels.append("agentwatch")
         if os.getenv("CODEX_NOTIFY_WEBHOOK_URL"):
             channels.append("generic_webhook")
         if os.getenv("WECOM_WEBHOOK_URL") or os.getenv("WECHAT_WORK_WEBHOOK"):
@@ -407,27 +415,49 @@ class Notifier:
             return True
 
         if not self.channels:
-            self.log("no notification channel configured; set BARK_URL, BARK_KEY, NTFY_URL, or CODEX_NOTIFY_WEBHOOK_URL")
+            self.log("no private notification channel configured; run agentwatch login")
             return False
 
-        ok = False
+        previously_completed = set(self.completed_channels)
+        self.last_successful_channels = set()
+        channel_results: dict[str, bool] = {}
         for channel in self.channels:
+            if channel in previously_completed:
+                channel_results[channel] = True
+                continue
             try:
                 if channel == "bark":
-                    ok = self._send_bark(title, body, event) or ok
+                    channel_results[channel] = self._send_bark(title, body, event)
+                elif channel == "agentwatch":
+                    channel_results[channel] = self._send_agentwatch(title, body, event)
                 elif channel == "ntfy":
-                    ok = self._send_ntfy(title, body, event) or ok
+                    # Kept only as an internal compatibility seam for old unit
+                    # tests. v0.2 channel discovery never selects direct ntfy,
+                    # so a shared topic cannot receive a duplicate delivery.
+                    channel_results[channel] = self._send_ntfy(title, body, event)
                 elif channel == "generic_webhook":
-                    ok = self._send_generic_webhook(title, body, event) or ok
+                    channel_results[channel] = self._send_generic_webhook(title, body, event)
                 elif channel == "wecom":
-                    ok = self._send_wecom(title, body) or ok
+                    channel_results[channel] = self._send_wecom(title, body)
                 elif channel == "command":
-                    ok = self._send_command(title, body, event) or ok
+                    channel_results[channel] = self._send_command(title, body, event)
                 elif channel == "macos":
-                    ok = self._send_macos(title, body) or ok
+                    channel_results[channel] = self._send_macos(title, body)
             except Exception as exc:  # noqa: BLE001 - log all channel failures and keep other channels alive.
                 self.log(f"channel {channel} failed: {exc}")
-        return ok
+                channel_results[channel] = False
+
+        self.last_successful_channels = {
+            channel
+            for channel, succeeded in channel_results.items()
+            if succeeded and channel not in previously_completed
+        }
+        external_channels = [channel for channel in self.channels if channel not in {"macos", "dry_run"}]
+        required_channels = external_channels or list(self.channels)
+        # A local macOS banner must never conceal a failed phone delivery. Each
+        # successful channel is persisted by the caller and skipped on retry,
+        # so the second round sends only channels that actually failed.
+        return bool(required_channels) and all(channel_results.get(channel, False) for channel in required_channels)
 
     def _http_post(
         self,
@@ -483,6 +513,29 @@ class Notifier:
             payload["icon"] = icon
         data = urllib.parse.urlencode(payload).encode("utf-8")
         return self._http_post(url, data, "application/x-www-form-urlencoded")
+
+    def _send_agentwatch(self, title: str, body: str, event: dict[str, Any]) -> bool:
+        token = self.computer_token
+        if not token:
+            self.log("AgentWatch private publish skipped: run agentwatch login")
+            return False
+        priority = str(event.get("agentwatch_priority") or os.getenv("AGENTWATCH_PRIORITY", "default")).strip()
+        try:
+            AgentWatchApi().publish(
+                token,
+                event_id=stable_event_id(event, self.computer["computer_id"]),
+                source=ntfy_source(event),
+                title=compact(title, 160),
+                body=compact(body, 3200),
+                priority=priority or None,
+            )
+        except ApiError as exc:
+            if exc.status == 401:
+                ComputerTokenStore(self.computer["computer_id"]).delete()
+                self.computer_token = None
+                self.log("AgentWatch computer token was revoked; run agentwatch login again")
+            raise
+        return True
 
     def _send_ntfy(self, title: str, body: str, event: dict[str, Any]) -> bool:
         prefix = str(event.get("event_type") or "").partition("_")[0].upper()
@@ -750,6 +803,14 @@ def deliver_event_with_bounded_retry(
     rec["offset"] = line_offset
     event["stable_id"] = stable_id
 
+    completed_channels = entry.get("completed_channels", [])
+    if not isinstance(completed_channels, list):
+        completed_channels = []
+    if hasattr(notifier, "completed_channels"):
+        notifier.completed_channels = {
+            str(channel) for channel in completed_channels if isinstance(channel, str) and channel
+        }
+
     # Write-ahead is deliberate: a crash cannot reset the retry allowance and create a notification storm.
     delivery_checkpoint(checkpoint)
     try:
@@ -759,6 +820,15 @@ def deliver_event_with_bounded_retry(
         sent = False
     finished_at = int(time.time())
 
+    successful_channels = getattr(notifier, "last_successful_channels", set())
+    if isinstance(successful_channels, (set, list, tuple)):
+        completed = {
+            str(channel) for channel in completed_channels if isinstance(channel, str) and channel
+        }
+        completed.update(str(channel) for channel in successful_channels if str(channel))
+        if completed:
+            entry["completed_channels"] = sorted(completed)
+
     if sent:
         state.setdefault("sent", {})[stable_id] = finished_at
         attempts_by_id.pop(stable_id, None)
@@ -766,7 +836,7 @@ def deliver_event_with_bounded_retry(
         delivery_checkpoint(checkpoint)
         return "sent"
 
-    entry["last_result"] = "all_channels_failed"
+    entry["last_result"] = "incomplete_channels"
     if attempt_number < max_attempts:
         entry["status"] = "retry_wait"
         entry["next_retry_at"] = finished_at + retry_delay
@@ -779,7 +849,7 @@ def deliver_event_with_bounded_retry(
         )
         return "retry_scheduled"
 
-    mark_delivery_exhausted(state, stable_id, entry, finished_at, "all_channels_failed")
+    mark_delivery_exhausted(state, stable_id, entry, finished_at, "incomplete_channels")
     rec["offset"] = line_end
     delivery_checkpoint(checkpoint)
     log(f"delivery exhausted for {source} {stable_id} after {attempt_number} attempts; no more automatic sends")
@@ -1848,18 +1918,21 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     print_check("config file", env_path.exists(), "chmod 600 recommended" if env_path.exists() else "run installer")
     print_check("notification channels", bool(notifier.channels), ",".join(notifier.channels) or "none configured")
     print_check("Bark configured", bool(os.getenv("BARK_URL") or os.getenv("BARK_KEY")), "BARK_URL/BARK_KEY")
-    ntfy_detail = next(
-        (
-            os.getenv(name)
-            for name in ("NTFY_URL", "CODEX_NTFY_URL", "ZCODE_NTFY_URL", "KIMI_NTFY_URL", "GROK_NTFY_URL")
-            if os.getenv(name)
-        ),
-        "NTFY_URL",
+    print_check(
+        "AgentWatch computer login",
+        notifier.computer_token is not None,
+        f"computer_id={notifier.computer['computer_id']}",
     )
-    ntfy_configured = ntfy_detail != "NTFY_URL"
-    if str(ntfy_detail).startswith("https://ntfy.sh/") and len(str(ntfy_detail).rstrip("/").rsplit("/", 1)[-1]) < 12:
-        ntfy_detail = f"{ntfy_detail} (public topic should be long and random)"
-    print_check("ntfy configured", ntfy_configured, str(ntfy_detail))
+    legacy_ntfy = any(
+        os.getenv(name)
+        for name in ("NTFY_URL", "NTFY_TOKEN", "CODEX_NTFY_URL", "ZCODE_NTFY_URL", "KIMI_NTFY_URL", "GROK_NTFY_URL")
+    )
+    if legacy_ntfy:
+        print_check(
+            "legacy ntfy configuration ignored",
+            False,
+            "v0.2 publishes only through the account-bound /publish API; no duplicate is sent",
+        )
     subagent_policy = "enabled" if notify_subagents_enabled() else "main sessions only"
     print(f"Codex subagent notifications: {subagent_policy}")
     print_check("Codex sessions root", any(root.exists() for root in roots), ", ".join(str(root) for root in roots))

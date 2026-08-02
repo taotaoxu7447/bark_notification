@@ -4,20 +4,26 @@ Give this folder to the other Mac. Then ask Codex on that Mac to run:
 
 ```bash
 cd /path/to/codex-watch-notifier-handoff-2026-06-16
-mkdir -p ~/.codex-watch-notifier
-cp env.example ~/.codex-watch-notifier/env
-chmod 600 ~/.codex-watch-notifier/env
-$EDITOR ~/.codex-watch-notifier/env
-./install_launch_agent.zsh
-./codex-watch-notifier.zsh --test
-launchctl print gui/$(id -u)/com.xutao.codex-watch-notifier | sed -n '1,60p'
-tail -40 ~/.codex-watch-notifier/notifier.log
+./install_launch_agent.zsh --json --no-login
+```
+
+Codex must then pause. The user personally runs this in Terminal and enters the
+password in the hidden prompt:
+
+```bash
+~/.local/bin/agentwatch login
+```
+
+After the user confirms login, Codex may run:
+
+```bash
+~/.local/bin/agentwatch doctor --json
 ```
 
 Expected result:
 
-- Test Bark notification arrives on the same iPhone / Apple Watch.
+- The computer is authenticated to the user's private AgentWatch channel.
 - LaunchAgent state is `running`.
-- Log says it is watching `~/.codex/sessions` with Bark.
+- No test notification was sent during install or login.
 
-Do not paste the Bark URL into public chat or commit it to Git. Store it only in `~/.codex-watch-notifier/env`.
+Do not give the account password to Codex or place it in a command, environment variable, config file, or log. See `AI_INSTALL.md` for the full protocol.

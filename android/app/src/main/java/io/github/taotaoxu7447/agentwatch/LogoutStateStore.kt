@@ -16,8 +16,15 @@ class LogoutStateStore(context: Context) {
 
     fun isPending(): Boolean = preferences.getBoolean(KEY_PENDING, false)
 
-    fun markPending() {
-        check(preferences.edit().putBoolean(KEY_PENDING, true).commit()) {
+    fun deleteHistory(): Boolean = preferences.getBoolean(KEY_DELETE_HISTORY, false)
+
+    fun markPending(deleteHistory: Boolean) {
+        check(
+            preferences.edit()
+                .putBoolean(KEY_PENDING, true)
+                .putBoolean(KEY_DELETE_HISTORY, deleteHistory)
+                .commit(),
+        ) {
             "Could not persist pending logout"
         }
     }
@@ -31,5 +38,6 @@ class LogoutStateStore(context: Context) {
     companion object {
         private const val PREFERENCES = "agentwatch_logout_state"
         private const val KEY_PENDING = "pending"
+        private const val KEY_DELETE_HISTORY = "delete_history"
     }
 }

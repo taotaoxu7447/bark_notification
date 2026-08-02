@@ -25,11 +25,10 @@ android {
         applicationId = "io.github.taotaoxu7447.agentwatch"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         buildConfigField("String", "SERVER_BASE_URL", "\"https://64.90.8.184:9444\"")
-        buildConfigField("String", "NTFY_TOPIC", "\"agent-watch\"")
         buildConfigField("String", "API_PREFIX", "\"/agentwatch/api/v1\"")
         buildConfigField("int", "MAX_CATCH_UP_SECONDS", "21600")
     }
@@ -81,4 +80,5 @@ kotlin {
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:5.4.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
