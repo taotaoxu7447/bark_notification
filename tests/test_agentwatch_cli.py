@@ -1138,6 +1138,34 @@ class CliSafetyTests(unittest.TestCase):
                             paths, system_name=system_name
                         ).install(should_start=False)
 
+    def test_macos_disabled_override_accepts_current_and_legacy_launchctl_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = agentwatch.InstallPaths(
+                Path(temp_dir) / "config", Path(temp_dir) / "home"
+            )
+            manager = agentwatch.ServiceManager(paths, system_name="Darwin")
+            expected = {
+                "disabled": True,
+                "true": True,
+                "enabled": False,
+                "false": False,
+            }
+            for value, is_disabled in expected.items():
+                with self.subTest(value=value), mock.patch.object(
+                    agentwatch,
+                    "_run",
+                    return_value=mock.Mock(
+                        returncode=0,
+                        stdout=(
+                            "disabled services = {\n"
+                            f'  "{agentwatch.MACOS_LABEL}" => {value}\n'
+                            "}\n"
+                        ),
+                        stderr="",
+                    ),
+                ):
+                    self.assertEqual(is_disabled, manager._macos_service_disabled())
+
     def test_start_requires_enabled_and_running_on_every_platform(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

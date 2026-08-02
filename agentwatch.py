@@ -551,11 +551,14 @@ class ServiceManager:
                 "could not verify whether the AgentWatch LaunchAgent is disabled"
             )
         pattern = re.compile(
-            rf'["\']?{re.escape(MACOS_LABEL)}["\']?\s*=>\s*(true|false)',
+            rf'["\']?{re.escape(MACOS_LABEL)}["\']?\s*=>\s*'
+            r'(true|false|disabled|enabled)',
             re.IGNORECASE,
         )
         match = pattern.search(result.stdout)
-        return bool(match and match.group(1).lower() == "true")
+        return bool(
+            match and match.group(1).lower() in {"true", "disabled"}
+        )
 
     def _linux_service_snapshot(self) -> tuple[str, str, str]:
         command = [
