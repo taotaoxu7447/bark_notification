@@ -32,7 +32,7 @@ from agentwatch_core import (
 )
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 MACOS_LABEL = "com.xutao.codex-watch-notifier"
 LINUX_UNIT = "codex-watch-notifier.service"
 WINDOWS_TASK = "CodexWatchNotifier"

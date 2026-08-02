@@ -360,14 +360,14 @@ python3 codex_watch_notifier.py --test-grok
 在 macOS 仓库根目录执行：
 
 ```bash
-./build_packages.zsh v0.2.0
+./build_packages.zsh v0.2.1
 ```
 
 产物会输出到 `dist/`：
 
-- `codex-watch-notifier-macos-v0.2.0.zip`
-- `codex-watch-notifier-ubuntu-v0.2.0.tar.gz`
-- `codex-watch-notifier-windows-v0.2.0.zip`
+- `codex-watch-notifier-macos-v0.2.1.zip`
+- `codex-watch-notifier-ubuntu-v0.2.1.tar.gz`
+- `codex-watch-notifier-windows-v0.2.1.zip`
 
 Android 正式 APK 在 `android/` 内使用长期发布密钥单独构建：
 
@@ -376,7 +376,7 @@ cd android
 ./build_release.zsh
 ```
 
-本地产物是 `android/app/build/outputs/apk/release/app-release.apk`，v0.2.0 Release 发布名为 `AgentWatch-android-v0.2.0.apk`。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
+本地产物是 `android/app/build/outputs/apk/release/app-release.apk`，v0.2.1 Release 发布名为 `AgentWatch-android-v0.2.1.apk`。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
 
 每次发布建议从同一个 git commit 构建三种电脑端安装包和 Android APK。
 

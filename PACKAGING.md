@@ -32,7 +32,7 @@ The Python script loads `~/.codex-watch-notifier/env` itself, so Linux and Windo
 Build all packages from macOS with:
 
 ```bash
-./build_packages.zsh v0.2.0
+./build_packages.zsh v0.2.1
 ```
 
 ## macOS Package
@@ -40,7 +40,7 @@ Build all packages from macOS with:
 Package name:
 
 ```text
-codex-watch-notifier-macos-v0.2.0.zip
+codex-watch-notifier-macos-v0.2.1.zip
 ```
 
 Includes:
@@ -73,7 +73,7 @@ The installer asks for AgentWatch account input only in modes that use AgentWatc
 Package name:
 
 ```text
-codex-watch-notifier-ubuntu-v0.2.0.tar.gz
+codex-watch-notifier-ubuntu-v0.2.1.tar.gz
 ```
 
 Includes:
@@ -108,7 +108,7 @@ Notes:
 Package name:
 
 ```text
-codex-watch-notifier-windows-v0.2.0.zip
+codex-watch-notifier-windows-v0.2.1.zip
 ```
 
 Includes:
@@ -150,6 +150,6 @@ Before each internal release:
 5. Confirm Bark-only never requests AgentWatch credentials, Android mode uses the custom app/account path, and `both` keeps Bark running when AgentWatch is logged out.
 6. Confirm first-run baseline does not replay old Codex, ZCode, Kimi Code, or Grok Build history.
 7. Build all three package files from the same git commit.
-8. Tag the commit `v0.2.0`.
+8. Tag the commit `v0.2.1`.
 9. Run `android/build_release.zsh`, verify the APK signature/application ID, and
-   publish `AgentWatch-android-v0.2.0.apk` from the same commit.
+   publish `AgentWatch-android-v0.2.1.apk` from the same commit.

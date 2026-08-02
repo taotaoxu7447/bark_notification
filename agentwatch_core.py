@@ -837,21 +837,43 @@ class AgentWatchApi:
 
 
 def stable_event_id(event: dict[str, Any], computer_id: str) -> str:
-    stable_parts: list[str] = []
-    for character in str(event.get("stable_id") or ""):
-        if not character.isascii():
-            continue
-        lowered = character.lower()
-        if lowered.isalnum() or lowered in {"_", ".", ":"}:
-            stable_parts.append(lowered)
-        elif lowered == "-":
-            stable_parts.append(".")
-    stable = "".join(stable_parts)[:64].strip("_.:")
-    if not stable:
-        canonical = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        stable = hashlib_sha256(canonical.encode("utf-8"))[:32]
-    machine = "".join(character.lower() for character in computer_id if character.isalnum())[:32]
-    return f"aw{API_VERSION}_{machine}_{stable}"
+    # ntfy 2.26.3 applies its topic-name contract to X-Sequence-ID as well:
+    # ASCII letters, digits, dash, or underscore, with a 64-character maximum.
+    # Preserve existing short protocol-safe stable IDs so retries keep the same
+    # identity. Hash only missing or incompatible values to avoid lossy
+    # punctuation stripping and accidental collisions.
+    machine = "".join(
+        character.lower()
+        for character in computer_id
+        if character.isascii() and character.isalnum()
+    )[:32]
+    if not machine:
+        machine = hashlib_sha256(computer_id.encode("utf-8"))[:12]
+
+    prefix = f"aw{API_VERSION}_{machine}_"
+    available = 64 - len(prefix)
+    if available < 1:
+        # UUID-backed machine IDs never take this path, but keep the helper
+        # bounded even if a future caller supplies a different identifier.
+        machine = hashlib_sha256(computer_id.encode("utf-8"))[:12]
+        prefix = f"aw{API_VERSION}_{machine}_"
+        available = 64 - len(prefix)
+
+    raw_stable = str(event.get("stable_id") or "").strip()
+    compatible = bool(raw_stable) and all(
+        character.isascii() and (character.isalnum() or character in {"_", "-"})
+        for character in raw_stable
+    )
+    if compatible and len(raw_stable) <= available:
+        stable = raw_stable.lower()
+    else:
+        if raw_stable:
+            stable_source = raw_stable.encode("utf-8")
+        else:
+            canonical = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            stable_source = canonical.encode("utf-8")
+        stable = hashlib_sha256(stable_source)[: min(24, available)]
+    return prefix + stable
 
 
 def hashlib_sha256(value: bytes) -> str:

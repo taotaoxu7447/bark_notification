@@ -41,7 +41,11 @@ ACK_RETENTION_SECONDS = 7 * 24 * 60 * 60
 TOKEN_PATTERN = re.compile(r"\btk_[A-Za-z0-9]{20,125}\b")
 USERNAME_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9_.-]{1,30}[a-z0-9])?\Z")
 DEVICE_ID_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{6,126}[A-Za-z0-9])?\Z")
-SEQUENCE_ID_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,126}[A-Za-z0-9])?\Z")
+# ntfy 2.26.3 validates X-Sequence-ID with the same contract as a topic:
+# ASCII letters, digits, dash, or underscore, with a hard 64-character limit.
+# Keep the public /publish contract equally strict so an incompatible client ID
+# is rejected clearly here instead of surfacing later as a generic ntfy 502.
+SEQUENCE_ID_PATTERN = re.compile(r"[-_A-Za-z0-9]{1,64}\Z")
 APP_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 COMPUTER_TOKEN_PATTERN = re.compile(r"awc_[A-Za-z0-9_-]{32,128}\Z")
 TEST_SOURCES = frozenset({"codex", "zcode", "kimi", "grok", "other"})

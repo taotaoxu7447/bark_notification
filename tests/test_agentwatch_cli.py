@@ -274,7 +274,7 @@ class PrivateNotifierTests(unittest.TestCase):
         self.assertNotIn("ntfy", delivery.channels)
         api.publish.assert_called_once_with(
             "private-token",
-            event_id="aw2_11111111111141118111111111111111_stable.event",
+            event_id="aw2_11111111111141118111111111111111_stable-event",
             source="kimi",
             title="Kimi 已完成",
             body="正文",
@@ -289,8 +289,39 @@ class PrivateNotifierTests(unittest.TestCase):
             agentwatch_core.stable_event_id(event, computer_id),
         )
         generated = agentwatch_core.stable_event_id(event, computer_id)
-        self.assertLessEqual(len(generated), 128)
-        self.assertRegex(generated, re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,126}[A-Za-z0-9])?\Z"))
+        self.assertLessEqual(len(generated), 64)
+        self.assertRegex(generated, re.compile(r"[-_A-Za-z0-9]{1,64}\Z"))
+
+    def test_private_event_id_preserves_short_ntfy_compatible_stable_id(self) -> None:
+        computer_id = "11111111-1111-4111-8111-111111111111"
+        generated = agentwatch_core.stable_event_id(
+            {"event_type": "zcode_turn_completed", "stable_id": "AbC-123_test"},
+            computer_id,
+        )
+
+        self.assertEqual(
+            "aw2_11111111111141118111111111111111_abc-123_test",
+            generated,
+        )
+
+    def test_private_event_id_hashes_missing_or_ntfy_incompatible_stable_id(self) -> None:
+        computer_id = "11111111-1111-4111-8111-111111111111"
+        events = [
+            {"event_type": "codex_test", "timestamp": "2026-08-02T15:36:20Z"},
+            {"event_type": "zcode_test", "timestamp": "2026-08-02T15:36:21Z"},
+            {"event_type": "kimi_test", "timestamp": "2026-08-02T15:36:22Z"},
+            {"event_type": "grok_test", "timestamp": "2026-08-02T15:36:23Z"},
+            {"event_type": "codex_task_complete", "stable_id": "event.with.dot"},
+            {"event_type": "codex_task_complete", "stable_id": "event:with:colon"},
+            {"event_type": "codex_task_complete", "stable_id": "x" * 200},
+        ]
+
+        generated = [agentwatch_core.stable_event_id(event, computer_id) for event in events]
+        self.assertEqual(len(generated), len(set(generated)))
+        for event_id in generated:
+            self.assertLessEqual(len(event_id), 64)
+            self.assertRegex(event_id, re.compile(r"[-_A-Za-z0-9]{1,64}\Z"))
+            self.assertEqual(61, len(event_id))
 
     def test_local_macos_success_cannot_mask_private_publish_failure(self) -> None:
         machine = {

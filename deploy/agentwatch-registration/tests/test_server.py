@@ -569,6 +569,37 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(429, status)
         self.assertEqual("rate_limited", response["error"])
 
+    def test_publish_rejects_ntfy_incompatible_event_ids_before_upstream(self) -> None:
+        self.register()
+        computer = self.computer_login()
+        token = str(computer["computer_token"])
+        base_payload = {
+            "source": "zcode",
+            "title": "Complete",
+            "body": "Complete",
+        }
+
+        for event_id in ("a" * 65, "event.with.dot", "event:with:colon"):
+            with self.subTest(event_id=event_id):
+                status, response = self.request(
+                    "/publish", {**base_payload, "event_id": event_id}, token
+                )
+                self.assertEqual(400, status)
+                self.assertEqual("invalid_event_id", response["error"])
+
+        # Rejection happens before NtfyPublisher, so it cannot be transformed
+        # into the generic publish_failed 502 contract.
+        self.assertEqual(0, self.publisher.calls)
+
+        compatible = "aw2_" + "m" * 32 + "_" + "e" * 27
+        self.assertEqual(64, len(compatible))
+        status, response = self.request(
+            "/publish", {**base_payload, "event_id": compatible}, token
+        )
+        self.assertEqual(202, status)
+        self.assertTrue(response["ok"])
+        self.assertEqual(1, self.publisher.calls)
+
     def test_publish_rate_limit_is_aggregated_across_account_computers(self) -> None:
         self.register()
         first = self.computer_login(
