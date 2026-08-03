@@ -317,7 +317,7 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual("https://example.test/api/v1/computers/logout", request.full_url)
         self.assertEqual({}, json.loads(request.data))
         self.assertEqual("Bearer computer-token", request.headers["Authorization"])
-        self.assertEqual("agentwatch-computer/0.3.0", request.headers["User-agent"])
+        self.assertEqual("agentwatch-computer/0.4.0", request.headers["User-agent"])
         self.assertTrue(response["ok"])
 
 
@@ -752,7 +752,9 @@ class ClaudeHookInstallerIntegrationTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertTrue(payload["partial"])
             self.assertTrue(payload["runtime_preserved"])
-            self.assertEqual("claude_hook_cleanup_failed", payload["error"])
+            self.assertEqual("integration_cleanup_failed", payload["error"])
+            self.assertTrue(payload["claude_hook_cleanup_failed"])
+            self.assertFalse(payload["tool_hook_cleanup_failed"])
 
 
 class PrivateNotifierTests(unittest.TestCase):
@@ -1276,6 +1278,8 @@ class CliSafetyTests(unittest.TestCase):
                 agentwatch, "ServiceManager", return_value=service
             ), mock.patch.object(
                 agentwatch, "_configure_installed_claude_hooks", return_value={}
+            ), mock.patch.object(
+                agentwatch, "_configure_installed_tool_hooks", return_value=False
             ), mock.patch.object(
                 agentwatch, "_run", side_effect=run_side_effect
             ) as run, mock.patch.object(
@@ -2035,6 +2039,8 @@ class DeliveryModeTests(unittest.TestCase):
             (paths.config / "env").write_text("BARK_URL=https://example.invalid/bark\n", encoding="utf-8")
             agentwatch_core.save_delivery_mode("both", paths.config)
             agentwatch._configure_installed_claude_hooks(paths)
+            with mock.patch.object(agentwatch.shutil, "which", return_value=None):
+                agentwatch._configure_installed_tool_hooks(paths)
             service = mock.Mock()
             service.installed.return_value = True
             service.state.return_value = "active"
@@ -2048,7 +2054,9 @@ class DeliveryModeTests(unittest.TestCase):
                 agentwatch, "InstallPaths", return_value=paths
             ), mock.patch.object(agentwatch, "ServiceManager", return_value=service), mock.patch.object(
                 agentwatch, "ComputerTokenStore", return_value=store
-            ), mock.patch.object(agentwatch, "AgentWatchApi", return_value=api), mock.patch("sys.stdout", output):
+            ), mock.patch.object(agentwatch, "AgentWatchApi", return_value=api), mock.patch.object(
+                agentwatch.shutil, "which", return_value=None
+            ), mock.patch("sys.stdout", output):
                 result = agentwatch.main(["doctor", "--json"])
 
             self.assertEqual(0, result)

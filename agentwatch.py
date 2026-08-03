@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import datetime as dt
 import getpass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import plistlib
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -48,9 +51,22 @@ from claude_hook_config import (
     inspect_claude_hooks,
     preflight_claude_hooks,
 )
+from tool_hook_config import (
+    INTEGRATION_REGISTRATION_FILE_NAME,
+    OPENCODE_MANAGED_MARKER,
+    PI_MANAGED_MARKER,
+    build_opencode_plugin,
+    build_pi_extension,
+    configure_managed_integration,
+    inspect_managed_integration,
+    managed_integration_sha256,
+    opencode_plugin_path,
+    pi_extension_path,
+    preflight_managed_integration,
+)
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MACOS_LABEL = "com.xutao.codex-watch-notifier"
 LINUX_UNIT = "codex-watch-notifier.service"
 WINDOWS_TASK = "CodexWatchNotifier"
@@ -59,6 +75,7 @@ RUNTIME_FILES = (
     "agentwatch_core.py",
     "codex_watch_notifier.py",
     "claude_hook_config.py",
+    "tool_hook_config.py",
     "env.example",
 )
 RUNNING_SERVICE_STATES = {"running", "active"}
@@ -72,6 +89,16 @@ CLAUDE_HOOK_SCHEMA = "agentwatch_claude_hook_v1"
 CLAUDE_HOOK_INPUT_LIMIT_BYTES = 1024 * 1024
 CLAUDE_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
 CLAUDE_APPEND_LOCK_TIMEOUT_SECONDS = 4.0
+TOOL_HOOK_EVENTS_DIR_NAME = "tool-hook-events"
+TOOL_HOOK_INPUT_LIMIT_BYTES = 1024 * 1024
+TOOL_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
+TOOL_HOOK_SCHEMA = "agentwatch_tool_hook_v1"
+TOOL_HOOK_SOURCE_SCHEMAS = {
+    "pi": ("agentwatch_pi_hook_v1", "agent_settled"),
+    "opencode": ("agentwatch_opencode_hook_v1", "session.idle"),
+}
+MIN_PI_EXTENSION_VERSION = (0, 80, 4)
+MIN_OPENCODE_PLUGIN_VERSION = (1, 15, 11)
 SERVICE_STATE_TIMEOUT_SECONDS = 8.0
 SERVICE_STATE_POLL_SECONDS = 0.2
 # AgentWatch relies on the complete modern Stop payload contract. Exec-form
@@ -382,6 +409,172 @@ def ingest_claude_hook_event(
     }
     _append_private_jsonl(events_path or claude_hook_events_path(), record)
     return True
+
+
+def _tool_hook_events_dir(paths: "InstallPaths | None" = None) -> Path:
+    root = paths.config if paths is not None else config_dir()
+    return root / TOOL_HOOK_EVENTS_DIR_NAME
+
+
+def _tool_hook_payload_string(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    limit: int,
+    required: bool = False,
+) -> str:
+    value = payload.get(key, "")
+    if not isinstance(value, str) or len(value) > limit:
+        raise AgentWatchError("invalid tool hook input")
+    normalized = value.strip() if key != "message" else value
+    if required and not normalized:
+        raise AgentWatchError("invalid tool hook input")
+    return normalized
+
+
+def _valid_tool_hook_timestamp(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            return False
+        if timestamp > 10_000_000_000_000:
+            timestamp /= 1_000_000
+        elif timestamp > 10_000_000_000:
+            timestamp /= 1_000
+        try:
+            dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return False
+        return True
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text or len(text) > 80:
+        return False
+    if text.isdigit():
+        return _valid_tool_hook_timestamp(int(text))
+    try:
+        dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def _write_private_tool_event(events_dir: Path, record: dict[str, Any]) -> Path:
+    events_dir = Path(os.path.abspath(events_dir))
+    if path_has_link_component(events_dir):
+        raise AgentWatchError("tool hook events directory must not contain a symlink or junction")
+    events_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = events_dir.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise AgentWatchError("tool hook events path must be a directory")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise AgentWatchError("tool hook events directory must be owned by the current user")
+    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise AgentWatchError("tool hook events directory must be private (0700)")
+
+    identity = hashlib.sha256(
+        f"{record['source']}\0{record['session_id']}\0{record['event_id']}".encode("utf-8")
+    ).hexdigest()[:16]
+    file_name = f"{time.time_ns()}-{record['source']}-{identity}-{secrets.token_hex(4)}.json"
+    destination = events_dir / file_name
+    temporary = events_dir / f".{file_name}.{secrets.token_hex(4)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # The watcher only discovers *.json. Publishing via an atomic rename
+        # means it can never observe a half-written record.
+        os.replace(temporary, destination)
+        if os.name != "nt":
+            directory_descriptor = os.open(events_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return destination
+
+
+def ingest_tool_hook_event(source: str, events_dir: Path | None = None) -> Path:
+    expected = TOOL_HOOK_SOURCE_SCHEMAS.get(source)
+    if expected is None:
+        raise AgentWatchError("invalid tool hook source")
+    raw = sys.stdin.buffer.read(TOOL_HOOK_INPUT_LIMIT_BYTES + 1)
+    if not raw or len(raw) > TOOL_HOOK_INPUT_LIMIT_BYTES:
+        raise AgentWatchError("invalid tool hook input")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise AgentWatchError("invalid tool hook input") from exc
+    if not isinstance(payload, dict):
+        raise AgentWatchError("invalid tool hook input")
+    allowed = {
+        "schema",
+        "event_name",
+        "session_id",
+        "event_id",
+        "timestamp",
+        "cwd",
+        "parent_session",
+        "outcome",
+        "stop_reason",
+        "message",
+    }
+    if set(payload) != allowed:
+        raise AgentWatchError("invalid tool hook input")
+    expected_schema, expected_event = expected
+    if payload.get("schema") != expected_schema or payload.get("event_name") != expected_event:
+        raise AgentWatchError("invalid tool hook input")
+
+    session_id = _tool_hook_payload_string(payload, "session_id", limit=256, required=True)
+    event_id = _tool_hook_payload_string(payload, "event_id", limit=256, required=True)
+    cwd = _tool_hook_payload_string(payload, "cwd", limit=4096, required=True)
+    parent_session = _tool_hook_payload_string(payload, "parent_session", limit=4096)
+    stop_reason = _tool_hook_payload_string(payload, "stop_reason", limit=128)
+    message = _tool_hook_payload_string(
+        payload,
+        "message",
+        limit=TOOL_HOOK_MESSAGE_LIMIT_CHARS,
+    )
+    outcome = payload.get("outcome")
+    if outcome not in {"completed", "error", "cancelled"}:
+        raise AgentWatchError("invalid tool hook input")
+    timestamp = payload.get("timestamp")
+    if not _valid_tool_hook_timestamp(timestamp):
+        raise AgentWatchError("invalid tool hook input")
+
+    record = {
+        "schema": TOOL_HOOK_SCHEMA,
+        "source": source,
+        "event_name": expected_event,
+        "session_id": session_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "cwd": cwd,
+        "parent_session": parent_session,
+        "outcome": outcome,
+        "stop_reason": stop_reason,
+        "message": message,
+        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "received_at": int(time.time()),
+    }
+    return _write_private_tool_event(events_dir or _tool_hook_events_dir(), record)
 
 
 class ServiceManager:
@@ -1307,6 +1500,424 @@ def _installed_claude_hook_status(paths: InstallPaths) -> dict[str, Any]:
     return status
 
 
+def _persistent_flag(values: dict[str, str], name: str, default: bool = True) -> bool:
+    raw = values.get(name, "").strip()
+    if not raw:
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}
+
+
+def _semver_cli_status(command: str, minimum: tuple[int, int, int]) -> dict[str, Any]:
+    executable = shutil.which(command)
+    minimum_text = ".".join(str(part) for part in minimum)
+    result: dict[str, Any] = {
+        "cli_detected": executable is not None,
+        "cli_path": executable,
+        "cli_version": None,
+        "minimum_cli_version": minimum_text,
+        "cli_compatible": False,
+    }
+    if executable is None:
+        return result
+    try:
+        completed = _run([executable, "--version"], timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        result["cli_version_error"] = str(exc)
+        return result
+    rendered = f"{completed.stdout}\n{completed.stderr}".strip()
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", rendered)
+    if completed.returncode != 0 or match is None:
+        result["cli_version_error"] = f"could not parse {command} --version"
+        return result
+    version = tuple(int(part) for part in match.groups())
+    result["cli_version"] = ".".join(str(part) for part in version)
+    result["cli_compatible"] = version >= minimum
+    return result
+
+
+def _tool_hook_registration_path(paths: InstallPaths) -> Path:
+    return paths.config / INTEGRATION_REGISTRATION_FILE_NAME
+
+
+TOOL_HOOK_REGISTRATION_VERSION = 2
+TOOL_HOOK_MANAGED_IDS = {
+    "pi": "agentwatch-pi-extension-v1",
+    "opencode": "agentwatch-opencode-plugin-v1",
+}
+TOOL_HOOK_EXPECTED_NAMES = {
+    "pi": "agentwatch-notifications.ts",
+    "opencode": "agentwatch-notifications.js",
+}
+
+
+def _valid_sha256_or_empty(value: Any) -> bool:
+    return isinstance(value, str) and (
+        value == ""
+        or (len(value) == 64 and all(character in "0123456789abcdef" for character in value))
+    )
+
+
+def _load_tool_hook_registration(paths: InstallPaths) -> dict[str, dict[str, str]]:
+    path = _tool_hook_registration_path(paths)
+    if not os.path.lexists(path):
+        return {}
+    reject_symlink_path(path, paths.config.parent)
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise AgentWatchError("tool hook registration must be a regular file")
+    if metadata.st_size > 64 * 1024:
+        raise AgentWatchError("tool hook registration is unexpectedly large")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise AgentWatchError("tool hook registration must be owned by the current user")
+    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise AgentWatchError("tool hook registration must be private (0600)")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AgentWatchError("tool hook registration is not valid UTF-8 JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"version", "integrations"}
+        or payload.get("version") != TOOL_HOOK_REGISTRATION_VERSION
+        or not isinstance(payload.get("integrations"), dict)
+    ):
+        raise AgentWatchError("tool hook registration has an unsupported format")
+    integrations = payload["integrations"]
+    if any(source not in TOOL_HOOK_EXPECTED_NAMES for source in integrations):
+        raise AgentWatchError("tool hook registration contains an unknown integration")
+    result: dict[str, dict[str, str]] = {}
+    for source, raw in integrations.items():
+        if not isinstance(raw, dict) or set(raw) != {
+            "managed_id",
+            "path",
+            "installed_sha256",
+            "pending_sha256",
+        }:
+            raise AgentWatchError("tool hook registration contains an invalid entry")
+        if raw.get("managed_id") != TOOL_HOOK_MANAGED_IDS[source]:
+            raise AgentWatchError("tool hook registration contains an invalid managed ID")
+        raw_path = raw.get("path")
+        if not isinstance(raw_path, str) or len(raw_path) > 4096:
+            raise AgentWatchError("tool hook registration contains an invalid path")
+        candidate = Path(raw_path)
+        if not candidate.is_absolute() or candidate.name != TOOL_HOOK_EXPECTED_NAMES[source]:
+            raise AgentWatchError("tool hook registration contains an invalid path")
+        installed = raw.get("installed_sha256")
+        pending = raw.get("pending_sha256")
+        if not _valid_sha256_or_empty(installed) or not _valid_sha256_or_empty(pending):
+            raise AgentWatchError("tool hook registration contains an invalid digest")
+        if not installed and not pending:
+            raise AgentWatchError("tool hook registration contains no ownership digest")
+        result[source] = {
+            "managed_id": TOOL_HOOK_MANAGED_IDS[source],
+            "path": str(Path(os.path.abspath(candidate))),
+            "installed_sha256": installed,
+            "pending_sha256": pending,
+        }
+    return result
+
+
+def _save_tool_hook_registration(
+    paths: InstallPaths,
+    registered: dict[str, dict[str, str]],
+) -> None:
+    path = _tool_hook_registration_path(paths)
+    reject_symlink_path(path, paths.config.parent)
+    if not registered:
+        _remove_tool_hook_registration(paths)
+        return
+    payload: dict[str, Any] = {
+        "version": TOOL_HOOK_REGISTRATION_VERSION,
+        "integrations": {source: registered[source] for source in sorted(registered)},
+    }
+    atomic_write(
+        path,
+        (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+
+
+def _remove_tool_hook_registration(paths: InstallPaths) -> None:
+    path = _tool_hook_registration_path(paths)
+    if not os.path.lexists(path):
+        return
+    # Parse and validate ownership/mode before unlinking. A same-named foreign
+    # file must never be treated as AgentWatch registration state.
+    _load_tool_hook_registration(paths)
+    path.unlink()
+
+
+def _tool_hook_entry_path(entry: dict[str, str]) -> Path:
+    return Path(entry["path"])
+
+
+def _tool_hook_entry_hashes(entry: dict[str, str], *, allow_absent: bool = True) -> set[str]:
+    accepted = {
+        digest
+        for digest in (entry.get("installed_sha256", ""), entry.get("pending_sha256", ""))
+        if digest
+    }
+    if allow_absent:
+        accepted.add("")
+    return accepted
+
+
+def _tool_hook_content_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _tool_hook_cleanup_targets(paths: InstallPaths) -> dict[str, dict[str, Any]]:
+    events_dir = _tool_hook_events_dir(paths)
+    path_environment = dict(_config_values(paths))
+    path_environment.update(os.environ)
+    return {
+        "pi": {
+            "path": pi_extension_path(paths.home, path_environment),
+            "marker": PI_MANAGED_MARKER,
+            "content": build_pi_extension(sys.executable, paths.runtime / "agentwatch.py", events_dir),
+        },
+        "opencode": {
+            "path": opencode_plugin_path(paths.home, path_environment),
+            "marker": OPENCODE_MANAGED_MARKER,
+            "content": build_opencode_plugin(sys.executable, paths.runtime / "agentwatch.py", events_dir),
+        },
+    }
+
+
+def _tool_hook_desired(paths: InstallPaths) -> dict[str, dict[str, Any]]:
+    values = _config_values(paths)
+    path_environment = dict(values)
+    path_environment.update(os.environ)
+    events_dir = _tool_hook_events_dir(paths)
+    pi_cli = _semver_cli_status("pi", MIN_PI_EXTENSION_VERSION)
+    opencode_cli = _semver_cli_status("opencode", MIN_OPENCODE_PLUGIN_VERSION)
+    pi_requested = _persistent_flag(values, "PI_WATCH_ENABLED", True)
+    opencode_requested = _persistent_flag(values, "OPENCODE_WATCH_ENABLED", True)
+    pi_eligible = not pi_cli["cli_detected"] or bool(pi_cli["cli_compatible"])
+    opencode_eligible = not opencode_cli["cli_detected"] or bool(opencode_cli["cli_compatible"])
+    pi_path = pi_extension_path(paths.home, path_environment)
+    opencode_path = opencode_plugin_path(paths.home, path_environment)
+    return {
+        "pi": {
+            "requested": pi_requested,
+            "enabled": pi_requested and pi_eligible,
+            "eligible": pi_eligible,
+            "path": pi_path,
+            "marker": PI_MANAGED_MARKER,
+            "content": build_pi_extension(sys.executable, paths.runtime / "agentwatch.py", events_dir),
+            "cli": pi_cli,
+        },
+        "opencode": {
+            "requested": opencode_requested,
+            "enabled": opencode_requested and opencode_eligible,
+            "eligible": opencode_eligible,
+            "path": opencode_path,
+            "marker": OPENCODE_MANAGED_MARKER,
+            "content": build_opencode_plugin(sys.executable, paths.runtime / "agentwatch.py", events_dir),
+            "cli": opencode_cli,
+        },
+    }
+
+
+def _preflight_installed_tool_hooks(paths: InstallPaths, *, enabled: bool | None = None) -> None:
+    registered = _load_tool_hook_registration(paths)
+    if enabled is False:
+        desired = _tool_hook_cleanup_targets(paths)
+        for source, entry in registered.items():
+            preflight_managed_integration(
+                _tool_hook_entry_path(entry),
+                desired[source]["marker"],
+                accepted_sha256=_tool_hook_entry_hashes(entry),
+            )
+        # An unregistered AgentWatch-named integration may still point to this
+        # runtime. Refuse to delete the runtime, but never adopt or delete the
+        # unregistered file.
+        for source, details in desired.items():
+            entry = registered.get(source)
+            if entry is not None and _tool_hook_entry_path(entry) == details["path"]:
+                continue
+            if os.path.lexists(details["path"]):
+                raise AgentWatchError(
+                    f"unregistered integration blocks safe uninstall: {details['path']}"
+                )
+        return
+
+    desired = _tool_hook_desired(paths)
+    for source, details in desired.items():
+        current_path = details["path"]
+        marker = details["marker"]
+        entry = registered.get(source)
+        if entry is not None:
+            preflight_managed_integration(
+                _tool_hook_entry_path(entry),
+                marker,
+                accepted_sha256=_tool_hook_entry_hashes(entry),
+            )
+        if not details["requested"] or not details["eligible"]:
+            continue
+        if entry is None or _tool_hook_entry_path(entry) != current_path:
+            preflight_managed_integration(current_path, marker, accepted_sha256={""})
+
+
+def _configure_installed_tool_hooks(paths: InstallPaths, *, enabled: bool | None = None) -> bool:
+    registered = _load_tool_hook_registration(paths)
+    if enabled is False:
+        desired = _tool_hook_cleanup_targets(paths)
+        _preflight_installed_tool_hooks(paths, enabled=False)
+        changed = False
+        for source, entry in list(registered.items()):
+            changed = configure_managed_integration(
+                _tool_hook_entry_path(entry),
+                desired[source]["marker"],
+                desired[source]["content"],
+                enabled=False,
+                accepted_sha256=_tool_hook_entry_hashes(entry),
+            ) or changed
+            registered.pop(source, None)
+            _save_tool_hook_registration(paths, registered)
+        return changed
+
+    desired = _tool_hook_desired(paths)
+    changed = False
+    for source, details in desired.items():
+        current_path = details["path"]
+        marker = details["marker"]
+        content = details["content"]
+        desired_hash = _tool_hook_content_sha256(content)
+        entry = registered.get(source)
+
+        if not details["requested"]:
+            if entry is None:
+                continue
+            changed = configure_managed_integration(
+                _tool_hook_entry_path(entry),
+                marker,
+                content,
+                enabled=False,
+                accepted_sha256=_tool_hook_entry_hashes(entry),
+            ) or changed
+            registered.pop(source, None)
+            _save_tool_hook_registration(paths, registered)
+            continue
+
+        # A temporary version-probe failure or an explicitly old CLI does not
+        # delete a previously registered integration. Status/doctor reports
+        # incompatibility while the user's file remains untouched.
+        if not details["eligible"]:
+            continue
+
+        if entry is not None:
+            old_path = _tool_hook_entry_path(entry)
+            current_digest = managed_integration_sha256(old_path, marker)
+            pending_digest = entry.get("pending_sha256", "")
+            if pending_digest and current_digest == pending_digest:
+                entry = dict(entry)
+                entry["installed_sha256"] = pending_digest
+                entry["pending_sha256"] = ""
+                registered[source] = entry
+                _save_tool_hook_registration(paths, registered)
+            if old_path != current_path:
+                changed = configure_managed_integration(
+                    old_path,
+                    marker,
+                    content,
+                    enabled=False,
+                    accepted_sha256=_tool_hook_entry_hashes(entry),
+                ) or changed
+                registered.pop(source, None)
+                _save_tool_hook_registration(paths, registered)
+                entry = None
+
+        if entry is None:
+            entry = {
+                "managed_id": TOOL_HOOK_MANAGED_IDS[source],
+                "path": str(current_path),
+                "installed_sha256": "",
+                "pending_sha256": desired_hash,
+            }
+            registered[source] = entry
+            _save_tool_hook_registration(paths, registered)
+            accepted_hashes = {""}
+        else:
+            accepted_hashes = _tool_hook_entry_hashes(entry)
+            entry = dict(entry)
+            entry["pending_sha256"] = desired_hash
+            registered[source] = entry
+            _save_tool_hook_registration(paths, registered)
+
+        changed = configure_managed_integration(
+            current_path,
+            marker,
+            content,
+            enabled=True,
+            accepted_sha256=accepted_hashes,
+        ) or changed
+        entry = dict(registered[source])
+        entry["installed_sha256"] = desired_hash
+        entry["pending_sha256"] = ""
+        registered[source] = entry
+        _save_tool_hook_registration(paths, registered)
+    return changed
+
+
+def _installed_tool_hook_status(paths: InstallPaths) -> dict[str, Any]:
+    desired = _tool_hook_desired(paths)
+    try:
+        registered = _load_tool_hook_registration(paths)
+        registration_error = None
+    except AgentWatchError as exc:
+        registered = {}
+        registration_error = str(exc)
+    result: dict[str, Any] = {
+        "events_dir": str(_tool_hook_events_dir(paths)),
+        "registration_error": registration_error,
+    }
+    for source, details in desired.items():
+        status = inspect_managed_integration(
+            details["path"],
+            details["marker"],
+            details["content"],
+        )
+        status.update(details["cli"])
+        status["enabled"] = bool(details["requested"])
+        status["eligible"] = bool(details["eligible"])
+        entry = registered.get(source)
+        registered_path = _tool_hook_entry_path(entry) if entry is not None else None
+        status["registered_path"] = str(registered_path) if registered_path else None
+        registration_matches = False
+        if entry is not None and registered_path == details["path"] and status["path_safe"]:
+            try:
+                digest = managed_integration_sha256(details["path"], details["marker"])
+                registration_matches = bool(
+                    digest and digest in _tool_hook_entry_hashes(entry, allow_absent=False)
+                )
+            except AgentWatchError:
+                registration_matches = False
+        status["registered"] = registration_matches
+        status["needs_reconcile"] = bool(
+            status["enabled"]
+            and status["eligible"]
+            and (
+                not registration_matches
+                or not status["configured"]
+                or not status["current"]
+                or bool(entry and entry.get("pending_sha256"))
+            )
+        )
+        status["active"] = bool(
+            status["enabled"]
+            and status["eligible"]
+            and status["configured"]
+            and status["current"]
+            and status["path_safe"]
+            and registration_matches
+            and not status["needs_reconcile"]
+            and registration_error is None
+        )
+        result[source] = status
+    return result
+
+
 def _delivery_snapshot(
     paths: InstallPaths,
     *,
@@ -1375,6 +1986,7 @@ def _status(paths: InstallPaths, service: ServiceManager) -> dict[str, Any]:
         "legacy_ntfy_keys": legacy_keys,
         "launcher": str(paths.launcher),
         "claude_hook": _installed_claude_hook_status(paths),
+        "tool_hooks": _installed_tool_hook_status(paths),
     }
     result.update(delivery)
     result["login_required"] = bool(
@@ -1505,6 +2117,27 @@ def _human_status(result: dict[str, Any]) -> None:
     else:
         claude_state = "未配置"
     print(f"Claude Code Hook：{claude_state}")
+    tool_hooks = result.get("tool_hooks") or {}
+    for source, label in (("pi", "Pi Agent 扩展"), ("opencode", "OpenCode 插件")):
+        integration = tool_hooks.get(source) or {}
+        if not integration.get("enabled"):
+            state = "已关闭"
+        elif integration.get("active") and integration.get("cli_detected"):
+            state = "已配置并可用"
+        elif integration.get("active"):
+            state = "已预配置（尚未检测到程序）"
+        elif integration.get("needs_reconcile"):
+            state = "配置目录已变化，请运行 agentwatch update"
+        elif integration.get("cli_detected") and not integration.get("cli_compatible"):
+            state = (
+                f"版本不兼容（当前 {integration.get('cli_version') or '无法识别'}，"
+                f"需要 >= {integration.get('minimum_cli_version')}）"
+            )
+        elif integration.get("configured"):
+            state = "已配置但需要修复"
+        else:
+            state = "未配置"
+        print(f"{label}：{state}")
     effective = ", ".join(result.get("effective_channels") or []) or "无"
     print(f"当前可用通道：{effective}")
     if result.get("degraded"):
@@ -1558,6 +2191,10 @@ def build_parser() -> argparse.ArgumentParser:
     claude_hook = command("claude-hook", argparse.SUPPRESS)
     claude_hook.add_argument("--events-file", help=argparse.SUPPRESS)
     claude_hook.add_argument("--managed-hook-id", help=argparse.SUPPRESS)
+    tool_hook = command("tool-hook", argparse.SUPPRESS)
+    tool_hook.add_argument("--source", choices=tuple(TOOL_HOOK_SOURCE_SCHEMAS), required=True)
+    tool_hook.add_argument("--events-dir", help=argparse.SUPPRESS)
+    tool_hook.add_argument("--require-persist", action="store_true", help=argparse.SUPPRESS)
     command("uninstall", "Remove the background service and installed runtime; keep account data.")
     return parser
 
@@ -1590,6 +2227,18 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001 - notification persistence must never block Claude.
             pass
         return 0
+    if args.command == "tool-hook":
+        # Tool integrations must never block the source application. Invalid
+        # input and local persistence failures are intentionally silent.
+        try:
+            explicit_dir = None
+            if args.events_dir:
+                expanded = Path(os.path.expandvars(os.path.expanduser(args.events_dir)))
+                explicit_dir = Path(os.path.abspath(expanded))
+            ingest_tool_hook_event(args.source, explicit_dir)
+        except Exception:  # noqa: BLE001 - notification persistence is best effort here.
+            return 1 if args.require_persist else 0
+        return 0
     paths = InstallPaths()
     service = ServiceManager(paths)
     json_output = bool(args.json)
@@ -1603,10 +2252,12 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 selected_delivery = _prompt_delivery_mode()
             _preflight_installed_claude_hooks(paths)
+            _preflight_installed_tool_hooks(paths)
             install_runtime(paths)
             load_or_create_machine(paths.config)
             save_delivery_mode(selected_delivery, paths.config)
             _configure_installed_claude_hooks(paths)
+            _configure_installed_tool_hooks(paths)
             result = _status(paths, service)
             service.install(should_start=result["operational"])
             result = _status(paths, service)
@@ -1654,6 +2305,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             result = _status(paths, service)
             claude_hook = result["claude_hook"]
+            tool_hooks = result["tool_hooks"]
             checks = {
                 "runtime_files": all((paths.runtime / filename).exists() for filename in RUNTIME_FILES[:-1]),
                 "delivery_mode_selected": result["delivery_mode"] is not None,
@@ -1685,7 +2337,27 @@ def main(argv: list[str] | None = None) -> int:
                     or not claude_hook.get("cli_detected")
                     or claude_hook.get("cli_compatible")
                 ),
+                "tool_hook_registration_valid": not tool_hooks.get("registration_error"),
             }
+            for source in ("pi", "opencode"):
+                integration = tool_hooks[source]
+                checks[f"{source}_integration_configured"] = bool(
+                    not integration["enabled"] or integration["configured"]
+                )
+                checks[f"{source}_integration_current"] = bool(
+                    not integration["enabled"] or integration["current"]
+                )
+                checks[f"{source}_integration_path_safe"] = bool(
+                    not integration["enabled"] or integration["path_safe"]
+                )
+                checks[f"{source}_integration_scope_current"] = not integration.get(
+                    "needs_reconcile", False
+                )
+                checks[f"{source}_cli_compatible"] = bool(
+                    not integration["enabled"]
+                    or not integration["cli_detected"]
+                    or integration["cli_compatible"]
+                )
             mode = result["delivery_mode"]
             if mode in {"bark", "both"}:
                 checks["bark_configured"] = result["bark_configured"]
@@ -1708,20 +2380,21 @@ def main(argv: list[str] | None = None) -> int:
                 result.get("authenticated")
             )
             result["checks"] = checks
-            result["ok"] = bool(
-                checks["runtime_files"]
-                and checks["delivery_mode_selected"]
-                and checks["service_installed"]
-                and checks["service_running"]
-                and checks["claude_hook_configured"]
-                and checks["claude_hook_registration_valid"]
-                and checks["claude_hook_scope_current"]
-                and checks["claude_hook_policy_active"]
-                and checks["claude_hook_active"]
-                and checks["claude_events_path_safe"]
-                and checks["claude_cli_compatible"]
-                and result["operational"]
-            )
+            # Channel-specific and CLI-presence checks are diagnostic. In
+            # `both` mode one healthy receiver is intentionally operational
+            # while the other may remain pending; tools may also be safely
+            # preconfigured before their CLI is installed.
+            diagnostic_only = {
+                "legacy_ntfy_ignored",
+                "bark_configured",
+                "agentwatch_authenticated",
+                "server_reachable",
+                "claude_cli_detected",
+            }
+            required_checks = [
+                value for name, value in checks.items() if name not in diagnostic_only
+            ]
+            result["ok"] = bool(all(required_checks) and result["operational"])
             if json_output:
                 _emit(result, True)
             else:
@@ -1734,10 +2407,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "update":
             _preflight_installed_claude_hooks(paths)
+            _preflight_installed_tool_hooks(paths)
             install_runtime(paths)
             load_or_create_machine(paths.config)
             _delivery_snapshot(paths, mutating=True)
             _configure_installed_claude_hooks(paths)
+            _configure_installed_tool_hooks(paths)
             before = _status(paths, service)
             service.install(should_start=before["operational"])
             result = _status(paths, service)
@@ -1827,6 +2502,11 @@ def main(argv: list[str] | None = None) -> int:
                 _configure_installed_claude_hooks(paths, enabled=False)
             except (AgentWatchError, OSError) as exc:
                 hook_cleanup_error = str(exc)
+            tool_hook_cleanup_error: str | None = None
+            try:
+                _configure_installed_tool_hooks(paths, enabled=False)
+            except (AgentWatchError, OSError) as exc:
+                tool_hook_cleanup_error = str(exc)
             service_cleanup_error: str | None = None
             try:
                 service.uninstall()
@@ -1836,6 +2516,8 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup_errors = {"service": service_cleanup_error}
                 if hook_cleanup_error is not None:
                     cleanup_errors["claude_hook"] = hook_cleanup_error
+                if tool_hook_cleanup_error is not None:
+                    cleanup_errors["tool_hooks"] = tool_hook_cleanup_error
                 result = {
                     "ok": False,
                     "error": "service_cleanup_failed",
@@ -1844,6 +2526,7 @@ def main(argv: list[str] | None = None) -> int:
                     "runtime_preserved": True,
                     "credentials_preserved": True,
                     "claude_hook_cleanup_failed": hook_cleanup_error is not None,
+                    "tool_hook_cleanup_failed": tool_hook_cleanup_error is not None,
                     "message": (
                         "AgentWatch 后台服务未能确认移除；为避免仍在运行的服务或残留 Hook "
                         "指向不存在的程序，运行时和命令入口已保留。请修复后台服务状态后"
@@ -1854,20 +2537,28 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 _emit(result, json_output)
                 return 1
-            if hook_cleanup_error is not None:
+            if hook_cleanup_error is not None or tool_hook_cleanup_error is not None:
+                cleanup_errors = {}
+                if hook_cleanup_error is not None:
+                    cleanup_errors["claude_hook"] = hook_cleanup_error
+                if tool_hook_cleanup_error is not None:
+                    cleanup_errors["tool_hooks"] = tool_hook_cleanup_error
                 result = {
                     "ok": False,
-                    "error": "claude_hook_cleanup_failed",
+                    "error": "integration_cleanup_failed",
                     "partial": True,
                     "service_removed": True,
                     "runtime_preserved": True,
                     "credentials_preserved": True,
+                    "claude_hook_cleanup_failed": hook_cleanup_error is not None,
+                    "tool_hook_cleanup_failed": tool_hook_cleanup_error is not None,
                     "message": (
-                        "AgentWatch 后台服务已移除，但 Claude settings 无法安全修改；"
-                        "为避免残留 Hook 指向不存在的程序，运行时和命令入口已保留。"
-                        "请修复 Claude settings 后重新运行 agentwatch uninstall。"
+                        "AgentWatch 后台服务已移除，但至少一个 AI 工具集成无法安全清理；"
+                        "为避免残留集成指向不存在的程序，运行时和命令入口已保留。"
+                        "请修复对应配置后重新运行 agentwatch uninstall。"
                     ),
-                    "detail": hook_cleanup_error,
+                    "detail": next(iter(cleanup_errors.values())),
+                    "cleanup_errors": cleanup_errors,
                 }
                 _emit(result, json_output)
                 return 1
@@ -1890,7 +2581,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             result = {
                 "ok": True,
-                "message": "AgentWatch 后台服务、Claude Hook 和程序已卸载；本机账号 token 与历史状态已保留",
+                "message": "AgentWatch 后台服务、Claude/Pi/OpenCode 集成和程序已卸载；本机账号 token 与历史状态已保留",
                 "credentials_preserved": True,
             }
             _emit(result, json_output)

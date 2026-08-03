@@ -2,7 +2,7 @@
 
 This folder contains a Bark/AgentWatch notifier for local AI coding agents.
 
-Goal: when a local Codex, ZCode, Kimi Code, Grok Build, or Claude Code task completes, stops, needs attention, or aborts, send a push only to the user's own devices. Bark is optional for iPhone and Apple Watch. Android uses the custom AgentWatch app over an account-isolated self-hosted WebSocket.
+Goal: when a local Codex, ZCode, Kimi Code, Grok Build, Claude Code, Pi Agent, or OpenCode task completes, stops, needs attention, or aborts, send a push only to the user's own devices. Bark is optional for iPhone and Apple Watch. Android uses the custom AgentWatch app over an account-isolated self-hosted WebSocket.
 
 ## Desktop Delivery Modes
 
@@ -41,8 +41,10 @@ For coworkers, publish three release artifacts and ask them to download the one 
 - `agentwatch.py`: cross-platform install/login/status/doctor/update/logout/uninstall CLI. `install --delivery` selects `bark`, `agentwatch`, or `both`.
 - `agentwatch_core.py`: stable computer identity, OS credential storage, and strict private publish client.
 - `claude_hook_config.py`: safe, idempotent Claude user-settings merge/status/removal logic.
+- `tool_hook_config.py`: safe, idempotent Pi extension and OpenCode plugin installation/status/removal logic.
 - `codex_watch_notifier.py`: Python monitor. Uses only the Python standard library.
 - `agentwatch.py` also exposes the internal Claude hook handler. It validates stdin JSON and appends only a safe subset to a private local spool; it never performs network delivery in the Claude process.
+- `agentwatch.py` also exposes an internal Pi/OpenCode hook ingestor. It accepts an exact schema over stdin and atomically publishes one private queue file; source processes never perform notification network delivery.
 - `codex-watch-notifier.zsh`: wrapper that loads `~/.codex-watch-notifier/env`.
 - `install_launch_agent.zsh`: installs runtime copies into `~/.codex-watch-notifier/bin` and starts a user LaunchAgent.
 - `uninstall_launch_agent.zsh`: stops/removes the LaunchAgent.
@@ -58,6 +60,9 @@ For coworkers, publish three release artifacts and ask them to download the one 
 - Claude's spool defaults to `~/.codex-watch-notifier/claude-hook-events.jsonl`. A custom `CLAUDE_WATCH_EVENTS_FILE` must be a dedicated, private path registered by AgentWatch; it must never reuse or take ownership of another data file. Fully consumed live data rotates at the earlier of the 4 MiB soft capacity limit (`CLAUDE_WATCH_SPOOL_MAX_BYTES=4194304`) or the 24-hour privacy TTL (`CLAUDE_WATCH_SPOOL_MAX_AGE_SECONDS=86400`); supported minimums are 64 KiB and one hour. Unread/retrying data is never truncated. Rotation renames the old inode into one watched drain and retires it only after it is consumed and stable through the 30-second append safety window. The packaged Claude icon is `assets/claude-icon-v1.png`; Android uses a dedicated Claude source icon, notification channel, and history category.
 - Desktop `status`/`doctor` are deliberately static and cannot enumerate every project, local, plugin, skill, agent, session, or remote-managed runtime scope. Final verification requires Claude Code's own `/status` for `Setting sources` and `/hooks` for the effective Hook list.
 - Claude's first `Stop` with `stop_hook_active=false` is provisional because all matching hooks run in parallel. The watcher leaves its durable offset unchanged for `CLAUDE_WATCH_STOP_SETTLE_SECONDS` (default 10 seconds, clamped to 5–600), performs no network work and consumes no delivery attempt, and read-only scans complete later spool lines. A fully validated true Stop with the same session/prompt/transcript, or a valid same-prompt `StopFailure`, suppresses the false record and is processed as the terminal candidate. Transcript growth is corroboration only: Claude writes transcripts asynchronously, so growth without a matching terminal record must not drop an ordinary final Stop. The 10-second default favors timely alerts and does not cover the official 30-second prompt-hook timeout; command/HTTP/MCP hooks default to 600 seconds and custom project/plugin/session/managed hooks can outlast the configured window. A blocker that finishes after the window can still produce an early provisional alert; choose 35 seconds or longer to reduce that risk, or 600 seconds for the strictest supported window, at the cost of equal delay for ordinary alerts.
+- Pi Agent 0.80.4+ uses the official global extension `agent_settled` event. Only persisted non-JSON interactive sessions are armed; JSON/no-session child runs stay silent, and forked/cloned sessions with `parentSession` are silent unless explicitly enabled.
+- OpenCode 1.15.11+ uses an import-free official global plugin and `session.idle`. It reads the current turn through the official client API, suppresses sessions with `Session.parentID`, and drains pending reads through the awaited `dispose` lifecycle so headless `opencode run` cannot exit ahead of local persistence.
+- Pi/OpenCode records use strict private filenames, owner/mode/schema/digest validation, and atomic publish. First enable baselines existing owned records at EOF; an older record waiting for its bounded retry blocks newer records from overtaking it. Foreign or malformed JSON files are ignored and never deleted.
 - Bark settings: the personal `BARK_URL` or `BARK_KEY` comes from the Bark iPhone home screen and must be stored privately on the computer. It is a Bark delivery credential, not AgentWatch pairing.
 - AgentWatch settings: Android users install the custom app and sign in there. `AGENTWATCH_API_BASE` is public metadata. Desktop `agentwatch login` uses a hidden password prompt once and stores only a per-computer token. `/publish` accepts no topic or user field. Legacy `NTFY_URL/NTFY_TOKEN` values are ignored to prevent duplicate shared-topic delivery.
 
@@ -69,7 +74,7 @@ Default rollout root:
 ~/.codex/sessions/**/rollout-*.jsonl
 ```
 
-On first background start, existing rollout files are baselined at EOF so old Codex history is not pushed. The Claude hook spool is also baselined at its current EOF on first enable, so records created before this watcher takes ownership are not replayed. New records are then polled every 2 seconds.
+On first background start, existing rollout files are baselined at EOF so old Codex history is not pushed. The Claude hook spool and owned Pi/OpenCode event queue are also baselined at their current EOF on first enable, so records created before this watcher takes ownership are not replayed. New records are then polled every 2 seconds.
 
 To avoid false pushes from Codex account/session tools such as Cockpit Tools, the monitor also:
 
@@ -86,6 +91,8 @@ Triggers:
 - Kimi Code `context.append_loop_event.event.type == "step.end"` with `finishReason == "end_turn"`
 - Grok Build `type == "turn_ended"` with `outcome` equal to `completed`, `error`, or `cancelled`
 - Claude Code official `Stop` and `StopFailure` hook payloads accepted by the local hook ingestor; `SubagentStop` is rejected and never configured
+- Pi Agent official `agent_settled` for a persisted root session
+- OpenCode official `session.idle` for a root session
 
 Claude's hook path is intentionally split: the hook only validates and appends to the private local spool, exits successfully, and emits no network traffic. The long-running watcher reads the spool and uses the same bounded delivery/de-duplication path as all other sources.
 
@@ -153,7 +160,7 @@ Choose `bark`, `agentwatch`, or `both` from the receiver device before running P
 
 The Windows package installs a scheduled task named `CodexWatchNotifier` and runs through a hidden PowerShell wrapper with stdout/stderr logs. AgentWatch authentication is required only for the `agentwatch` channel; Bark-only operation must not be gated on it. Task Scheduler state `Ready` means the task is registered and waiting, not that the watcher process is currently running; use `doctor --json` (`checks.service_running`) and the runtime log to diagnose actual execution.
 
-Across macOS, Ubuntu, and Windows, repeated install/update must be safe: merge the managed Claude hooks once, preserve unrelated `~/.claude/settings.json` content, never add `SubagentStop`, and never emit a notification as a side effect.
+Across macOS, Ubuntu, and Windows, repeated install/update must be safe: merge the managed Claude hooks and install only the marked Pi/OpenCode integration files once, preserve unrelated configuration, never add `SubagentStop`, and never emit a notification as a side effect.
 
 For AI-driven setup, follow `AI_INSTALL.md`: determine the receiver and delivery mode first, run the platform installer without secrets, then pause for only the relevant user-owned steps. The user privately configures the persistent Bark URL/key for `bark`; the user runs the hidden-prompt `agentwatch login` for `agentwatch`; `both` requires each independently. After Bark configuration, the AI runs `agentwatch update` and only then `agentwatch doctor --json`. Doctor is read-only: it does not start the watcher or test delivery.
 
@@ -167,6 +174,8 @@ Only when the user explicitly requests a source-specific end-to-end test, run ex
 ./codex-watch-notifier.zsh --test-kimi
 ./codex-watch-notifier.zsh --test-grok
 ./codex-watch-notifier.zsh --test-claude
+./codex-watch-notifier.zsh --test-pi
+./codex-watch-notifier.zsh --test-opencode
 ```
 
 Expected: the explicitly configured personal Bark client or logged-in Android AgentWatch account receives the selected source's test reminder. `--test-claude` is an explicit one-shot external test; it does not simulate a hook retry loop. These commands are manual and intentional and may run only when the user asks for a notification test; install, update, login, `doctor`, and packaging never invoke them automatically.
@@ -251,18 +260,18 @@ The long-running watcher and `--once`/`--replay-file` processing hold an OS-back
 ./uninstall_launch_agent.zsh
 ```
 
-This removes the background service and installed runtime. It must also remove only AgentWatch's own managed entries from Claude's `Stop` and `StopFailure` arrays; all other Claude hooks and settings remain untouched. Account credentials, config, logs, and watcher state remain for an idempotent reinstall; `agentwatch logout` revokes the current computer token first.
+This removes the background service and installed runtime. It must also remove only AgentWatch's own managed entries from Claude's `Stop` and `StopFailure` arrays and its registered, marked Pi/OpenCode integration files; all other settings and files remain untouched. Account credentials, config, logs, and watcher state remain for an idempotent reinstall; `agentwatch logout` revokes the current computer token first.
 
 ## Important Notes
 
 - Do not print, commit, or share the Bark URL, Bark key, computer token, account password, or authentication database. The self-hosted API base is intentionally public.
 - Do not put a Bark URL/key or AgentWatch password in AI chat or argv. iPhone/Apple Watch setup is Bark-only and is not AgentWatch account pairing.
 - Ask for or infer the receiver device before installation, then preserve the selected `bark`, `agentwatch`, or `both` semantics. In `both`, an unavailable AgentWatch login must not disable Bark.
-- Do not remove first-run EOF baselining for either discovered session files or the Claude hook spool; otherwise an update may replay old completion records.
+- Do not remove first-run EOF baselining for discovered session files, the Claude hook spool, or the Pi/OpenCode owned event queue; otherwise an update may replay old completion records.
 - Do not turn the Claude spool's 4 MiB/24-hour soft retention policy into a hard truncate. A live file may exceed either boundary while unread records, an active retry, or a drain exists; preserving those records takes precedence, and cleanup must continue to use rename plus drain.
 - Do not advance the Claude spool offset, create a delivery attempt, or call a notification channel while a false Stop is inside its settle window. Preserve the tail lookahead and full candidate validation; transcript growth by itself is never sufficient suppression evidence. Keep the 5–600 second clamp and document that blockers slower than the selected window remain an early-alert edge case.
 - Do not raise the hard two-attempt delivery cap or restore immediate retry loops; avoiding repeated phone alerts is a product requirement.
-- Do not put network work into a Claude hook, enable `SubagentStop`, replace existing `~/.claude/settings.json` hooks, or make uninstall remove entries it does not own.
+- Do not put network work into any in-tool hook/plugin, enable `SubagentStop`, replace existing tool configuration, or make uninstall remove entries/files it does not own.
 - Do not treat desktop `status`/`doctor` as proof that every Claude Hook scope is active. Verify the effective runtime configuration with both `/status` and `/hooks`, and keep custom spool paths dedicated, private, and explicitly registered by AgentWatch.
 - Every account must have its own random topic and least-privilege ACL. A computer token is write-only for its bound account and must never specify topic/user in a publish request.
 - Keep `CODEX_WATCH_MAX_EVENT_AGE_SECONDS` enabled unless you explicitly want old rewritten rollout history to be replayed.

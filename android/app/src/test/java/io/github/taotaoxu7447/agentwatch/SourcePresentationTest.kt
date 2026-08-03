@@ -23,4 +23,41 @@ class SourcePresentationTest {
             assertNotEquals(SourcePresentation.largeIcon(other), SourcePresentation.largeIcon(claude))
         }
     }
+
+    @Test
+    fun piAndOpenCodeUseDedicatedChannelsAndIcons() {
+        val expected = listOf(
+            NtfyMessage.Source.PI to Triple(
+                "event_pi_v1",
+                R.drawable.ic_notify_pi,
+                R.drawable.source_pi,
+            ),
+            NtfyMessage.Source.OPENCODE to Triple(
+                "event_opencode_v1",
+                R.drawable.ic_notify_opencode,
+                R.drawable.source_opencode,
+            ),
+        )
+
+        expected.forEach { (source, presentation) ->
+            assertEquals(presentation.first, SourcePresentation.channelId(source))
+            assertEquals(
+                presentation.first.removeSuffix("_v1") + "_recovery_v1",
+                SourcePresentation.recoveryChannelId(source),
+            )
+            assertEquals(presentation.second, SourcePresentation.smallIcon(source))
+            assertEquals(presentation.third, SourcePresentation.largeIcon(source))
+        }
+    }
+
+    @Test
+    fun piAndOpenCodePresentationsDoNotReuseAnyOtherSource() {
+        listOf(NtfyMessage.Source.PI, NtfyMessage.Source.OPENCODE).forEach { source ->
+            NtfyMessage.Source.entries.filter { it != source }.forEach { other ->
+                assertNotEquals(SourcePresentation.channelId(other), SourcePresentation.channelId(source))
+                assertNotEquals(SourcePresentation.smallIcon(other), SourcePresentation.smallIcon(source))
+                assertNotEquals(SourcePresentation.largeIcon(other), SourcePresentation.largeIcon(source))
+            }
+        }
+    }
 }

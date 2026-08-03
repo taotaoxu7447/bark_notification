@@ -27,6 +27,29 @@ class AgentWatchSourceProtocolTests(unittest.TestCase):
         self.assertEqual("claude", payload["source"])
         self.assertEqual("computer-token", post.call_args.kwargs["token"])
 
+    def test_publish_preserves_pi_and_opencode_as_allowed_sources(self) -> None:
+        api = agentwatch_core.AgentWatchApi("https://example.test/api/v1")
+
+        for source in ("pi", "opencode"):
+            with self.subTest(source=source), mock.patch.object(
+                api,
+                "_post",
+                return_value=(202, {"ok": True, "event_id": f"{source}-event-1"}),
+            ) as post:
+                response = api.publish(
+                    "computer-token",
+                    event_id=f"{source}-event-1",
+                    source=source,
+                    title=f"{source} complete",
+                    body=f"The {source} turn is complete.",
+                )
+
+            self.assertTrue(response["ok"])
+            path, payload = post.call_args.args
+            self.assertEqual("/publish", path)
+            self.assertEqual(source, payload["source"])
+            self.assertEqual("computer-token", post.call_args.kwargs["token"])
+
 
 if __name__ == "__main__":
     unittest.main()

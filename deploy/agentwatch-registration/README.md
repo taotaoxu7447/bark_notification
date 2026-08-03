@@ -54,7 +54,7 @@ Android/account endpoints:
 - `POST /computers/revoke`: `computer_id` plus App Bearer. Cross-account and
   unknown IDs both return `computer_not_found`.
 - `POST /test`: optional validated `source` (`codex`, `zcode`, `kimi`, `grok`,
-  `claude`, or `other`) plus App Bearer. Sends exactly one device-targeted v2
+  `claude`, `pi`, `opencode`, or `other`) plus App Bearer. Sends exactly one device-targeted v2
   test notification on the account's private topic.
 - `POST /ack`: App Bearer plus `event_id` (legacy `sequence_id` accepted).
   Delivery-only rows contain device, event ID, and server time and expire after

@@ -27,6 +27,7 @@ COMMON=(
   agentwatch.py
   agentwatch_core.py
   claude_hook_config.py
+  tool_hook_config.py
   codex_watch_notifier.py
   env.example
   README.md
@@ -39,6 +40,9 @@ COMMON=(
   assets/zcode-icon-v1.png
   assets/kimi-icon-v1.png
   assets/grok-icon-v1.png
+  assets/pi-icon-v1.png
+  assets/opencode-icon-v1.png
+  assets/README.md
 )
 
 make_pkg() {

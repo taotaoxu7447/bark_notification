@@ -301,6 +301,36 @@ class ApiTestCase(unittest.TestCase):
         envelope = json.loads(self.publisher.events[-1]["message"])
         self.assertEqual("claude", envelope["source"])
 
+    def test_pi_and_opencode_sources_are_allowed_for_test_and_publish(self) -> None:
+        credentials = self.register()
+        computer = self.computer_login()
+
+        self.assertTrue({"pi", "opencode"}.issubset(server.TEST_SOURCES))
+        for source in ("pi", "opencode"):
+            with self.subTest(endpoint="test", source=source):
+                status, response = self.request(
+                    "/test", {"source": source}, str(credentials["app_token"])
+                )
+                self.assertEqual(200, status)
+                self.assertTrue(response["ok"])
+                self.assertEqual(source, self.publisher.sources[-1])
+
+            with self.subTest(endpoint="publish", source=source):
+                payload = {
+                    "event_id": f"aw2_{source}_event-1",
+                    "source": source,
+                    "title": f"{source} complete",
+                    "body": f"The {source} turn is complete.",
+                }
+                status, response = self.request(
+                    "/publish", payload, str(computer["computer_token"])
+                )
+                self.assertEqual(202, status)
+                self.assertEqual(payload["event_id"], response["event_id"])
+                self.assertEqual(source, self.publisher.events[-1]["source"])
+                envelope = json.loads(self.publisher.events[-1]["message"])
+                self.assertEqual(source, envelope["source"])
+
     def test_logout_revokes_ntfy_tokens_then_deletes_device(self) -> None:
         credentials = self.register()
         app_token = str(credentials["app_token"])

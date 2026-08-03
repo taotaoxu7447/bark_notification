@@ -16,6 +16,8 @@ internal object SourcePresentation {
         NtfyMessage.Source.KIMI -> R.drawable.ic_notify_kimi
         NtfyMessage.Source.GROK -> R.drawable.ic_notify_grok
         NtfyMessage.Source.CLAUDE -> R.drawable.ic_notify_claude
+        NtfyMessage.Source.PI -> R.drawable.ic_notify_pi
+        NtfyMessage.Source.OPENCODE -> R.drawable.ic_notify_opencode
         NtfyMessage.Source.OTHER -> R.drawable.ic_notify_other
     }
 
@@ -25,6 +27,8 @@ internal object SourcePresentation {
         NtfyMessage.Source.KIMI -> R.drawable.source_kimi
         NtfyMessage.Source.GROK -> R.drawable.source_grok
         NtfyMessage.Source.CLAUDE -> R.drawable.source_claude
+        NtfyMessage.Source.PI -> R.drawable.source_pi
+        NtfyMessage.Source.OPENCODE -> R.drawable.source_opencode
         NtfyMessage.Source.OTHER -> null
     }
 }

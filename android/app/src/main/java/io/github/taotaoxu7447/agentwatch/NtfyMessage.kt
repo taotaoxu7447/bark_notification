@@ -36,6 +36,8 @@ data class NtfyMessage(
         KIMI("kimi", "Kimi Code"),
         GROK("grok", "Grok Build"),
         CLAUDE("claude", "Claude Code"),
+        PI("pi", "Pi Agent"),
+        OPENCODE("opencode", "OpenCode"),
         OTHER("other", "其他任务"),
     }
 
@@ -105,6 +107,8 @@ data class NtfyMessage(
                 normalized.startsWith("kimi") -> Source.KIMI
                 normalized.startsWith("grok") -> Source.GROK
                 normalized.startsWith("claude") -> Source.CLAUDE
+                normalized.startsWith("pi agent") -> Source.PI
+                normalized.startsWith("opencode") || normalized.startsWith("open code") -> Source.OPENCODE
                 else -> Source.OTHER
             }
         }

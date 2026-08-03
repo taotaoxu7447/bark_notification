@@ -23,7 +23,12 @@ class NtfyMessageTest {
     fun oldMessagesCanFallBackToTitle() {
         assertEquals(NtfyMessage.Source.GROK, NtfyMessage.inferSource(emptySet(), "Grok Build 已完成"))
         assertEquals(NtfyMessage.Source.CLAUDE, NtfyMessage.inferSource(emptySet(), "Claude Code 已完成"))
+        assertEquals(NtfyMessage.Source.PI, NtfyMessage.inferSource(emptySet(), "Pi Agent 已完成"))
+        assertEquals(NtfyMessage.Source.OPENCODE, NtfyMessage.inferSource(emptySet(), "OpenCode 已完成"))
+        assertEquals(NtfyMessage.Source.OPENCODE, NtfyMessage.inferSource(emptySet(), "Open Code needs attention"))
         assertEquals(NtfyMessage.Source.OTHER, NtfyMessage.inferSource(emptySet(), "任务已完成"))
+        assertEquals(NtfyMessage.Source.OTHER, NtfyMessage.inferSource(emptySet(), "OpenAI 任务已完成"))
+        assertEquals(NtfyMessage.Source.OTHER, NtfyMessage.inferSource(emptySet(), "Pipeline 已完成"))
     }
 
     @Test
@@ -34,6 +39,49 @@ class NtfyMessageTest {
         )
         assertEquals(NtfyMessage.Source.CLAUDE, NtfyMessage.sourceForKey("CLAUDE"))
         assertEquals("Claude Code", NtfyMessage.Source.CLAUDE.displayName)
+    }
+
+    @Test
+    fun piAndOpenCodeTagsAndStoredKeysUseIndependentHistoryCategories() {
+        assertEquals(
+            NtfyMessage.Source.PI,
+            NtfyMessage.inferSource(setOf("agentwatch_v2", "source_pi"), "任务已完成"),
+        )
+        assertEquals(
+            NtfyMessage.Source.OPENCODE,
+            NtfyMessage.inferSource(setOf("agentwatch_v2", "source_opencode"), "任务已完成"),
+        )
+        assertEquals(NtfyMessage.Source.PI, NtfyMessage.sourceForKey("PI"))
+        assertEquals(NtfyMessage.Source.OPENCODE, NtfyMessage.sourceForKey("OpenCode"))
+        assertEquals("Pi Agent", NtfyMessage.Source.PI.displayName)
+        assertEquals("OpenCode", NtfyMessage.Source.OPENCODE.displayName)
+    }
+
+    @Test
+    fun v2PiAndOpenCodeEnvelopesUseTheirDedicatedSources() {
+        listOf(
+            Triple("pi", "Pi Agent 已完成", NtfyMessage.Source.PI),
+            Triple("opencode", "OpenCode 已完成", NtfyMessage.Source.OPENCODE),
+        ).forEach { (source, title, expected) ->
+            val eventId = "aw2-$source-event"
+            val envelope = JSONObject()
+                .put("schema", "agentwatch_event_v2")
+                .put("event_id", eventId)
+                .put("source", source)
+                .put("title", title)
+                .put("body", "$title body")
+            val wire = JSONObject()
+                .put("id", "ntfy-$source")
+                .put("sequence_id", eventId)
+                .put("event", "message")
+                .put("topic", "aw-0123456789abcdef0123456789abcdef")
+                .put("message", envelope.toString())
+                .put("tags", org.json.JSONArray(listOf("agentwatch_v2", "source_$source")))
+
+            val parsed = requireNotNull(NtfyMessage.parse(wire.toString()))
+            assertEquals(expected, parsed.source)
+            assertEquals(title, parsed.title)
+        }
     }
 
     @Test

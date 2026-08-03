@@ -1,6 +1,6 @@
 # AgentWatch：AI 安装协议
 
-本文档供 Codex、Claude Code、Kimi、Grok 等 AI 安装代理读取。人类用户也可以使用完全相同的命令。桌面端没有常驻 GUI；安装前必须先根据接收设备选择 Bark、AgentWatch 或两者共存。
+本文档供 Codex、Claude Code、Kimi、Grok、Pi Agent、OpenCode 等 AI 安装代理读取。人类用户也可以使用完全相同的命令。桌面端没有常驻 GUI；安装前必须先根据接收设备选择 Bark、AgentWatch 或两者共存。
 
 ## 第一步必须确定接收设备
 
@@ -34,6 +34,8 @@ agentwatch install --delivery both
 - Claude hook 只能写入本机私有队列，不得在 Claude Code 进程里发 HTTP、Bark 或 WebSocket 请求。网络投递由已经安装的后台 watcher 统一完成。
 - `CLAUDE_WATCH_EVENTS_FILE` 留空时使用 AgentWatch 的默认私有队列。自定义路径必须是 AgentWatch 注册的专用文件，文件和父目录均须由当前用户持有并保持私有；不得复用已有日志、配置、状态或任何其他应用的数据文件，也不得使用符号链接、junction 或目录。
 - Claude Code 必须为 `2.1.196` 或更高版本。虽然官方 exec-form `args` 从 `2.1.139` 已可用，但本项目还依赖 `2.1.145` 加入的 `background_tasks` / `session_crons`，以及 `2.1.196` 加入、用于同一 prompt 主去重的 `prompt_id`。不要擅自替用户升级；若 `doctor` 报告版本不兼容，应说明最低版本并按用户授权处理。
+- Pi Agent 必须为 `0.80.4` 或更高版本，以使用官方 `agent_settled`。OpenCode 必须为 `1.15.11` 或更高版本，以使用官方全局插件的 `session.idle` 和可等待的 `dispose` 生命周期。两种集成都只能原子写入本机私有事件队列，不能在 AI 工具进程中联网。
+- 安装器只管理带 AgentWatch 标记的 Pi 扩展和 OpenCode 插件。发现同名外来文件、符号链接、非当前用户文件或损坏的注册记录时必须停止，不得覆盖；卸载也只删除已登记的 AgentWatch 文件。
 
 ## AI 自动安装流程
 
@@ -82,7 +84,7 @@ Windows PowerShell：
 
 只有与所选模式对应的必需条件满足后，才把该通道报告为就绪；`both` 可以是 Bark 已运行、Android 待登录的降级状态。
 
-重复执行安装是幂等操作：只修复同一个后台服务和运行文件，不创建第二个 watcher，不生成通知，也不改变已存在的账号绑定。每次安装或更新都会协调 Claude Code 官方 hooks：缺少时加入 AgentWatch 自己的 `Stop`、`StopFailure` 条目，已经存在时不重复添加，并原样保留其他程序和用户配置的 hooks。不会配置 `SubagentStop`。
+重复执行安装是幂等操作：只修复同一个后台服务和运行文件，不创建第二个 watcher，不生成通知，也不改变已存在的账号绑定。每次安装或更新都会协调 Claude Code、Pi Agent 和 OpenCode 的官方事件集成：Claude 条目缺少时加入 AgentWatch 自己的 `Stop`、`StopFailure`，Pi/OpenCode 只写入各自全局扩展目录中的 AgentWatch 管理文件；已有内容不重复写，并保留所有外来配置。不会配置 `SubagentStop`。
 
 ### 3. 暂停并交给用户完成对应密钥步骤
 
@@ -128,7 +130,7 @@ Windows PowerShell：
 & "$env:USERPROFILE\.local\bin\agentwatch.cmd" update
 ```
 
-不得跳过这一步直接运行 `doctor`：`doctor` 只读，不会替用户启动或重启服务，也不会发送测试通知。`update` 还会重新执行幂等的 Claude hook 协调，但不会把协调过程当成一次任务事件。
+不得跳过这一步直接运行 `doctor`：`doctor` 只读，不会替用户启动或重启服务，也不会发送测试通知。`update` 还会重新执行幂等的 Claude、Pi 和 OpenCode 集成协调，但不会把协调过程当成一次任务事件。
 
 ### 5. 用户确认相关私密步骤完成后再验收
 
@@ -156,7 +158,7 @@ Windows PowerShell：
 - `agentwatch`：要求 `authenticated` 和 `checks.server_reachable`。
 - `both`：分别报告两条通道；缺少 AgentWatch 登录时不得把已就绪的 Bark 报告为不可用。
 
-`doctor` 只做只读诊断，不会启动或重启后台服务，也不会发送通知。`bark`/`both` 必须先按上一步运行 `update`。若检测到旧版 `NTFY_URL` 或 `NTFY_TOKEN`，会报告 `legacy_ntfy_ignored=true`；v0.3.0 不会向旧共享 topic 双发。
+`doctor` 只做只读诊断，不会启动或重启后台服务，也不会发送通知。`bark`/`both` 必须先按上一步运行 `update`。若检测到旧版 `NTFY_URL` 或 `NTFY_TOKEN`，会报告 `legacy_ntfy_ignored=true`；v0.4.0 不会向旧共享 topic 双发。
 
 Windows 任务计划程序显示 `Ready` 只表示任务已注册并等待触发，不等于 watcher 正在运行。以 `checks.service_running` 和私有运行日志判断实际状态；`doctor` 不会为了让检查通过而启动任务。
 
@@ -169,25 +171,27 @@ Windows 任务计划程序显示 `Ready` 只表示任务已注册并等待触发
 # 或 --delivery agentwatch / --delivery both
 ```
 
-或使用当前系统对应的安装脚本。用户同样先选择接收设备和投递模式。Bark-only 不应提示 AgentWatch 账号；AgentWatch 模式才使用账号和隐藏密码；`both` 分别配置，且 Bark 不等待 Android 登录。`bark`/`both` 用户私下保存 Bark secret 后必须运行 `agentwatch update`，再运行 `doctor --json`。任何安装路径都会幂等协调 Claude `Stop`/`StopFailure` hooks，但不会自动发送测试通知。
+或使用当前系统对应的安装脚本。用户同样先选择接收设备和投递模式。Bark-only 不应提示 AgentWatch 账号；AgentWatch 模式才使用账号和隐藏密码；`both` 分别配置，且 Bark 不等待 Android 登录。`bark`/`both` 用户私下保存 Bark secret 后必须运行 `agentwatch update`，再运行 `doctor --json`。任何安装路径都会幂等协调 Claude、Pi 和 OpenCode 集成，但不会自动发送测试通知。
 
 ## 统一命令
 
 ```text
-agentwatch install    安装或幂等修复；使用 --delivery bark|agentwatch|both；合并自身 Claude hooks
+agentwatch install    安装或幂等修复；使用 --delivery bark|agentwatch|both；协调自身 AI 工具集成
 agentwatch login      使用账号和隐藏密码绑定当前电脑
 agentwatch status     查看安装、登录和后台服务状态
 agentwatch doctor     只读诊断，支持 --json
-agentwatch update     更新运行文件、幂等协调自身 Claude hooks，并按持久配置重新协调后台，保留 computer token
+agentwatch update     更新运行文件、幂等协调自身 AI 工具集成，并按持久配置重新协调后台，保留 computer token
 agentwatch logout     先在服务器撤销当前 token，再删除本机 token；已配置的 Bark 仍保持运行
-agentwatch uninstall  删除后台服务和运行文件，只移除自身 Claude hooks，默认保留凭据与状态
+agentwatch uninstall  删除后台服务和运行文件，只移除自身已登记集成，默认保留凭据与状态
 ```
 
 `logout` 在服务器成功撤销后才会删除本机 token；服务器返回 401 代表该 token 已经失效，也可以安全删除。网络或服务器失败时会保留本机 token，方便重试。在 `both` 模式下，退出 AgentWatch 只移除 Android 通道，已配置的 Bark 继续运行。对于已经丢失或无法操作的电脑，用户应在 Android App 的“设备”页面远程撤销。
 
 卸载时只能从 Claude 的 `Stop`、`StopFailure` 数组中移除由 AgentWatch 管理的精确条目。不得删除整个事件数组、其他工具的 hooks、用户自定义 hooks 或 Claude settings 中的任何其他设置。若 settings 无法解析，必须先移除后台服务但保留 Hook 指向的运行时，报告 `claude_hook_cleanup_failed` 部分失败，修复 settings 后再重试；绝不能留下指向已删除程序的 Hook。
 
-## Claude Code 事件与显式测试
+Pi/OpenCode 卸载同样只能删除注册记录指向、且带正确 AgentWatch 标记的管理文件。路径变化或文件被用户替换时必须报告 `tool_hook_cleanup_failed` 并保留运行时，不能猜测或扩大删除范围。
+
+## Claude Code、Pi Agent、OpenCode 事件与显式测试
 
 Claude Code 官方 hook 将 `Stop` 或 `StopFailure` 的 stdin JSON 交给本机处理器。处理器只校验并追加到权限受限的 `~/.codex-watch-notifier/claude-hook-events.jsonl`，随后立即成功退出；后台 watcher 才读取队列并访问外部通知通道。项目不使用 `SubagentStop`，因此 Claude 子智能体停止不会制造额外提醒。
 
@@ -203,7 +207,9 @@ Claude 官方会并行运行所有匹配的 hooks；一个 `stop_hook_active=fal
 
 Claude live 队列中的已消费数据采用双重低频留存边界：默认达到 4 MiB（`CLAUDE_WATCH_SPOOL_MAX_BYTES=4194304`）或 24 小时（`CLAUDE_WATCH_SPOOL_MAX_AGE_SECONDS=86400`）即触发安全轮转，配置最低值分别为 65536 字节和 3600 秒。容量是软上限；只要存在未读记录、active retry 或尚未排空的 drain，就必须继续保留，绝不能使用 read/check 后 truncate。watcher 通过 rename 保留旧 inode，继续读取并等待 30 秒写入安全窗后才清理，避免与 Claude Hook 并发 append 时丢事件。
 
-只有用户明确要求测试时，才可执行 `python3 codex_watch_notifier.py --test-claude`（或发布包 wrapper 的同名参数）。它是一次显式、单次测试，不得由 `install`、`update`、`login`、`doctor` 或安装验收流程自动调用，也不得为了“确认”循环执行。
+Pi 使用 `agent_settled`，只接收持久、非 JSON 模式的稳定终态；默认不提醒带 `parentSession` 的 fork/clone。OpenCode 使用 `session.idle`，并通过 `Session.parentID` 排除子会话。二者的单事件文件写完整后才原子发布到私有队列；首次接管从 EOF 建立基线，失败事件在有界重试完成前阻止后续事件越序。
+
+只有用户明确要求测试时，才可执行对应的一条 `--test-claude`、`--test-pi` 或 `--test-opencode`（或发布包 wrapper 的同名参数）。每个都是一次显式、单次测试，不得由 `install`、`update`、`login`、`doctor` 或安装验收流程自动调用，也不得为了“确认”循环执行。
 
 ## 凭据存储
 

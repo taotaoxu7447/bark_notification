@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import secrets
 import stat
 import subprocess
@@ -40,6 +41,7 @@ DEFAULT_ZCODE_LOG_ROOT = "~/.zcode/cli/log"
 DEFAULT_KIMI_SESSIONS_ROOT = "~/.kimi-code/sessions"
 DEFAULT_GROK_SESSIONS_ROOT = "~/.grok/sessions"
 CLAUDE_HOOK_EVENTS_FILE_NAME = "claude-hook-events.jsonl"
+TOOL_HOOK_EVENTS_DIR_NAME = "tool-hook-events"
 DEFAULT_CLAUDE_SPOOL_MAX_BYTES = 4 * 1024 * 1024
 MIN_CLAUDE_SPOOL_MAX_BYTES = 64 * 1024
 DEFAULT_CLAUDE_SPOOL_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -72,7 +74,20 @@ DEFAULT_CLAUDE_BARK_ICON = (
     "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/"
     "android/app/src/main/res/drawable-nodpi/source_claude.png"
 )
+DEFAULT_PI_BARK_ICON = (
+    "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/pi-icon-v1.png"
+)
+DEFAULT_OPENCODE_BARK_ICON = (
+    "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/opencode-icon-v1.png"
+)
 CLAUDE_HOOK_SCHEMA = "agentwatch_claude_hook_v1"
+TOOL_HOOK_SCHEMA = "agentwatch_tool_hook_v1"
+TOOL_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
+TOOL_HOOK_EVENT_MAX_BYTES = 1024 * 1024
+TOOL_HOOK_EVENT_FILE_RE = re.compile(
+    r"^(?P<created>[0-9]{15,21})-(?P<source>pi|opencode)-"
+    r"(?P<identity>[0-9a-f]{16})-(?P<nonce>[0-9a-f]{8})\.json$"
+)
 CLAUDE_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
 CLAUDE_STOP_FAILURE_ERRORS = frozenset(
     {
@@ -106,6 +121,149 @@ class StateFileError(ValueError):
 
 class ConfigFileError(ValueError):
     """The persistent private environment cannot be read safely."""
+
+
+PRIVATE_STATE_FILE_MODE = 0o600
+
+
+def lexical_absolute_path(path: Path | str) -> Path:
+    """Return an absolute path without erasing symlink/reparse-point evidence."""
+    expanded = os.path.expandvars(os.path.expanduser(str(path)))
+    return Path(os.path.abspath(expanded))
+
+
+def prepare_private_file_parent(path: Path, description: str) -> Path:
+    """Create and validate a parent without following linked descendants."""
+    target = lexical_absolute_path(path)
+    if path_has_link_component(target):
+        raise StateFileError(f"{description} must not contain a symlink or junction: {target}")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise StateFileError(f"cannot create {description} directory: {target.parent}") from exc
+    if path_has_link_component(target):
+        raise StateFileError(f"{description} must not contain a symlink or junction: {target}")
+    try:
+        parent_metadata = target.parent.lstat()
+    except OSError as exc:
+        raise StateFileError(f"cannot inspect {description} directory: {target.parent}") from exc
+    if not stat.S_ISDIR(parent_metadata.st_mode) or stat.S_ISLNK(parent_metadata.st_mode):
+        raise StateFileError(f"{description} parent must be a real directory: {target.parent}")
+    return target
+
+
+def validate_private_regular_descriptor(descriptor: int, description: str) -> os.stat_result:
+    """Validate and privatize an already-open state/lock file descriptor."""
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as exc:
+        raise StateFileError(f"cannot inspect {description}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise StateFileError(f"{description} must be a regular file")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise StateFileError(f"{description} must be owned by the current user")
+    try:
+        os.fchmod(descriptor, PRIVATE_STATE_FILE_MODE)
+    except (AttributeError, OSError):
+        if os.name != "nt":
+            raise StateFileError(f"cannot make {description} private") from None
+    if os.name != "nt":
+        try:
+            private_metadata = os.fstat(descriptor)
+        except OSError as exc:
+            raise StateFileError(f"cannot verify {description} permissions") from exc
+        if stat.S_IMODE(private_metadata.st_mode) != PRIVATE_STATE_FILE_MODE:
+            raise StateFileError(f"{description} must have private 0600 permissions")
+        metadata = private_metadata
+    return metadata
+
+
+def path_matches_open_file(path: Path, metadata: os.stat_result) -> bool:
+    """Return whether a lexical path still names the opened non-link file."""
+    if path_has_link_component(path):
+        return False
+    try:
+        current = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode):
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(current, "st_file_attributes", 0) & reparse_flag:
+        return False
+    if hasattr(os.path, "isjunction") and os.path.isjunction(path):
+        return False
+    # Some Windows filesystems report zero inode/device values. The no-link and
+    # regular-file checks remain authoritative there; compare identity whenever
+    # the platform supplies meaningful values.
+    expected_identity = (getattr(metadata, "st_dev", 0), getattr(metadata, "st_ino", 0))
+    current_identity = (getattr(current, "st_dev", 0), getattr(current, "st_ino", 0))
+    if all(expected_identity) and all(current_identity):
+        return expected_identity == current_identity
+    return True
+
+
+def fsync_directory(path: Path, description: str) -> None:
+    """Persist a directory entry update on platforms that support directory fsync."""
+    if os.name == "nt":
+        return
+    if path_has_link_component(path):
+        raise StateFileError(f"{description} directory must not contain a symlink or junction")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise StateFileError(f"cannot open {description} directory for sync") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise StateFileError(f"{description} parent must be a directory")
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise StateFileError(f"cannot sync {description} directory") from exc
+    finally:
+        os.close(descriptor)
+
+
+def validate_existing_private_file(path: Path, description: str) -> None:
+    """Validate an existing state-owned file without following its final path."""
+    if not os.path.lexists(path):
+        return
+    if path_has_link_component(path):
+        raise StateFileError(f"{description} must not contain a symlink or junction: {path}")
+    try:
+        path_metadata = path.lstat()
+    except OSError as exc:
+        raise StateFileError(f"cannot inspect {description}: {path}") from exc
+    if not stat.S_ISREG(path_metadata.st_mode) or stat.S_ISLNK(path_metadata.st_mode):
+        raise StateFileError(f"{description} must be a regular file: {path}")
+    if hasattr(os, "getuid") and path_metadata.st_uid != os.getuid():
+        raise StateFileError(f"{description} must be owned by the current user: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOINHERIT"):
+        flags |= os.O_NOINHERIT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise StateFileError(f"cannot safely open {description}: {path}") from exc
+    try:
+        metadata = validate_private_regular_descriptor(descriptor, description)
+        if not path_matches_open_file(path, metadata):
+            raise StateFileError(f"{description} changed while it was being inspected: {path}")
+    finally:
+        os.close(descriptor)
 
 
 def expand_path(value: str) -> Path:
@@ -263,7 +421,7 @@ def publisher_instance_id() -> str:
 
 def ntfy_source(event: dict[str, Any]) -> str:
     prefix = str(event.get("event_type") or "").partition("_")[0].lower()
-    return prefix if prefix in {"codex", "zcode", "kimi", "grok", "claude"} else "codex"
+    return prefix if prefix in {"codex", "zcode", "kimi", "grok", "claude", "pi", "opencode"} else "codex"
 
 
 def ntfy_sequence_id(event: dict[str, Any]) -> str:
@@ -290,6 +448,8 @@ def ntfy_icon(event: dict[str, Any]) -> str:
         "kimi": DEFAULT_KIMI_BARK_ICON,
         "grok": DEFAULT_GROK_BARK_ICON,
         "claude": DEFAULT_CLAUDE_BARK_ICON,
+        "pi": DEFAULT_PI_BARK_ICON,
+        "opencode": DEFAULT_OPENCODE_BARK_ICON,
     }
     configured = str(event.get("bark_icon") or os.getenv(f"{source.upper()}_BARK_ICON", "") or defaults[source]).strip()
     parsed = urllib.parse.urlparse(configured)
@@ -386,13 +546,35 @@ class SingleInstanceLock:
     """Hold an OS-backed lock for one state file without relying on stale PID files."""
 
     def __init__(self, path: Path) -> None:
-        self.path = path
+        self.path = lexical_absolute_path(path)
         self.handle: Any = None
 
     def acquire(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+b")
+        if self.handle is not None:
+            return True
         try:
+            self.path = prepare_private_file_parent(self.path, "watcher lock")
+            validate_existing_private_file(self.path, "watcher lock")
+        except StateFileError:
+            return False
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOINHERIT"):
+            flags |= os.O_NOINHERIT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        descriptor = -1
+        handle: Any = None
+        try:
+            descriptor = os.open(self.path, flags, PRIVATE_STATE_FILE_MODE)
+            metadata = validate_private_regular_descriptor(descriptor, "watcher lock")
+            if not path_matches_open_file(self.path, metadata):
+                return False
+            handle = os.fdopen(descriptor, "r+b", buffering=0)
+            descriptor = -1
             if os.name == "nt":
                 import msvcrt
 
@@ -406,24 +588,28 @@ class SingleInstanceLock:
                 import fcntl
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
-            return False
-
-        self.handle = handle
-        try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
-        try:
+            if not path_matches_open_file(self.path, metadata):
+                return False
             handle.seek(0)
             handle.truncate()
             handle.write(f"{os.getpid()}\n".encode("ascii"))
             handle.flush()
-        except OSError:
-            # The kernel lock is authoritative; PID text is diagnostic only.
-            pass
-        return True
+            os.fsync(handle.fileno())
+            fsync_directory(self.path.parent, "watcher lock")
+            if not path_matches_open_file(self.path, metadata):
+                return False
+            self.handle = handle
+            handle = None
+            return True
+        except (OSError, StateFileError):
+            return False
+        finally:
+            # Closing a failed handle also releases an OS lock that may already
+            # have been acquired before a later identity or durability check.
+            if handle is not None:
+                handle.close()
+            elif descriptor >= 0:
+                os.close(descriptor)
 
     def release(self) -> None:
         handle = self.handle
@@ -667,7 +853,7 @@ class Notifier:
 
     def _send_ntfy(self, title: str, body: str, event: dict[str, Any]) -> bool:
         prefix = str(event.get("event_type") or "").partition("_")[0].upper()
-        if prefix not in {"CODEX", "ZCODE", "KIMI", "GROK", "CLAUDE"}:
+        if prefix not in {"CODEX", "ZCODE", "KIMI", "GROK", "CLAUDE", "PI", "OPENCODE"}:
             prefix = "CODEX"
         url = (
             str(event.get("ntfy_url") or "").strip()
@@ -753,7 +939,8 @@ class Notifier:
 
 
 def load_state(path: Path) -> dict[str, Any]:
-    if not path.exists():
+    path = lexical_absolute_path(path)
+    if not os.path.lexists(path):
         return {
             "version": STATE_VERSION,
             "initialized": False,
@@ -762,11 +949,32 @@ def load_state(path: Path) -> dict[str, Any]:
             "delivery_attempts": {},
             "delivery_stats": {},
         }
+    validate_existing_private_file(path, "watcher state")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOINHERIT"):
+        flags |= os.O_NOINHERIT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = -1
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        descriptor = os.open(path, flags)
+        metadata = validate_private_regular_descriptor(descriptor, "watcher state")
+        if not path_matches_open_file(path, metadata):
+            raise StateFileError(f"watcher state changed while it was being opened: {path}")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
             state = json.load(handle)
+    except StateFileError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise StateFileError(f"cannot read watcher state {path}: {type(exc).__name__}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not isinstance(state, dict):
         raise StateFileError(f"watcher state {path} must contain a JSON object")
     if "version" in state and (
@@ -779,6 +987,10 @@ def load_state(path: Path) -> dict[str, Any]:
     if "claude_initialized" in state and not isinstance(state["claude_initialized"], str):
         raise StateFileError(
             f"watcher state {path} field 'claude_initialized' must be a path string"
+        )
+    if "tool_hooks_initialized" in state and not isinstance(state["tool_hooks_initialized"], str):
+        raise StateFileError(
+            f"watcher state {path} field 'tool_hooks_initialized' must be a path string"
         )
     for key in ("files", "sent", "delivery_attempts", "delivery_stats"):
         value = state.get(key, {})
@@ -863,7 +1075,8 @@ def load_state(path: Path) -> dict[str, Any]:
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = prepare_private_file_parent(path, "watcher state")
+    validate_existing_private_file(path, "watcher state")
     state["version"] = STATE_VERSION
     sent = state.get("sent", {})
     if len(sent) > MAX_SENT_KEYS:
@@ -881,11 +1094,76 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
             delivery_attempts.pop(stable_id, None)
         stats = state.setdefault("delivery_stats", {})
         stats["pruned_exhausted_total"] = int(stats.get("pruned_exhausted_total", 0) or 0) + remove_count
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp.replace(path)
+    encoded = (
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOINHERIT"):
+        flags |= os.O_NOINHERIT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+
+    temporary: Path | None = None
+    descriptor = -1
+    temporary_metadata: os.stat_result | None = None
+    try:
+        for _attempt in range(16):
+            candidate = path.parent / (
+                f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+            )
+            try:
+                descriptor = os.open(candidate, flags, PRIVATE_STATE_FILE_MODE)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise StateFileError(f"cannot create private watcher state temporary file") from exc
+            temporary = candidate
+            break
+        if temporary is None or descriptor < 0:
+            raise StateFileError("cannot allocate a unique watcher state temporary file")
+
+        temporary_metadata = validate_private_regular_descriptor(
+            descriptor, "watcher state temporary file"
+        )
+        remaining = memoryview(encoded)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise StateFileError("could not write the complete watcher state")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+
+        if not path_matches_open_file(temporary, temporary_metadata):
+            raise StateFileError("watcher state temporary file changed before publication")
+        # Revalidate the destination immediately before publication. `replace`
+        # would not follow a final symlink, but refusing it also avoids deleting
+        # an unexpected foreign directory entry.
+        validate_existing_private_file(path, "watcher state")
+        os.replace(temporary, path)
+        temporary = None
+        validate_existing_private_file(path, "watcher state")
+        fsync_directory(path.parent, "watcher state")
+    except StateFileError:
+        raise
+    except OSError as exc:
+        raise StateFileError(f"cannot persist watcher state {path}: {type(exc).__name__}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Never broaden cleanup after a failed atomic state write.
+                pass
 
 
 def delivery_attempts_for_state(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1125,6 +1403,88 @@ def claude_hook_event_files(path: Path) -> list[Path]:
     if not regular_file_without_symlink(path):
         return []
     return [path]
+
+
+def tool_hook_event_files(root: Path) -> list[Path]:
+    if path_has_link_component(root):
+        return []
+    try:
+        metadata = root.lstat()
+    except OSError:
+        return []
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return []
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        return []
+    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
+        return []
+    paths: list[Path] = []
+    try:
+        candidates = sorted(root.glob("*.json"), key=lambda path: path.name)
+    except OSError:
+        return []
+    for path in candidates:
+        if read_owned_tool_hook_event(path) is not None:
+            paths.append(path)
+    return paths
+
+
+def read_owned_tool_hook_event_snapshot(
+    path: Path,
+) -> tuple[dict[str, Any], str, int] | None:
+    """Read one owned queue item from a no-follow fd and return its identity."""
+    match = TOOL_HOOK_EVENT_FILE_RE.fullmatch(path.name)
+    if match is None or path_has_link_component(path):
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
+            return None
+        if metadata.st_size > TOOL_HOOK_EVENT_MAX_BYTES:
+            return None
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            return None
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600:
+            return None
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        return None
+    try:
+        record = json.loads(raw[:-1].decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    parsed = validated_tool_hook_record(record)
+    if parsed is None or parsed["source"] != match.group("source"):
+        return None
+    identity = hashlib.sha256(
+        f"{parsed['source']}\0{parsed['session_id']}\0{parsed['event_id']}".encode("utf-8")
+    ).hexdigest()[:16]
+    if identity != match.group("identity"):
+        return None
+    return record, f"{metadata.st_dev}:{metadata.st_ino}", metadata.st_size
+
+
+def read_owned_tool_hook_event(path: Path) -> dict[str, Any] | None:
+    """Return one authenticated AgentWatch queue record without trusting its name alone."""
+    snapshot = read_owned_tool_hook_event_snapshot(path)
+    return snapshot[0] if snapshot is not None else None
 
 
 def claude_drain_prefix(spool_path: Path) -> str:
@@ -1644,6 +2004,163 @@ def trigger_from_claude_hook_record(path: Path, offset: int, record: dict[str, A
         "bark_icon": os.getenv("CLAUDE_BARK_ICON", DEFAULT_CLAUDE_BARK_ICON),
         "ntfy_url": os.getenv("CLAUDE_NTFY_URL", ""),
         "ntfy_tags": os.getenv("CLAUDE_NTFY_TAGS", "robot,computer"),
+    }
+    body_parts = [
+        f"状态: {status}",
+        f"判断: {status_detail}",
+        f"会话: {display_name}",
+        f"时间: {local_time}",
+    ]
+    if include_workspace_in_notifications():
+        body_parts.append(f"目录: {cwd}")
+    if message and include_message_excerpt_in_notifications() and notification_body_max_chars() > 0:
+        body_parts.extend(["", compact(message, notification_body_max_chars())])
+    event["notification_title"] = f"{title}: {compact(display_name, 42)}"
+    event["notification_body"] = "\n".join(body_parts)
+    return event
+
+
+def validated_tool_hook_record(record: Any) -> dict[str, Any] | None:
+    if not isinstance(record, dict) or record.get("schema") != TOOL_HOOK_SCHEMA:
+        return None
+    source = _claude_record_string(record, "source", required=True, limit=16)
+    event_name = _claude_record_string(record, "event_name", required=True, limit=32)
+    session_id = _claude_record_string(record, "session_id", required=True, limit=256)
+    event_id = _claude_record_string(record, "event_id", required=True, limit=256)
+    cwd = _claude_record_string(record, "cwd", required=True, limit=4096)
+    parent_session = _claude_record_string(record, "parent_session", limit=4096)
+    stop_reason = _claude_record_string(record, "stop_reason", limit=128)
+    # Assistant text is hashed exactly as emitted. Do not strip leading or
+    # trailing whitespace here or a valid record's digest would no longer
+    # match the private ingestor's digest.
+    message_value = record.get("message")
+    message = (
+        message_value
+        if isinstance(message_value, str) and len(message_value) <= TOOL_HOOK_MESSAGE_LIMIT_CHARS
+        else None
+    )
+    message_hash = _claude_record_string(
+        record,
+        "message_sha256",
+        required=True,
+        limit=64,
+    )
+    if None in {
+        source,
+        event_name,
+        session_id,
+        event_id,
+        cwd,
+        parent_session,
+        stop_reason,
+        message,
+        message_hash,
+    }:
+        return None
+    expected_event = {"pi": "agent_settled", "opencode": "session.idle"}.get(source)
+    if event_name != expected_event:
+        return None
+    outcome = record.get("outcome")
+    if outcome not in {"completed", "error", "cancelled"}:
+        return None
+    timestamp = record.get("timestamp")
+    if parse_timestamp(timestamp) is None:
+        return None
+    received_at = record.get("received_at")
+    if isinstance(received_at, bool) or not isinstance(received_at, int) or received_at <= 0:
+        return None
+    if (
+        len(message_hash) != 64
+        or any(character not in "0123456789abcdef" for character in message_hash)
+        or hashlib.sha256(message.encode("utf-8")).hexdigest() != message_hash
+    ):
+        return None
+    return {
+        "source": source,
+        "event_name": event_name,
+        "session_id": session_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "cwd": cwd,
+        "parent_session": parent_session,
+        "outcome": outcome,
+        "stop_reason": stop_reason,
+        "message": message,
+        "message_sha256": message_hash,
+        "received_at": received_at,
+    }
+
+
+def trigger_from_tool_hook_record(path: Path, offset: int, record: dict[str, Any]) -> dict[str, Any] | None:
+    parsed = validated_tool_hook_record(record)
+    if parsed is None:
+        return None
+    source = parsed["source"]
+    if not env_flag(f"{source.upper()}_WATCH_ENABLED", True):
+        return None
+    parent_session = parsed["parent_session"]
+    if source == "opencode" and parent_session:
+        return None
+    if (
+        source == "pi"
+        and parent_session
+        and not env_flag("PI_WATCH_NOTIFY_FORKED_SESSIONS", False)
+    ):
+        return None
+
+    labels = {"pi": "Pi Agent", "opencode": "OpenCode"}
+    tool_name = labels[source]
+    outcome = parsed["outcome"]
+    message = parsed["message"]
+    if outcome == "completed":
+        status, status_detail = classify_task_complete(message, tool_name)
+        title = {
+            "完成": f"{tool_name} 已完成",
+            "需要处理": f"{tool_name} 需要处理",
+            "已停下": f"{tool_name} 已停下",
+        }[status]
+        event_type = f"{source}_turn_completed"
+    elif outcome == "cancelled":
+        status = "已取消"
+        status_detail = f"{tool_name} 本轮被取消或停止"
+        title = f"{tool_name} 已取消"
+        event_type = f"{source}_turn_cancelled"
+    else:
+        status = "需要处理"
+        detail = parsed["stop_reason"] or "error"
+        status_detail = f"{tool_name} 本轮因 {compact(detail, 80)} 结束"
+        title = f"{tool_name} 需要处理"
+        event_type = f"{source}_turn_error"
+
+    session_id = parsed["session_id"]
+    event_id = parsed["event_id"]
+    cwd = parsed["cwd"]
+    display_name = Path(cwd).name or session_id[:12]
+    timestamp = parsed["timestamp"]
+    local_time = utc_to_local(timestamp)
+    stable_source = f"{source}\0{session_id}\0{event_id}\0{outcome}"
+    default_icons = {
+        "pi": DEFAULT_PI_BARK_ICON,
+        "opencode": DEFAULT_OPENCODE_BARK_ICON,
+    }
+    event = {
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "local_time": local_time,
+        "session_id": session_id,
+        "event_id": event_id,
+        "status": status,
+        "status_detail": status_detail,
+        "cwd": cwd,
+        "parent_session": parent_session,
+        "log_path": str(path),
+        "offset": offset,
+        "message": message,
+        "stable_id": hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24],
+        "bark_group": os.getenv(f"{source.upper()}_BARK_GROUP", tool_name),
+        "bark_icon": os.getenv(f"{source.upper()}_BARK_ICON", default_icons[source]),
+        "ntfy_url": os.getenv(f"{source.upper()}_NTFY_URL", ""),
+        "ntfy_tags": os.getenv(f"{source.upper()}_NTFY_TAGS", "robot,computer"),
     }
     body_parts = [
         f"状态: {status}",
@@ -2392,6 +2909,185 @@ def process_external_file(
     return sent_count
 
 
+def initialize_tool_hook_events(
+    state: dict[str, Any],
+    root: Path,
+    *,
+    process_existing: bool,
+    log: Logger,
+) -> bool:
+    key = str(root)
+    if state.get("tool_hooks_initialized") == key:
+        return False
+    files = state.setdefault("files", {})
+    now = int(time.time())
+    count = 0
+    for path in tool_hook_event_files(root):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        files[str(path)] = {
+            "offset": 0 if process_existing else size,
+            "size": size,
+            "updated_at": now,
+            "kind": "Tool Hook",
+            "tool_hook_owned": True,
+            "file_identity": file_identity(path),
+        }
+        count += 1
+    state["tool_hooks_initialized"] = key
+    action = "from BOF" if process_existing else "at EOF"
+    log(
+        f"initialized Pi/OpenCode hook event queue {action} for {count} file(s): {root}",
+        always_stdout=True,
+    )
+    return True
+
+
+def cleanup_consumed_tool_hook_event(
+    path: Path,
+    state: dict[str, Any],
+    log: Logger,
+    checkpoint: Callable[[], None] | None = None,
+) -> bool:
+    files = state.setdefault("files", {})
+    rec = files.get(str(path))
+    if (
+        not isinstance(rec, dict)
+        or rec.get("kind") != "Tool Hook"
+        or rec.get("tool_hook_owned") is not True
+    ):
+        return False
+    if has_active_delivery_for_path(state, path):
+        return False
+    try:
+        metadata = path.lstat()
+        offset = int(rec.get("offset", 0) or 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    if offset < metadata.st_size:
+        return False
+    expected_identity = str(rec.get("file_identity") or "")
+    actual_identity = f"{metadata.st_dev}:{metadata.st_ino}"
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or not expected_identity
+        or expected_identity != actual_identity
+        or read_owned_tool_hook_event(path) is None
+    ):
+        rec["foreign_replacement"] = True
+        return False
+    try:
+        path.unlink()
+    except OSError as exc:
+        log(f"cannot retire consumed tool hook event {path.name}: {exc}")
+        return False
+    files.pop(str(path), None)
+    delivery_checkpoint(checkpoint)
+    return True
+
+
+def process_tool_hook_event_file(
+    path: Path,
+    state: dict[str, Any],
+    notifier: Notifier,
+    log: Logger,
+    checkpoint: Callable[[], None] | None = None,
+) -> int:
+    files = state.setdefault("files", {})
+    rec = files.get(str(path))
+    snapshot = read_owned_tool_hook_event_snapshot(path)
+    if snapshot is None:
+        return 0
+    record, actual_identity, size = snapshot
+    if not isinstance(rec, dict):
+        rec = {
+            "offset": 0,
+            "kind": "Tool Hook",
+            "tool_hook_owned": True,
+            "file_identity": actual_identity,
+            "updated_at": int(time.time()),
+        }
+        files[str(path)] = rec
+    elif rec.get("file_identity") and rec.get("file_identity") != actual_identity:
+        rec.update(
+            {
+                "offset": size,
+                "size": size,
+                "updated_at": int(time.time()),
+                "foreign_replacement": True,
+            }
+        )
+        log(f"ignored replaced tool hook event file: {path.name}")
+        return 0
+    elif actual_identity and not rec.get("file_identity"):
+        rec["file_identity"] = actual_identity
+    rec["tool_hook_owned"] = True
+
+    rec["kind"] = "Tool Hook"
+    rec["size"] = size
+    rec["updated_at"] = int(time.time())
+    try:
+        offset = int(rec.get("offset", 0) or 0)
+    except (TypeError, ValueError):
+        offset = size
+    if offset not in {0, size}:
+        rec["offset"] = size
+        rec["foreign_replacement"] = True
+        return 0
+    if offset == size:
+        cleanup_consumed_tool_hook_event(path, state, log, checkpoint)
+        return 0
+
+    event = trigger_from_tool_hook_record(path, 0, record)
+    if not event:
+        rec["offset"] = size
+        cleanup_consumed_tool_hook_event(path, state, log, checkpoint)
+        return 0
+    stable_id = str(event.get("stable_id") or "")
+    if not stable_id:
+        rec["offset"] = size
+        cleanup_consumed_tool_hook_event(path, state, log, checkpoint)
+        return 0
+    stale, age, max_age = is_stale_event(event)
+    if stale:
+        rec["stale_events_skipped"] = int(rec.get("stale_events_skipped", 0) or 0) + 1
+        delivery_attempts_for_state(state).pop(stable_id, None)
+        rec["offset"] = size
+        log(
+            f"skipped stale Tool Hook event for {event.get('session_id')} "
+            f"from {path.name} (age={age:.0f}s, max={max_age:.0f}s)"
+        )
+        cleanup_consumed_tool_hook_event(path, state, log, checkpoint)
+        return 0
+    if stable_id in state.setdefault("sent", {}):
+        delivery_attempts_for_state(state).pop(stable_id, None)
+        rec["offset"] = size
+        cleanup_consumed_tool_hook_event(path, state, log, checkpoint)
+        return 0
+
+    outcome = deliver_event_with_bounded_retry(
+        state=state,
+        rec=rec,
+        notifier=notifier,
+        log=log,
+        event=event,
+        stable_id=stable_id,
+        source="tool_hook",
+        path=path,
+        line_offset=0,
+        line_end=size,
+        checkpoint=checkpoint,
+    )
+    sent = 1 if outcome == "sent" else 0
+    if outcome == "sent":
+        log(f"sent {event['event_type']} for {event.get('session_id')} from {path.name}")
+    cleanup_consumed_tool_hook_event(path, state, log, checkpoint)
+    return sent
+
+
 def baseline_existing_files(state: dict[str, Any], roots: list[Path], log: Logger) -> None:
     files = state.setdefault("files", {})
     count = 0
@@ -2937,6 +3633,26 @@ def claude_watch_enabled(args: argparse.Namespace) -> bool:
     return env_flag("CLAUDE_WATCH_ENABLED", True)
 
 
+def build_tool_hook_events_dir(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "tool_hook_events_dir", None)
+    if configured:
+        return absolute_path_without_symlink_resolution(configured)
+    config_root = (
+        os.getenv("CODEX_WATCH_CONFIG_DIR")
+        or os.getenv("AGENTWATCH_CONFIG_DIR")
+        or "~/.codex-watch-notifier"
+    )
+    return absolute_path_without_symlink_resolution(
+        str(Path(config_root) / TOOL_HOOK_EVENTS_DIR_NAME)
+    )
+
+
+def tool_hooks_watch_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "disable_tool_hooks", False):
+        return False
+    return env_flag("PI_WATCH_ENABLED", True) or env_flag("OPENCODE_WATCH_ENABLED", True)
+
+
 def parse_extra_event_types() -> set[str]:
     raw = os.getenv("CODEX_WATCH_EXTRA_EVENT_TYPES", "")
     return {part.strip() for part in raw.split(",") if part.strip()}
@@ -2988,6 +3704,8 @@ def send_external_test_notification(
         "KIMI": DEFAULT_KIMI_BARK_ICON,
         "GROK": DEFAULT_GROK_BARK_ICON,
         "CLAUDE": DEFAULT_CLAUDE_BARK_ICON,
+        "PI": DEFAULT_PI_BARK_ICON,
+        "OPENCODE": DEFAULT_OPENCODE_BARK_ICON,
     }.get(env_prefix, "")
     event = {
         "event_type": f"{event_prefix}_test",
@@ -3053,6 +3771,7 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     kimi_root = build_kimi_sessions_root(args)
     grok_root = build_grok_sessions_root(args)
     claude_events_file = build_claude_hook_events_file(args)
+    tool_hook_events_dir = build_tool_hook_events_dir(args)
     notifier = Notifier(False, Logger(None))
 
     print("Codex Watch Notifier doctor")
@@ -3125,6 +3844,14 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
             regular_file_without_symlink(claude_events_file),
             str(claude_events_file),
         )
+    print_check(
+        "Pi/OpenCode hook queue enabled",
+        tool_hooks_watch_enabled(args),
+        f"events={tool_hook_events_dir}",
+    )
+    if tool_hooks_watch_enabled(args):
+        queue_safe = not path_has_link_component(tool_hook_events_dir)
+        print_check("Pi/OpenCode hook queue path", queue_safe, str(tool_hook_events_dir))
     print_check("state file", state_path.exists(), str(state_path))
     state_file_valid = True
     delivery_state: dict[str, Any] = {}
@@ -3198,6 +3925,8 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
     grok_root = build_grok_sessions_root(args)
     claude_enabled = claude_watch_enabled(args)
     claude_events_file = build_claude_hook_events_file(args)
+    tool_hooks_enabled = tool_hooks_watch_enabled(args)
+    tool_hook_events_dir = build_tool_hook_events_dir(args)
     last_state_error = ""
     while True:
         try:
@@ -3268,10 +3997,19 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
         )
         if claude_needs_baseline and not args.process_existing:
             did_baseline = True
+    if tool_hooks_enabled:
+        tool_hooks_need_baseline = state.get("tool_hooks_initialized") != str(
+            tool_hook_events_dir
+        )
+        if initialize_tool_hook_events(
+            state,
+            tool_hook_events_dir,
+            process_existing=args.process_existing,
+            log=log,
+        ) and tool_hooks_need_baseline and not args.process_existing:
+            did_baseline = True
     if did_baseline:
         save_state(state_path, state)
-        if args.once:
-            return 0
 
     notifier = Notifier(args.dry_run, log)
     extra_types = parse_extra_event_types()
@@ -3284,6 +4022,11 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
         log(f"watching Grok Build {grok_root} with channels={notifier.channels}", always_stdout=True)
     if claude_enabled:
         log(f"watching Claude Code hook events {claude_events_file} with channels={notifier.channels}", always_stdout=True)
+    if tool_hooks_enabled:
+        log(
+            f"watching Pi/OpenCode hook events {tool_hook_events_dir} with channels={notifier.channels}",
+            always_stdout=True,
+        )
 
     while True:
         for path in rollout_files(roots):
@@ -3355,6 +4098,33 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
                 if path in drain_paths:
                     retire_stable_claude_drain(path, state, log, checkpoint)
             rotate_consumed_claude_spool(claude_events_file, state, log, checkpoint)
+        if tool_hooks_enabled:
+            if initialize_tool_hook_events(
+                state,
+                tool_hook_events_dir,
+                process_existing=args.process_existing,
+                log=log,
+            ):
+                checkpoint()
+            for path in tool_hook_event_files(tool_hook_events_dir):
+                process_tool_hook_event_file(path, state, notifier, log, checkpoint)
+                # Each hook record is a separate queue item. Preserve strict
+                # FIFO semantics: while the oldest item is waiting for its
+                # bounded retry (or has been replaced unexpectedly), do not
+                # let a newer completion jump ahead of it.
+                queue_record = state.setdefault("files", {}).get(str(path))
+                if isinstance(queue_record, dict):
+                    try:
+                        queue_size = path.lstat().st_size
+                        queue_offset = int(queue_record.get("offset", 0) or 0)
+                    except (OSError, TypeError, ValueError):
+                        break
+                    if (
+                        queue_record.get("foreign_replacement")
+                        or has_active_delivery_for_path(state, path)
+                        or queue_offset < queue_size
+                    ):
+                        break
         save_state(state_path, state)
         if args.once:
             return 0
@@ -3373,6 +4143,8 @@ def main() -> int:
         "--test-kimi",
         "--test-grok",
         "--test-claude",
+        "--test-pi",
+        "--test-opencode",
     }
     while True:
         try:
@@ -3406,6 +4178,8 @@ def main() -> int:
     parser.add_argument("--disable-grok", action="store_true", help="Disable Grok Build notifications.")
     parser.add_argument("--claude-hook-events-file", help="JSONL spool written by the official Claude Code hooks.")
     parser.add_argument("--disable-claude", action="store_true", help="Disable Claude Code hook notifications.")
+    parser.add_argument("--tool-hook-events-dir", help="Private event queue written by Pi and OpenCode integrations.")
+    parser.add_argument("--disable-tool-hooks", action="store_true", help="Disable Pi and OpenCode integration notifications.")
     parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them.")
     parser.add_argument("--verbose", action="store_true", help="Also print log lines to stdout.")
     parser.add_argument("--test", action="store_true", help="Send one test notification and exit.")
@@ -3413,6 +4187,8 @@ def main() -> int:
     parser.add_argument("--test-kimi", action="store_true", help="Send one Kimi Code test notification and exit.")
     parser.add_argument("--test-grok", action="store_true", help="Send one Grok Build test notification and exit.")
     parser.add_argument("--test-claude", action="store_true", help="Send one Claude Code test notification and exit.")
+    parser.add_argument("--test-pi", action="store_true", help="Send one Pi Agent test notification and exit.")
+    parser.add_argument("--test-opencode", action="store_true", help="Send one OpenCode test notification and exit.")
     parser.add_argument("--doctor", action="store_true", help="Check configuration, log roots, and LaunchAgent status.")
     parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
     args = parser.parse_args()
@@ -3430,10 +4206,18 @@ def main() -> int:
         return send_external_test_notification(args, log, "Grok Build", "grok")
     if args.test_claude:
         return send_external_test_notification(args, log, "Claude Code", "claude")
+    if args.test_pi:
+        return send_external_test_notification(args, log, "Pi Agent", "pi")
+    if args.test_opencode:
+        return send_external_test_notification(args, log, "OpenCode", "opencode")
     if args.doctor:
         return doctor(args, log)
-    state_path = expand_path(args.state)
-    lock_path = expand_path(os.getenv("CODEX_WATCH_LOCK", str(state_path) + ".lock"))
+    # Keep these paths lexical so the safety checks can still see a configured
+    # symlink or junction instead of resolving it to an apparently safe target.
+    state_path = lexical_absolute_path(args.state)
+    lock_path = lexical_absolute_path(
+        os.getenv("CODEX_WATCH_LOCK", str(state_path) + ".lock")
+    )
     try:
         with SingleInstanceLock(lock_path):
             if args.replay_file:

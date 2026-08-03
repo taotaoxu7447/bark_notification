@@ -28,7 +28,7 @@ import uuid
 
 
 PRODUCT_NAME = "AgentWatch"
-CLIENT_USER_AGENT = "agentwatch-computer/0.3.0"
+CLIENT_USER_AGENT = "agentwatch-computer/0.4.0"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 API_VERSION = 2
 DEFAULT_API_BASE = "https://64.90.8.184:9444/agentwatch/api/v1"
@@ -52,7 +52,7 @@ LINUX_BACKENDS = frozenset(
 WINDOWS_TOKEN_FILE_NAME = "computer-token.dpapi"
 KEYCHAIN_SERVICE = "io.github.taotaoxu7447.agentwatch.computer"
 SECRET_TOOL_LABEL = "AgentWatch computer token"
-ALLOWED_SOURCES = {"codex", "zcode", "kimi", "grok", "claude", "other"}
+ALLOWED_SOURCES = {"codex", "zcode", "kimi", "grok", "claude", "pi", "opencode", "other"}
 
 
 class AgentWatchError(RuntimeError):
