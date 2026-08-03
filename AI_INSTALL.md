@@ -191,9 +191,9 @@ agentwatch uninstall  删除后台服务和运行文件，只移除自身 Claude
 
 Claude Code 官方 hook 将 `Stop` 或 `StopFailure` 的 stdin JSON 交给本机处理器。处理器只校验并追加到权限受限的 `~/.codex-watch-notifier/claude-hook-events.jsonl`，随后立即成功退出；后台 watcher 才读取队列并访问外部通知通道。项目不使用 `SubagentStop`，因此 Claude 子智能体停止不会制造额外提醒。
 
-Claude 官方会并行运行所有匹配的 hooks；一个 `stop_hook_active=false` 事件写入时，其他 project/plugin/session/managed Stop Hook 仍可能尚未返回阻止决定。后台 watcher 必须保留当前 offset，并默认等待 `CLAUDE_WATCH_STOP_SETTLE_SECONDS=35` 秒：等待期不访问网络、不建立或增加 delivery attempt，也不把私密消息复制进 state。每轮只读 lookahead 后续完整 JSONL；仅当找到同一 `session_id`、`prompt_id` 和 transcript 的有效 `stop_hook_active=true`（或同一 prompt 的有效 `StopFailure`）时，才抛弃 false 并继续处理终态。独立 `StopFailure` 和有效 true Stop 不等待。
+Claude 官方会并行运行所有匹配的 hooks；一个 `stop_hook_active=false` 事件写入时，其他 project/plugin/session/managed Stop Hook 仍可能尚未返回阻止决定。后台 watcher 必须保留当前 offset，并默认等待 `CLAUDE_WATCH_STOP_SETTLE_SECONDS=10` 秒：等待期不访问网络、不建立或增加 delivery attempt，也不把私密消息复制进 state。每轮只读 lookahead 后续完整 JSONL；仅当找到同一 `session_id`、`prompt_id` 和 transcript 的有效 `stop_hook_active=true`（或同一 prompt 的有效 `StopFailure`）时，才抛弃 false 并继续处理终态。独立 `StopFailure` 和有效 true Stop 不等待。
 
-不得把 transcript 文件增长单独当作“被其他 Hook 阻止”的证据。Claude 官方说明 transcript 异步落盘，普通最终 Stop 后也可能增长；增长只能作为匹配 true 记录存在时的旁证，当前通知文本使用 `last_assistant_message`。35 秒用于覆盖官方 prompt Hook 的 30 秒默认超时并留出轮询余量；配置会被限制在 5–600 秒。command/http/MCP Hook 官方默认可运行 600 秒，project/plugin/session 或自定义 Hook 也可能超过当前窗口，因此本机制是有边界的抑制而不是对 Claude 最终合并决定的绝对证明。需要更严格抑制可设为 600 秒，但会同样延迟普通通知；超出窗口的 blocker 仍可能导致暂定提醒先到。
+不得把 transcript 文件增长单独当作“被其他 Hook 阻止”的证据。Claude 官方说明 transcript 异步落盘，普通最终 Stop 后也可能增长；增长只能作为匹配 true 记录存在时的旁证，当前通知文本使用 `last_assistant_message`。10 秒默认值优先保证提醒及时性，并不覆盖官方 prompt Hook 的 30 秒默认超时；配置会被限制在 5–600 秒。command/http/MCP Hook 官方默认可运行 600 秒，project/plugin/session 或自定义 Hook 也可能超过当前窗口，因此本机制是有边界的抑制而不是对 Claude 最终合并决定的绝对证明。需要降低延迟后误提醒或二次提醒的概率可设为 35 秒或更长，最严格可设为 600 秒，但会同样延迟普通通知；超出窗口的 blocker 仍可能导致暂定提醒先到。
 
 安装器会用私有注册文件记住实际 Claude user-settings 路径。`CLAUDE_CONFIG_DIR` 改变后，必须执行 `agentwatch update` 完成旧 Hook 清理和新路径迁移；`status` / `doctor` 的 `needs_reconcile` 不得被忽略。静态诊断会检查 user settings、系统文件型 managed settings 及 `managed-settings.d`，但无法完整枚举 project、local、plugin、skill、agent、session、远程 managed policy 等运行时 scope。最终必须让用户在 Claude Code 内同时运行 `/status` 查看 `Setting sources`、运行 `/hooks` 查看实际 Hook；CLI 结果不能替代这两项运行时验证。
 

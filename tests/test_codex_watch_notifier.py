@@ -739,7 +739,7 @@ class ClaudeHookWatcherTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"CLAUDE_WATCH_STOP_SETTLE_SECONDS": ""}, clear=False
         ):
-            self.assertEqual(35, notifier.claude_stop_settle_seconds())
+            self.assertEqual(10, notifier.claude_stop_settle_seconds())
         with mock.patch.dict(
             os.environ, {"CLAUDE_WATCH_STOP_SETTLE_SECONDS": "1"}, clear=False
         ):

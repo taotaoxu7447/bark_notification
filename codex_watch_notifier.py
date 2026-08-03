@@ -47,11 +47,11 @@ MIN_CLAUDE_SPOOL_MAX_AGE_SECONDS = 60 * 60
 DEFAULT_CLAUDE_DRAIN_GRACE_SECONDS = 30
 # A first-pass Stop (stop_hook_active=false) is provisional because all
 # matching Claude hooks run in parallel and a sibling may still block the
-# stop. Thirty-five seconds covers Claude's 30-second default prompt-hook
-# window plus polling/merge slack without imposing the 10-minute command-hook
-# default on every notification. Installations with slow blocking command,
-# HTTP, or MCP hooks can opt into the full 600-second window.
-DEFAULT_CLAUDE_STOP_SETTLE_SECONDS = 35
+# stop. Ten seconds favors timely completion alerts while retaining a short
+# lookahead window. It does not cover Claude's 30-second default prompt-hook
+# timeout, so installations with slow blockers should select a longer value,
+# up to the full 600-second command/HTTP/MCP hook window.
+DEFAULT_CLAUDE_STOP_SETTLE_SECONDS = 10
 MIN_CLAUDE_STOP_SETTLE_SECONDS = 5
 MAX_CLAUDE_STOP_SETTLE_SECONDS = 600
 CLAUDE_DRAIN_MARKER = ".agentwatch-drain-"

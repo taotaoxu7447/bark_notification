@@ -248,7 +248,7 @@ agentwatch uninstall
 | `GROK_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Grok 子会话，默认 `0` |
 | `CLAUDE_WATCH_ENABLED` | 是否启用 Claude Code 官方 hook 队列监听，默认 `1` |
 | `CLAUDE_WATCH_EVENTS_FILE` | Claude hook 本地队列，默认 `~/.codex-watch-notifier/claude-hook-events.jsonl`；自定义路径必须是 AgentWatch 注册的专用文件，且文件、父目录均为当前用户私有，不能复用其他数据文件 |
-| `CLAUDE_WATCH_STOP_SETTLE_SECONDS` | Claude 首次 `Stop` 的暂定等待窗口，默认 `35` 秒，配置范围 `5`–`600` 秒；窗口内不投递、不计重试、不前移队列 offset |
+| `CLAUDE_WATCH_STOP_SETTLE_SECONDS` | Claude 首次 `Stop` 的暂定等待窗口，默认 `10` 秒，配置范围 `5`–`600` 秒；窗口内不投递、不计重试、不前移队列 offset |
 | `CLAUDE_WATCH_SPOOL_MAX_BYTES` | Claude 队列已消费数据的容量软上限，默认 `4194304`（4 MiB），最低 `65536`；未读或待补投数据不会被截断 |
 | `CLAUDE_WATCH_SPOOL_MAX_AGE_SECONDS` | Claude live 队列已消费数据的保留时间，默认 `86400`（24 小时），最低 `3600`；到期后仅在安全条件满足时轮转 |
 | `NOTIFY_INCLUDE_WORKSPACE` | 是否在通知里显示工作目录，默认 `1` |
@@ -272,8 +272,8 @@ NOTIFY_BODY_MAX_CHARS=0
 - Kimi Code watcher 监听 `~/.kimi-code/sessions` 下主智能体的 `agents/main/wire.jsonl`，只在 `step.end` 且 `finishReason=end_turn` 时提醒，不把工具调用步骤当成完成。
 - Grok Build watcher 监听 `~/.grok/sessions` 下的 `events.jsonl`，识别 `turn_ended` 的 `completed`、`error` 和 `cancelled` 结果。
 - Claude Code 使用官方 `Stop` 和 `StopFailure` hooks。hook 接收 Claude 提供的 stdin JSON，校验后只追加到权限受限的本地 JSONL 队列并立即退出，不在 Claude 进程中访问网络；后台 watcher 再读取队列并投递。项目不会配置 `SubagentStop`。
-- Claude 会并行执行同一事件的所有匹配 hooks；因此 `stop_hook_active=false` 只表示第一次 `Stop`，不能证明其他 project/plugin/session/managed Hook 最终没有阻止停止。watcher 默认把它作为暂定记录保留 35 秒，期间不前移队列 offset、不调用网络通道，也不消耗两轮投递额度；每轮只读扫描后续完整队列记录。若出现同一 `session_id`、`prompt_id` 和 transcript 的有效 `stop_hook_active=true`，或同轮有效 `StopFailure`，就丢弃旧的暂定记录并处理后面的终态；`true` 和独立 `StopFailure` 不再等待。Claude 官方说明 transcript 是异步写入的，所以 `transcript_size` 增长只能作为旁证，绝不会单独触发丢弃；通知正文始终使用官方 `last_assistant_message`。
-- 35 秒默认值覆盖官方 prompt Hook 的 30 秒默认超时并留出轮询/合并余量，同时避免让每条普通通知都等待 command/http/MCP Hook 的 600 秒默认超时。可用 `CLAUDE_WATCH_STOP_SETTLE_SECONDS` 在 5–600 秒内调整；如果某个阻断 Hook 在窗口结束后才返回，仍可能先收到一次暂定提醒，这是旁路通知 Hook 无法获知并行结果合并时刻的已知边界。需要更严格抑制时可设为 `600`，代价是普通提醒也可能延迟十分钟；自定义超时超过 600 秒仍超出本机制保证范围。
+- Claude 会并行执行同一事件的所有匹配 hooks；因此 `stop_hook_active=false` 只表示第一次 `Stop`，不能证明其他 project/plugin/session/managed Hook 最终没有阻止停止。watcher 默认把它作为暂定记录保留 10 秒，期间不前移队列 offset、不调用网络通道，也不消耗两轮投递额度；每轮只读扫描后续完整队列记录。若出现同一 `session_id`、`prompt_id` 和 transcript 的有效 `stop_hook_active=true`，或同轮有效 `StopFailure`，就丢弃旧的暂定记录并处理后面的终态；`true` 和独立 `StopFailure` 不再等待。Claude 官方说明 transcript 是异步写入的，所以 `transcript_size` 增长只能作为旁证，绝不会单独触发丢弃；通知正文始终使用官方 `last_assistant_message`。
+- 10 秒默认值优先保证普通提醒的及时性，但不覆盖官方 prompt Hook 的 30 秒默认超时。如果某个阻断 Hook 在窗口结束后才返回，仍可能先收到一次暂定提醒，这是旁路通知 Hook 无法获知并行结果合并时刻的已知边界。可用 `CLAUDE_WATCH_STOP_SETTLE_SECONDS` 在 5–600 秒内调整；需要降低延迟后误提醒或二次提醒的概率时可设为 `35` 或更长，最严格可设为 `600`，代价是普通提醒也会等同样久；自定义超时超过 600 秒仍超出本机制保证范围。
 - Claude live 队列中已经消费的数据默认在达到 4 MiB 或保留 24 小时后轮转，以先达到者为准。4 MiB 是容量软上限：只要还有未读记录、待补投事件或现存安全 drain，watcher 就不会截断或删除这些数据。轮转使用 rename 后继续排空旧 inode，确认读取完成并经过 30 秒并发写入安全窗后才删除 drain，因此不会为了隐私清理而丢事件或重发历史。
 - Claude Code 最低版本为 `2.1.196`：exec-form `args` 从 `2.1.139` 可用，`background_tasks` / `session_crons` 从 `2.1.145` 可用，而作为同一用户 prompt 主去重键的 `prompt_id` 需要 `2.1.196`。`status` / `doctor` 会解析 `claude --version`；检测到更旧或无法识别的版本时不会把 Hook 报告为可用。字段与并行语义以 [Claude Code 官方 Hooks 参考](https://code.claude.com/docs/en/hooks) 和 [官方 changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) 为准。
 - 安装器会记录 Hook 实际写入的 Claude user-settings 路径。若 `CLAUDE_CONFIG_DIR` 改变，`status` 会要求运行 `agentwatch update`，更新时先清理旧位置再写入新位置，避免两个 `Stop` Hook 同时触发。
