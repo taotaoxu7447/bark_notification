@@ -13,7 +13,7 @@ cd /path/to/codex-watch-notifier-handoff-2026-06-16
 ./install_launch_agent.zsh --delivery both --json --no-login
 ```
 
-For `bark`, Codex must pause while the user personally copies the Bark home-screen personal push URL or key into the persistent private `~/.codex-watch-notifier/env`. The URL contains the key: it must not enter AI chat, argv, command output, logs, or Git. A temporary shell `export` does not configure the background watcher, which reads only the persistent private env. This is Bark configuration on the computer, not AgentWatch account pairing. There is no `configure-bark` command.
+For `bark`, Codex must pause while the user opens Bark's bottom **Server** tab and uses only the first card, whose sample looks like `https://api.day.app/<device-key>/replace-with-your-push-content`. The user removes the trailing sample-content path and privately stores the base URL ending at `<device-key>` as `BARK_URL` in `~/.codex-watch-notifier/env`. Do not use the later title, sound, continuous-ring, or archive example URLs. `BARK_KEY` is a shorthand only for the official `api.day.app`; a self-hosted Bark server requires its full base `BARK_URL`. Source groups and icons are already built in and require no normal user input. The URL contains the key: it must not enter AI chat, argv, command output, logs, or Git. A temporary shell `export` does not configure the background watcher, which reads only the persistent private env. This is Bark configuration on the computer, not AgentWatch account pairing or an AgentWatch subscription URL. There is no `configure-bark` command.
 
 For `agentwatch`, Codex must pause. The user personally runs this in Terminal and enters the password in the hidden prompt:
 

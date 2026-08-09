@@ -55,7 +55,7 @@
 
 | 模式 | 接收设备 | 手机端准备 | 电脑端凭据 |
 | --- | --- | --- | --- |
-| `bark` | iPhone / Apple Watch | 只安装 Bark；不安装、不注册、不登录 AgentWatch | 安全保存 Bark 首页的个人推送地址或 key |
+| `bark` | iPhone / Apple Watch | 只安装 Bark；不安装、不注册、不登录 AgentWatch | 安全保存 Bark“服务器”页第一张卡片中的个人推送基础地址 |
 | `agentwatch` | Android / Android 穿戴设备转发 | 安装自研 AgentWatch App，并注册或登录账号 | 使用同一 AgentWatch 账号登录，保存只写 computer token |
 | `both` | 同时使用上述两类设备 | 分别完成 Bark 和 Android AgentWatch 准备 | 两条通道独立配置；即使尚未完成 Android 账号登录，已配置的 Bark 仍应照常运行 |
 
@@ -75,18 +75,46 @@ agentwatch install --delivery both
 
 1. 在 iPhone 安装 Bark。
 2. 打开 Bark，允许通知权限。
-3. 复制 Bark 首页显示的推送地址或 key。
-4. 如果使用 Apple Watch，保持 iPhone 和 Apple Watch 的系统通知同步设置正常。Bark 通知会按 iOS / watchOS 的规则转发到手表。
+3. 点击 Bark 底部的“服务器”页签。如果 Bark 中添加了多个服务器，先进入这台 iPhone 实际用于接收推送的那一个；官方服务器页顶通常显示 `api.day.app`，但这个页面标题本身不是完整推送地址。页面最上方第一张卡片标题是“这里改成你自己的推送内容”，其中会显示类似下面的测试 URL：
 
-iPhone / Apple Watch 用户只需要 Bark，不需要安装 AgentWatch App，也不需要注册或登录 AgentWatch 账号。电脑仍然必须得到这台 iPhone 的 Bark 首页个人推送地址或 key 才能发送通知；这是把个人 Bark 凭据安全配置到电脑，不是与 AgentWatch 账号配对。
+   ```text
+   https://api.day.app/<你的设备Key>/这里改成你自己的推送内容
+   ```
 
-配置时可以二选一：
+4. 复制这张第一卡片的 URL，然后删掉设备 Key 后面的“`/这里改成你自己的推送内容`”。电脑端实际需要保存的是以设备 Key 结尾的基础地址：
+
+   ```text
+   https://api.day.app/<你的设备Key>
+   ```
+
+5. **不要选择**下面的“推送标题”、“推送铃声”、“持续响铃”或“自动保存”等示例 URL。它们只是 Bark 演示不同调用参数的测试地址，不是本项目要求的配置。
+6. 如果使用 Apple Watch，保持 iPhone 和 Apple Watch 的系统通知同步设置正常。Bark 通知会按 iOS / watchOS 的规则转发到手表。
+
+iPhone / Apple Watch 用户只需要 Bark，不需要安装 AgentWatch App，也不需要注册或登录 AgentWatch 账号。电脑仍然必须得到这台 iPhone 的 Bark 个人推送基础地址或 key 才能发送通知；这是把个人 Bark 凭据安全配置到电脑，不是“订阅地址”，也不是与 AgentWatch 账号配对。
+
+配置时优先使用完整基础地址：
 
 ```bash
 BARK_URL=https://api.day.app/<your-key>
-# 或
+# 仅使用 Bark 官方 api.day.app 服务器时，也可以只写 key：
 BARK_KEY=<your-key>
 ```
+
+如果 Bark App 使用自建服务器，必须使用带自建域名的完整 `BARK_URL`；`BARK_KEY` 简写会默认发往官方 `https://api.day.app`。
+
+本项目会自动识别任务来源，新安装也已在 `env.example` 中内置 Bark 分组名和图标 URL。普通用户不需要再找图标或逐项配置分组：
+
+| 任务来源 | Bark 自动分组 |
+| --- | --- |
+| Codex | `Codex` |
+| ZCode | `ZCode` |
+| Kimi Code | `Kimi Code` |
+| Grok Build | `Grok Build` |
+| Claude Code | `Claude Code` |
+| Pi Agent | `Pi Agent` |
+| OpenCode | `OpenCode` |
+
+桌面端会在发送时自动填入标题、正文、分组、图标和通知级别；Bark 页面上其他带标题、铃声或查询参数的测试 URL 都不需要提供。
 
 Bark 完整推送地址本身包含 key，同样属于密钥。不要把真实值发到 AI 对话、写进命令行参数、日志或 Git；由用户本人写入权限受限的 `~/.codex-watch-notifier/env`，AI 只能准备空白配置和检查文件权限，不能读取或回显该值。临时在当前 shell 中 `export BARK_URL=...` 或 `export BARK_KEY=...` 不算后台配置，后台 watcher 只读取持久的私有 `env` 文件。用户保存文件后必须运行 `~/.local/bin/agentwatch update`，让 CLI 重新协调并启动或重启后台服务，然后再运行 `doctor --json`。AgentWatch 密码同样不得进入 AI 对话或 argv，只能由用户在 CLI 隐藏提示中输入。
 
@@ -194,7 +222,7 @@ AI 必须先询问或判断接收设备，再映射到 `agentwatch install --del
 ./install_launch_agent.zsh --delivery both --json --no-login
 ```
 
-`agentwatch` 或 `both` 模式看到 `login_required=true` 后，AI 应暂停，让用户亲自在终端运行 `~/.local/bin/agentwatch login` 并输入隐藏密码。`bark` 模式不得要求 AgentWatch 登录；AI 应让用户本人把 Bark 首页个人推送地址或 key 写入电脑持久私有配置，且不得通过聊天或 argv 传递。临时 shell `export` 不算后台配置。用户只需确认 secret 已经保存，不应把值反馈给 AI；随后由 AI 运行 `~/.local/bin/agentwatch update` 重新协调后台，再运行只读的 `agentwatch doctor --json`。`both` 尚未完成 Android 登录时，update 仍应让 Bark 独立运行。`doctor` 不会启动服务或自动测试通知。完整约束见 [`AI_INSTALL.md`](AI_INSTALL.md)。
+`agentwatch` 或 `both` 模式看到 `login_required=true` 后，AI 应暂停，让用户亲自在终端运行 `~/.local/bin/agentwatch login` 并输入隐藏密码。`bark` 模式不得要求 AgentWatch 登录；AI 应指导用户从 Bark“服务器”页第一张卡片复制 URL，删掉设备 Key 后的推送内容占位路径，再把剩下的个人推送基础地址写入电脑持久私有配置。不得让用户选择“推送标题”、“推送铃声”或“持续响铃”等示例 URL，也不得通过聊天或 argv 传递真实地址。临时 shell `export` 不算后台配置。用户只需确认 secret 已经保存，不应把值反馈给 AI；随后由 AI 运行 `~/.local/bin/agentwatch update` 重新协调后台，再运行只读的 `agentwatch doctor --json`。项目已内置支持工具的 Bark 分组和图标，普通用户不需要另外提供。`both` 尚未完成 Android 登录时，update 仍应让 Bark 独立运行。`doctor` 不会启动服务或自动测试通知。完整约束见 [`AI_INSTALL.md`](AI_INSTALL.md)。
 
 统一命令：
 
@@ -220,23 +248,23 @@ agentwatch uninstall
 
 | 变量 | 说明 |
 | --- | --- |
-| `BARK_URL` | Bark 完整推送地址，例如 `https://api.day.app/<key>` |
-| `BARK_KEY` | Bark key；和 `BARK_URL` 二选一 |
+| `BARK_URL` | 从 Bark“服务器”页第一张卡片提取的个人推送基础地址，以设备 Key 结尾，例如 `https://api.day.app/<key>`；不包含测试正文、标题、铃声或查询参数 |
+| `BARK_KEY` | Bark 设备 key；仅适用于官方 `api.day.app`，和 `BARK_URL` 二选一；自建 Bark 服务器必须使用完整 `BARK_URL` |
 | `BARK_LEVEL` | Bark 通知级别，默认 `timeSensitive` |
 | `CODEX_BARK_GROUP` | Codex 通知分组，默认 `Codex` |
-| `CODEX_BARK_ICON` | Codex 通知图标 URL |
+| `CODEX_BARK_ICON` | Codex 通知图标 URL；新安装已内置默认值，仅在需要自定义时覆盖 |
 | `ZCODE_BARK_GROUP` | ZCode 通知分组，默认 `ZCode` |
-| `ZCODE_BARK_ICON` | ZCode 通知图标 URL |
+| `ZCODE_BARK_ICON` | ZCode 通知图标 URL；新安装已内置默认值，仅在需要自定义时覆盖 |
 | `KIMI_BARK_GROUP` | Kimi Code 通知分组，默认 `Kimi Code` |
-| `KIMI_BARK_ICON` | Kimi Code 通知图标 URL；默认使用仓库内的 Kimi 官方 App 图案适配版 |
+| `KIMI_BARK_ICON` | Kimi Code 通知图标 URL；新安装默认使用仓库内的 Kimi 官方 App 图案适配版，仅在需要自定义时覆盖 |
 | `GROK_BARK_GROUP` | Grok Build 通知分组，默认 `Grok Build` |
-| `GROK_BARK_ICON` | Grok Build 通知图标 URL；默认使用仓库内的 Grok 官方 App 图案适配版 |
+| `GROK_BARK_ICON` | Grok Build 通知图标 URL；新安装默认使用仓库内的 Grok 官方 App 图案适配版，仅在需要自定义时覆盖 |
 | `CLAUDE_BARK_GROUP` | Claude Code 通知分组，默认 `Claude Code` |
-| `CLAUDE_BARK_ICON` | Claude Code 的可选 Bark 图标 URL；可使用仓库内的 [`source_claude.png`](https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/android/app/src/main/res/drawable-nodpi/source_claude.png)，发布包同时包含 `assets/claude-icon-v1.png` |
+| `CLAUDE_BARK_ICON` | Claude Code 的 Bark 图标 URL；新安装已内置仓库中的 [`source_claude.png`](https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/android/app/src/main/res/drawable-nodpi/source_claude.png)，仅在需要自定义时覆盖；发布包同时包含 `assets/claude-icon-v1.png` |
 | `PI_BARK_GROUP` | Pi Agent 通知分组，默认 `Pi Agent` |
-| `PI_BARK_ICON` | Pi Agent 通知图标 URL；默认使用仓库内的 `assets/pi-icon-v1.png` |
+| `PI_BARK_ICON` | Pi Agent 通知图标 URL；新安装默认使用仓库内的 `assets/pi-icon-v1.png`，仅在需要自定义时覆盖 |
 | `OPENCODE_BARK_GROUP` | OpenCode 通知分组，默认 `OpenCode` |
-| `OPENCODE_BARK_ICON` | OpenCode 通知图标 URL；默认使用仓库内的 `assets/opencode-icon-v1.png` |
+| `OPENCODE_BARK_ICON` | OpenCode 通知图标 URL；新安装默认使用仓库内的 `assets/opencode-icon-v1.png`，仅在需要自定义时覆盖 |
 | `AGENTWATCH_API_BASE` | 账号绑定 API，默认是项目自建服务器的 `/agentwatch/api/v1` |
 | `AGENTWATCH_PRIORITY` | AgentWatch 通知优先级，默认 `default` |
 | `CODEX_WATCH_POLL_INTERVAL` | 轮询间隔，默认 2 秒 |

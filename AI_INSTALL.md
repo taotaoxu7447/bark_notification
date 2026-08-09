@@ -20,12 +20,24 @@ agentwatch install --delivery both
 
 不存在 `configure-bark` 命令，不得编造。应使用当前包提供的安装入口，并保持上述模式语义。
 
+## iPhone Bark 地址的准确辨认规则
+
+不要只告诉用户“提供 Bark 地址”。Bark 的“服务器”页有多张示例卡片，AI 必须把下面的选择方法说清楚：
+
+1. 让用户打开 iPhone Bark，进入底部“服务器”页签。如果 App 中有多个服务器，先选择这台 iPhone 实际用于收信的那一个。不要把页面顶部的 `api.day.app` 标题单独当成推送地址。
+2. 只查看页面最上方第一张“这里改成你自己的推送内容”卡片。它会显示类似 `https://api.day.app/<device-key>/这里改成你自己的推送内容` 的测试 URL。
+3. 用户复制后，删掉设备 Key 后面的推送内容占位路径。实际写入 `BARK_URL` 的值必须以设备 Key 结尾，例如 `https://api.day.app/<device-key>`。
+4. 不选择“推送标题”、“推送铃声”、“持续响铃”或“自动保存”等后续卡片的 URL；它们只是 Bark 的参数调用示例。
+5. 优先保存完整 `BARK_URL`。`BARK_KEY=<device-key>` 只适用于 Bark 官方 `api.day.app`；使用自建 Bark 服务器时必须保留自建域名并使用完整 `BARK_URL`。
+
+这个值是个人推送端点，不应称为 AgentWatch 订阅地址。桌面端会自动添加通知标题、正文、来源分组、内置图标和通知级别。对普通用户，AI 不得额外索取 `CODEX_BARK_GROUP`、`KIMI_BARK_ICON`、`CLAUDE_BARK_ICON` 等可选覆盖项。
+
 ## 不可违反的安全边界
 
 - 不要向用户索取 AgentWatch 密码，也不要让用户把密码发到 AI 对话中。
 - 不要使用、建议或实现 `--password`；该参数会被 CLI 主动拒绝。
 - 不要把密码写入环境变量、`.env`、配置文件、shell 历史、日志或临时文件。
-- Bark 首页个人推送地址包含 key，本身就是密钥。不要向用户索取，不要让它进入 AI 对话、argv、日志、Git 或 AI 可见的命令输出。
+- Bark“服务器”页的个人推送基础地址包含 key，本身就是密钥。不要向用户索取，不要让它进入 AI 对话、argv、日志、Git 或 AI 可见的命令输出。
 - Bark 模式仍需要把该个人推送地址或 key 安全配置到电脑；这只是 Bark 投递配置，不是 AgentWatch 账号配对。AI 可以准备权限受限的空白配置，但必须暂停，让用户本人把真实值写入持久的 `~/.codex-watch-notifier/env`，且不得随后读取或回显。当前 shell 的临时 `export` 不算后台配置，后台只以持久私有 `env` 为准。
 - 不要读取、打印或复制 computer token。登录后 CLI 自动把它写入系统凭据存储。
 - 不要配置 topic、订阅 URL 或用户 ID。电脑只调用账号绑定的 `/publish` API，目标账号由服务器根据 computer token 决定。
@@ -90,7 +102,7 @@ Windows PowerShell：
 
 #### `bark`
 
-用户在 iPhone Bark 首页找到个人推送地址或 key，并亲自将 `BARK_URL` 或 `BARK_KEY` 写入电脑上权限受限的持久 `~/.codex-watch-notifier/env`。AI 不得让用户把真实值粘贴到聊天或命令参数，不得代填、读取或打印该值。只在当前 shell 临时 `export` 不会配置后台 watcher。Bark-only 用户不运行 `agentwatch login`。
+按前文“iPhone Bark 地址的准确辨认规则”指导用户进入 Bark“服务器”页，从第一张卡片复制 URL，并只保留到设备 Key 为止。用户亲自将完整基础地址写入 `BARK_URL`；仅官方 `api.day.app` 可选择把 key 写入 `BARK_KEY`。持久配置位于电脑上权限受限的 `~/.codex-watch-notifier/env`。AI 不得让用户把真实值粘贴到聊天或命令参数，不得代填、读取或打印该值。只在当前 shell 临时 `export` 不会配置后台 watcher。项目的默认配置已包含 Codex、ZCode、Kimi Code、Grok Build、Claude Code、Pi Agent 和 OpenCode 的分组与图标，不要要求普通用户另行配置。Bark-only 用户不运行 `agentwatch login`。
 
 #### `agentwatch`
 

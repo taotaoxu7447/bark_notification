@@ -7,13 +7,13 @@ signing key is not part of the platform packages and must never enter Git.
 
 Every desktop package supports the same delivery selection:
 
-- `bark`: iPhone / Apple Watch users install only Bark and privately configure that Bark installation's home-screen push URL or key on the computer. They do not register or log in to AgentWatch.
+- `bark`: iPhone / Apple Watch users install only Bark and privately configure the base personal push URL from the first card on Bark's **Server** tab. The saved `BARK_URL` ends at the device key; it excludes the sample content path and all later title, sound, continuous-ring, or archive examples. They do not register or log in to AgentWatch.
 - `agentwatch`: Android users install the custom AgentWatch app and use the same account on the computer.
 - `both`: both channels coexist independently. A missing AgentWatch login must not prevent a configured Bark channel from running.
 
 The shared CLI contract is `agentwatch install --delivery bark|agentwatch|both`; each platform installer forwards `--delivery`. There is no `configure-bark` command. Bark URL/key and AgentWatch password must never enter AI chat or argv. Install and `update` idempotently coordinate AgentWatch's Claude Code `Stop`/`StopFailure` hooks, Pi Agent `agent_settled` extension, and OpenCode `session.idle` plugin while preserving every unrelated setting and file. Claude Code 2.1.196+, Pi Agent 0.80.4+, and OpenCode 1.15.11+ are required for their integrations. Install, `update`, and `doctor` never send a test notification, and `doctor` never starts/restarts the background watcher.
 
-For every `bark` or `both` install, the user must save `BARK_URL` or `BARK_KEY` in the persistent private `~/.codex-watch-notifier/env` (or its Windows-profile equivalent). A temporary shell export is not background configuration. After the user confirms the secret was saved without revealing it, run `agentwatch update` to reconcile and start/restart the service, then run the read-only `agentwatch doctor --json`.
+For every `bark` or `both` install, the user must save the full base `BARK_URL` in the persistent private `~/.codex-watch-notifier/env` (or its Windows-profile equivalent). `BARK_KEY` is an alternative only for the official `api.day.app`; self-hosted Bark requires the complete base URL. A temporary shell export is not background configuration. Source grouping and icon URLs ship as non-secret defaults, so packaging and installation must not ask ordinary users to configure them individually. After the user confirms the secret was saved without revealing it, run `agentwatch update` to reconcile and start/restart the service, then run the read-only `agentwatch doctor --json`.
 
 ## Shared Core
 
