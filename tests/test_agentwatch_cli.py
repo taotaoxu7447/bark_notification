@@ -1172,6 +1172,8 @@ class CliSafetyTests(unittest.TestCase):
             registration_script = register[-1]
             self.assertIn("-WindowStyle Hidden", registration_script)
             self.assertIn("-RestartCount 999", registration_script)
+            self.assertIn("-RunLevel Limited", registration_script)
+            self.assertNotIn("-RunLevel LeastPrivilege", registration_script)
             self.assertIn(["schtasks.exe", "/Change", "/TN", agentwatch.WINDOWS_TASK, "/Disable"], commands)
             wrapper = (paths.runtime / "run_notifier.ps1").read_text(encoding="utf-8")
             self.assertIn("task.out.log", wrapper)

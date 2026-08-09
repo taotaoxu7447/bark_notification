@@ -1023,7 +1023,7 @@ WantedBy=default.target
             "$ErrorActionPreference='Stop';"
             f"$action=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '{escaped_task_command}';"
             "$trigger=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
-            "$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel LeastPrivilege;"
+            "$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited;"
             "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
             "-RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1);"
             f"Register-ScheduledTask -TaskName '{WINDOWS_TASK}' -Action $action -Trigger $trigger "
