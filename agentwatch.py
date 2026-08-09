@@ -70,6 +70,7 @@ VERSION = "0.4.0"
 MACOS_LABEL = "com.xutao.codex-watch-notifier"
 LINUX_UNIT = "codex-watch-notifier.service"
 WINDOWS_TASK = "CodexWatchNotifier"
+WINDOWS_CLI_LAUNCHER = "agentwatch-launcher.ps1"
 RUNTIME_FILES = (
     "agentwatch.py",
     "agentwatch_core.py",
@@ -183,6 +184,11 @@ def systemd_scalar_path(value: str) -> str:
     return value.replace("%", "%%")
 
 
+def powershell_literal(value: str) -> str:
+    """Render a PowerShell single-quoted literal without interpolation."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 class InstallPaths:
     def __init__(self, root: Path | None = None, home: Path | None = None) -> None:
         self.config = root or config_dir()
@@ -190,6 +196,7 @@ class InstallPaths:
         self.runtime = self.config / "bin"
         self.launcher_dir = self.home / ".local" / "bin"
         self.launcher = self.launcher_dir / ("agentwatch.cmd" if platform.system() == "Windows" else "agentwatch")
+        self.windows_cli_launcher = self.launcher_dir / WINDOWS_CLI_LAUNCHER
         self.macos_plist = self.home / "Library" / "LaunchAgents" / f"{MACOS_LABEL}.plist"
         self.linux_unit = self.home / ".config" / "systemd" / "user" / LINUX_UNIT
 
@@ -1043,9 +1050,12 @@ WantedBy=default.target
 
 def install_runtime(paths: InstallPaths, source: Path | None = None) -> None:
     source_root = source or Path(__file__).resolve().parent
+    system_name = platform.system()
     reject_symlink_path(paths.config, paths.config.parent)
     reject_symlink_path(paths.runtime, paths.config.parent)
     reject_symlink_path(paths.launcher, paths.home)
+    if system_name == "Windows":
+        reject_symlink_path(paths.windows_cli_launcher, paths.home)
     paths.config.mkdir(parents=True, exist_ok=True)
     paths.runtime.mkdir(parents=True, exist_ok=True)
     try:
@@ -1072,19 +1082,40 @@ def install_runtime(paths: InstallPaths, source: Path | None = None) -> None:
         atomic_write(env_path, (source_root / "env.example").read_bytes(), mode=0o600)
 
     paths.launcher_dir.mkdir(parents=True, exist_ok=True)
-    if platform.system() == "Windows":
+    if system_name == "Windows":
         run_script = paths.runtime / "run_notifier.ps1"
         reject_symlink_path(run_script, paths.config.parent)
         watcher = paths.runtime / "codex_watch_notifier.py"
         out_log = paths.config / "task.out.log"
         err_log = paths.config / "task.err.log"
         powershell = f'''$ErrorActionPreference = "Stop"
-$env:AGENTWATCH_CONFIG_DIR = '{str(paths.config).replace("'", "''")}'
-& "{sys.executable}" "{watcher}" 1>> "{out_log}" 2>> "{err_log}"
+$env:AGENTWATCH_CONFIG_DIR = {powershell_literal(str(paths.config))}
+& {powershell_literal(sys.executable)} {powershell_literal(str(watcher))} 1>> {powershell_literal(str(out_log))} 2>> {powershell_literal(str(err_log))}
 exit $LASTEXITCODE
 '''
-        atomic_write(run_script, powershell.encode("utf-8"), mode=0o700)
-        launcher = f'@echo off\r\n"{sys.executable}" "{paths.runtime / "agentwatch.py"}" %*\r\n'
+        # Windows PowerShell 5.1 treats a UTF-8 script without a BOM as the
+        # active ANSI code page.  A BOM is therefore required when any
+        # installer path contains non-ASCII characters.
+        atomic_write(run_script, powershell.encode("utf-8-sig"), mode=0o700)
+
+        cli_powershell = f'''$ErrorActionPreference = "Stop"
+& {powershell_literal(sys.executable)} {powershell_literal(str(paths.runtime / "agentwatch.py"))} @args
+exit $LASTEXITCODE
+'''
+        atomic_write(
+            paths.windows_cli_launcher,
+            cli_powershell.encode("utf-8-sig"),
+            mode=0o700,
+        )
+        # Keep the batch file strictly ASCII so cmd.exe can parse it under
+        # every OEM code page.  %~dp0 resolves the Unicode launcher directory
+        # at runtime; PowerShell 5.1 then reads the BOM-marked path literals.
+        launcher = (
+            "@echo off\r\n"
+            "setlocal DisableDelayedExpansion\r\n"
+            f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0{WINDOWS_CLI_LAUNCHER}" %*\r\n'
+            "exit /b %ERRORLEVEL%\r\n"
+        )
     else:
         launcher = (
             "#!/bin/sh\nexec "
@@ -2503,6 +2534,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "uninstall":
             reject_symlink_path(paths.launcher, paths.home)
+            if platform.system() == "Windows":
+                reject_symlink_path(paths.windows_cli_launcher, paths.home)
             reject_symlink_path(paths.runtime, paths.config.parent)
             hook_cleanup_error: str | None = None
             try:
@@ -2573,6 +2606,11 @@ def main(argv: list[str] | None = None) -> int:
                 paths.launcher.unlink()
             except FileNotFoundError:
                 pass
+            if platform.system() == "Windows":
+                try:
+                    paths.windows_cli_launcher.unlink()
+                except FileNotFoundError:
+                    pass
             for filename in RUNTIME_FILES:
                 try:
                     (paths.runtime / filename).unlink()

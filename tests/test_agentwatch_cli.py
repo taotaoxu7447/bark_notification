@@ -1015,6 +1015,84 @@ class CliSafetyTests(unittest.TestCase):
 
             self.assertEqual("do not overwrite", outside.read_text(encoding="utf-8"))
 
+    def test_windows_runtime_wrappers_are_encoding_safe_for_non_ascii_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "用户!许涛$资料's" / "配置"
+            home = root / "用户!许涛" / "主`目录"
+            python = root / "Python!中文`$'s" / "python.exe"
+            source = Path(agentwatch.__file__).resolve().parent
+
+            with mock.patch.object(agentwatch.platform, "system", return_value="Windows"), mock.patch.object(
+                agentwatch.sys, "executable", str(python)
+            ):
+                paths = agentwatch.InstallPaths(config, home)
+                agentwatch.install_runtime(paths, source)
+
+            bom = b"\xef\xbb\xbf"
+            run_script = paths.runtime / "run_notifier.ps1"
+            run_bytes = run_script.read_bytes()
+            self.assertTrue(run_bytes.startswith(bom))
+            self.assertFalse(run_bytes[len(bom) :].startswith(bom))
+            run_text = run_bytes.decode("utf-8-sig")
+            self.assertIn(
+                f"$env:AGENTWATCH_CONFIG_DIR = {agentwatch.powershell_literal(str(config))}",
+                run_text,
+            )
+            self.assertIn(agentwatch.powershell_literal(str(python)), run_text)
+            self.assertIn(
+                agentwatch.powershell_literal(str(paths.runtime / "codex_watch_notifier.py")),
+                run_text,
+            )
+            self.assertIn(agentwatch.powershell_literal(str(config / "task.out.log")), run_text)
+            self.assertIn(agentwatch.powershell_literal(str(config / "task.err.log")), run_text)
+
+            cli_bytes = paths.windows_cli_launcher.read_bytes()
+            self.assertTrue(cli_bytes.startswith(bom))
+            cli_text = cli_bytes.decode("utf-8-sig")
+            self.assertIn(agentwatch.powershell_literal(str(python)), cli_text)
+            self.assertIn(
+                agentwatch.powershell_literal(str(paths.runtime / "agentwatch.py")),
+                cli_text,
+            )
+            self.assertIn(" @args\n", cli_text)
+
+            # cmd.exe decodes batch source through its OEM code page.  The
+            # launcher therefore contains no locale-dependent bytes or
+            # installer-generated absolute paths at all.
+            launcher_bytes = paths.launcher.read_bytes()
+            launcher_text = launcher_bytes.decode("ascii")
+            self.assertEqual(
+                "@echo off\r\n"
+                "setlocal DisableDelayedExpansion\r\n"
+                "powershell.exe -NoProfile -ExecutionPolicy Bypass "
+                f'-File "%~dp0{agentwatch.WINDOWS_CLI_LAUNCHER}" %*\r\n'
+                "exit /b %ERRORLEVEL%\r\n",
+                launcher_text,
+            )
+            self.assertNotIn(str(python), launcher_text)
+            self.assertNotIn(str(home), launcher_text)
+            self.assertNotIn(str(config), launcher_text)
+            self.assertEqual(0o700, stat.S_IMODE(run_script.stat().st_mode))
+            self.assertEqual(0o700, stat.S_IMODE(paths.windows_cli_launcher.stat().st_mode))
+            self.assertEqual(0o700, stat.S_IMODE(paths.launcher.stat().st_mode))
+
+    def test_windows_install_refuses_cli_launcher_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = Path(agentwatch.__file__).resolve().parent
+            with mock.patch.object(agentwatch.platform, "system", return_value="Windows"):
+                paths = agentwatch.InstallPaths(root / "配置", root / "用户 许涛")
+                paths.launcher_dir.mkdir(parents=True)
+                outside = root / "outside.ps1"
+                outside.write_text("do not overwrite", encoding="utf-8")
+                paths.windows_cli_launcher.symlink_to(outside)
+
+                with self.assertRaises(agentwatch_core.AgentWatchError):
+                    agentwatch.install_runtime(paths, source)
+
+            self.assertEqual("do not overwrite", outside.read_text(encoding="utf-8"))
+
     def test_unauthenticated_linux_install_writes_valid_unit_and_keeps_service_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1380,6 +1458,71 @@ class CliSafetyTests(unittest.TestCase):
         self.assertGreaterEqual(
             sum(command[0] == "powershell.exe" for command in commands), 2
         )
+
+    def test_windows_uninstall_failure_preserves_both_cli_launchers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            agentwatch.platform, "system", return_value="Windows"
+        ):
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "配置", root / "用户!许涛")
+            paths.runtime.mkdir(parents=True)
+            paths.launcher_dir.mkdir(parents=True)
+            runtime_script = paths.runtime / "agentwatch.py"
+            runtime_script.write_text("# must remain\n", encoding="utf-8")
+            paths.launcher.write_bytes(b"@echo off\r\n")
+            paths.windows_cli_launcher.write_bytes(b"\xef\xbb\xbf# must remain\r\n")
+            service = mock.Mock()
+            service.uninstall.side_effect = agentwatch_core.AgentWatchError("service remains")
+            output = io.StringIO()
+
+            with mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "_configure_installed_claude_hooks", return_value={}
+            ), mock.patch.object(
+                agentwatch, "_configure_installed_tool_hooks", return_value=False
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["uninstall", "--json"])
+
+            self.assertEqual(1, result)
+            self.assertTrue(runtime_script.exists())
+            self.assertTrue(paths.launcher.exists())
+            self.assertTrue(paths.windows_cli_launcher.exists())
+            self.assertEqual("service_cleanup_failed", json.loads(output.getvalue())["error"])
+
+    def test_windows_successful_uninstall_removes_both_cli_launchers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            agentwatch.platform, "system", return_value="Windows"
+        ):
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "配置", root / "用户!许涛")
+            paths.runtime.mkdir(parents=True)
+            paths.launcher_dir.mkdir(parents=True)
+            runtime_script = paths.runtime / "agentwatch.py"
+            run_notifier = paths.runtime / "run_notifier.ps1"
+            runtime_script.write_text("# remove\n", encoding="utf-8")
+            run_notifier.write_bytes(b"\xef\xbb\xbf# remove\r\n")
+            paths.launcher.write_bytes(b"@echo off\r\n")
+            paths.windows_cli_launcher.write_bytes(b"\xef\xbb\xbf# remove\r\n")
+            service = mock.Mock()
+            output = io.StringIO()
+
+            with mock.patch.object(agentwatch, "InstallPaths", return_value=paths), mock.patch.object(
+                agentwatch, "ServiceManager", return_value=service
+            ), mock.patch.object(
+                agentwatch, "_configure_installed_claude_hooks", return_value={}
+            ), mock.patch.object(
+                agentwatch, "_configure_installed_tool_hooks", return_value=False
+            ), mock.patch("sys.stdout", output):
+                result = agentwatch.main(["uninstall", "--json"])
+
+            self.assertEqual(0, result)
+            service.uninstall.assert_called_once_with()
+            self.assertFalse(runtime_script.exists())
+            self.assertFalse(run_notifier.exists())
+            self.assertFalse(paths.launcher.exists())
+            self.assertFalse(paths.windows_cli_launcher.exists())
+            self.assertTrue(json.loads(output.getvalue())["ok"])
 
     def test_uninstall_combines_service_and_claude_hook_cleanup_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
