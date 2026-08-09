@@ -1015,10 +1015,13 @@ class CliSafetyTests(unittest.TestCase):
 
             self.assertEqual("do not overwrite", outside.read_text(encoding="utf-8"))
 
-    def test_unauthenticated_linux_install_keeps_service_disabled(self) -> None:
+    def test_unauthenticated_linux_install_writes_valid_unit_and_keeps_service_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            paths = agentwatch.InstallPaths(
+                root / "config path % value \\ literal",
+                root / "home",
+            )
             paths.runtime.mkdir(parents=True)
             completed = mock.Mock(returncode=0, stdout="", stderr="")
 
@@ -1047,6 +1050,10 @@ class CliSafetyTests(unittest.TestCase):
                 agentwatch.ServiceManager(paths, system_name="Linux").install(authenticated=False)
 
             commands = [call.args[0] for call in run.call_args_list]
+            unit = paths.linux_unit.read_text(encoding="utf-8")
+            expected_working_directory = str(paths.runtime).replace("%", "%%")
+            self.assertIn(f"WorkingDirectory={expected_working_directory}\n", unit)
+            self.assertNotIn('WorkingDirectory="', unit)
             self.assertIn(["systemctl", "--user", "disable", agentwatch.LINUX_UNIT], commands)
             self.assertNotIn(["systemctl", "--user", "enable", "--now", agentwatch.LINUX_UNIT], commands)
 

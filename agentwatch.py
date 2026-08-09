@@ -176,6 +176,13 @@ def systemd_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def systemd_scalar_path(value: str) -> str:
+    """Render a scalar systemd path; its parser treats outer quotes literally."""
+    if "\n" in value or "\r" in value:
+        raise AgentWatchError("invalid newline in systemd unit value")
+    return value.replace("%", "%%")
+
+
 class InstallPaths:
     def __init__(self, root: Path | None = None, home: Path | None = None) -> None:
         self.config = root or config_dir()
@@ -979,7 +986,7 @@ After=network-online.target
 [Service]
 Type=simple
 Environment={systemd_quote('AGENTWATCH_CONFIG_DIR=' + str(self.paths.config))}
-WorkingDirectory={systemd_quote(str(self.paths.runtime))}
+WorkingDirectory={systemd_scalar_path(str(self.paths.runtime))}
 ExecStart={systemd_quote(sys.executable)} {systemd_quote(str(self.paths.runtime / 'codex_watch_notifier.py'))}
 Restart=always
 RestartSec=5
