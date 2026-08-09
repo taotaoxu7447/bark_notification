@@ -1013,6 +1013,13 @@ class ComputerTokenStore:
         except FileNotFoundError:
             return None
         try:
+            # _windows_save writes one trailing LF for a regular text-file
+            # shape. Keep Base64 validation strict while accepting exactly
+            # that writer-owned line ending (and an edited CRLF equivalent).
+            if encoded.endswith(b"\r\n"):
+                encoded = encoded[:-2]
+            elif encoded.endswith(b"\n"):
+                encoded = encoded[:-1]
             protected = base64.b64decode(encoded, validate=True)
             value = _dpapi_unprotect(protected).decode("utf-8").strip()
         except (ValueError, UnicodeError, AgentWatchError) as exc:

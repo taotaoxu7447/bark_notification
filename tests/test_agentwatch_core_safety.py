@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 import tempfile
@@ -330,6 +331,60 @@ class StrictCredentialLoadTests(unittest.TestCase):
                 agentwatch_core.AgentWatchError, "DPAPI computer token is unreadable"
             ):
                 store.load_strict()
+
+    def test_windows_saved_dpapi_file_round_trips_with_writer_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = agentwatch_core.ComputerTokenStore(
+                "computer-win", root, system_name="Windows"
+            )
+            protected = b"protected-token-bytes"
+
+            with mock.patch.object(
+                agentwatch_core, "_dpapi_protect", return_value=protected
+            ), mock.patch.object(
+                agentwatch_core, "_dpapi_unprotect", return_value=b"private-token"
+            ) as unprotect:
+                store.save("private-token")
+                self.assertTrue(store._windows_path().read_bytes().endswith(b"\n"))
+                self.assertEqual("private-token", store.load_strict())
+
+            unprotect.assert_called_once_with(protected)
+
+    def test_windows_dpapi_loader_keeps_base64_whitespace_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = agentwatch_core.ComputerTokenStore(
+                "computer-win", root, system_name="Windows"
+            )
+            store._windows_path().write_bytes(b"cHJvdGVjdGVk\n\n")
+
+            with mock.patch.object(agentwatch_core, "_dpapi_unprotect") as unprotect:
+                with self.assertRaisesRegex(
+                    agentwatch_core.AgentWatchError,
+                    "DPAPI computer token is unreadable",
+                ):
+                    store.load_strict()
+
+            unprotect.assert_not_called()
+
+    def test_windows_dpapi_loader_accepts_one_crlf(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = agentwatch_core.ComputerTokenStore(
+                "computer-win", root, system_name="Windows"
+            )
+            protected = b"protected-token-bytes"
+            store._windows_path().write_bytes(
+                base64.b64encode(protected) + b"\r\n"
+            )
+
+            with mock.patch.object(
+                agentwatch_core, "_dpapi_unprotect", return_value=b"private-token"
+            ) as unprotect:
+                self.assertEqual("private-token", store.load_strict())
+
+            unprotect.assert_called_once_with(protected)
 
 if __name__ == "__main__":
     unittest.main()
