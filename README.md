@@ -411,7 +411,7 @@ cd android
 ./build_release.zsh
 ```
 
-本地产物是 `android/app/build/outputs/apk/release/app-release.apk`，v0.4.0 Release 发布名为 `AgentWatch-android-v0.4.0.apk`。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
+本地产物是 `android/app/build/outputs/apk/release/app-release.apk`；当前 Android UI 版本为 v0.4.1，发布名为 `AgentWatch-android-v0.4.1.apk`。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
 
 每次发布建议从同一个 git commit 构建三种电脑端安装包和 Android APK。
 

@@ -9,20 +9,24 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.Bundle
 import android.text.Editable
 import android.text.InputType
+import android.text.TextUtils
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -48,6 +52,7 @@ class MainActivity : Activity() {
 
     private lateinit var authPanel: LinearLayout
     private lateinit var navigation: LinearLayout
+    private lateinit var mainScroll: ScrollView
     private lateinit var pageContainer: LinearLayout
     private lateinit var messagesPage: LinearLayout
     private lateinit var devicesPage: LinearLayout
@@ -59,6 +64,7 @@ class MainActivity : Activity() {
     private lateinit var registerButton: Button
     private lateinit var loginButton: Button
     private lateinit var accountText: TextView
+    private lateinit var statusDot: View
     private lateinit var statusText: TextView
     private lateinit var statusDetailText: TextView
     private lateinit var lastDeliveryText: TextView
@@ -67,9 +73,10 @@ class MainActivity : Activity() {
     private lateinit var searchInput: EditText
     private lateinit var categoryRow: LinearLayout
     private lateinit var messageList: LinearLayout
+    private lateinit var messageCountText: TextView
     private lateinit var computerList: LinearLayout
     private lateinit var historySizeText: TextView
-    private val navButtons = mutableMapOf<Page, Button>()
+    private val navButtons = mutableMapOf<Page, TextView>()
     private var selectedPage = Page.MESSAGES
     private var selectedSource: NtfyMessage.Source? = null
     private var receiverRegistered = false
@@ -90,6 +97,11 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility =
+                window.decorView.systemUiVisibility or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        }
         secretStore = SecretStore(this)
         statusStore = StatusStore(this)
         registrationClient = RegistrationClient(this)
@@ -99,8 +111,21 @@ class MainActivity : Activity() {
         historyStore.cleanupAll(historySettings.retentionDays())
         NotificationRenderer(this).createChannels()
         pendingEventId = intent.getStringExtra(EXTRA_EVENT_ID).orEmpty()
+        selectedPage = savedInstanceState?.getString(STATE_PAGE)
+            ?.let { value -> Page.entries.firstOrNull { it.name == value } }
+            ?: Page.MESSAGES
+        selectedSource = savedInstanceState?.getString(STATE_SOURCE)
+            ?.let(NtfyMessage::sourceForKey)
         setContentView(buildContent())
+        savedInstanceState?.getString(STATE_SEARCH).orEmpty().takeIf { it.isNotBlank() }?.let(searchInput::setText)
         refreshSession()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString(STATE_PAGE, selectedPage.name)
+        outState.putString(STATE_SOURCE, selectedSource?.key)
+        if (::searchInput.isInitialized) outState.putString(STATE_SEARCH, searchInput.text.toString())
+        super.onSaveInstanceState(outState)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -178,23 +203,36 @@ class MainActivity : Activity() {
     }
 
     private fun buildContent(): View {
+        val shell = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(COLOR_BACKGROUND)
+        }
+        shell.setOnApplyWindowInsetsListener { view, insets ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars())
+                view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            } else {
+                @Suppress("DEPRECATION")
+                view.setPadding(
+                    insets.systemWindowInsetLeft,
+                    insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight,
+                    insets.systemWindowInsetBottom,
+                )
+            }
+            insets
+        }
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(24), dp(20), dp(36))
-            setBackgroundColor(Color.rgb(245, 247, 251))
+            setPadding(dp(18), dp(18), dp(18), dp(30))
         }
-        root.addView(text("AgentWatch", 31f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) })
-        root.addView(text("你的 AI 任务，送达到你的设备", 16f).apply {
-            setTextColor(Color.rgb(77, 91, 124))
-            setPadding(0, dp(4), 0, dp(18))
-        })
+        root.addView(buildBrandHeader())
+        root.addView(space(18))
         root.addView(buildStatusCard())
-        root.addView(space(14))
+        root.addView(space(16))
         authPanel = buildAuthPanel()
         root.addView(authPanel)
-        navigation = buildNavigation()
-        root.addView(navigation)
-        root.addView(space(12))
         pageContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         messagesPage = buildMessagesPage()
         devicesPage = buildDevicesPage()
@@ -203,66 +241,161 @@ class MainActivity : Activity() {
         pageContainer.addView(devicesPage)
         pageContainer.addView(settingsPage)
         root.addView(pageContainer)
-        showPage(Page.MESSAGES)
-        return ScrollView(this).apply {
-            isFillViewport = true
-            addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val availableWidth = resources.displayMetrics.widthPixels - dp(24)
+        val contentWidth = minOf(availableWidth, dp(760)).coerceAtLeast(dp(280))
+        val centeredContent = FrameLayout(this).apply {
+            addView(
+                root,
+                FrameLayout.LayoutParams(
+                    contentWidth,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+                ),
+            )
         }
+        mainScroll = ScrollView(this).apply {
+            isFillViewport = true
+            clipToPadding = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            addView(
+                centeredContent,
+                ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+            )
+        }
+        shell.addView(mainScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        navigation = buildNavigation()
+        shell.addView(
+            navigation,
+            LinearLayout.LayoutParams(contentWidth, dp(70)).apply { gravity = Gravity.CENTER_HORIZONTAL },
+        )
+        showPage(selectedPage)
+        return shell
     }
 
-    private fun buildStatusCard(): LinearLayout = card().apply {
-        addView(text("实时连接", 14f, bold = true).apply { setTextColor(Color.rgb(77, 91, 124)) })
-        statusText = text("未启动", 23f, bold = true).apply {
-            setTextColor(Color.rgb(20, 33, 61))
-            setPadding(0, dp(6), 0, 0)
+    private fun buildBrandHeader(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        addView(FrameLayout(this@MainActivity).apply {
+            background = roundedBackground(COLOR_NAVY, 17)
+            clipToOutline = true
+            addView(ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.ic_launcher_agentwatch_v2)
+                scaleType = ImageView.ScaleType.CENTER_CROP
+            }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }, LinearLayout.LayoutParams(dp(54), dp(54)).apply { marginEnd = dp(13) })
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addView(text("AgentWatch", 26f, bold = true).apply {
+                setTextColor(COLOR_TEXT_PRIMARY)
+                includeFontPadding = false
+                letterSpacing = 0.01f
+            })
+            addView(text("AI 任务完成，立即送达", 13f).apply {
+                setTextColor(COLOR_TEXT_SECONDARY)
+                setPadding(0, dp(4), 0, 0)
+            })
+        })
+        addView(text("私有通道", 12f, bold = true).apply {
+            setTextColor(COLOR_BLUE)
+            gravity = Gravity.CENTER
+            background = roundedBackground(COLOR_BLUE_SOFT, 10)
+            setPadding(dp(10), dp(7), dp(10), dp(7))
+        })
+    }
+
+    private fun buildStatusCard(): LinearLayout = darkCard().apply {
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            statusDot = View(this@MainActivity).apply { background = dotBackground(COLOR_MUTED_LIGHT) }
+            addView(statusDot, LinearLayout.LayoutParams(dp(9), dp(9)).apply { marginEnd = dp(8) })
+            addView(text("实时连接", 13f, bold = true).apply {
+                setTextColor(COLOR_ON_DARK_MUTED)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(text("WebSocket", 11f, bold = true).apply {
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                background = roundedBackground(Color.argb(35, 255, 255, 255), 9)
+                setPadding(dp(9), dp(5), dp(9), dp(5))
+            })
+        })
+        statusText = text("未启动", 27f, bold = true).apply {
+            setTextColor(Color.WHITE)
+            includeFontPadding = false
+            setPadding(0, dp(12), 0, 0)
         }
         addView(statusText)
-        statusDetailText = helpText("登录后会自动连接").apply { setPadding(0, dp(5), 0, 0) }
+        statusDetailText = text("登录后会自动连接", 14f).apply {
+            setTextColor(COLOR_ON_DARK)
+            setLineSpacing(0f, 1.12f)
+            setPadding(0, dp(7), 0, dp(15))
+        }
         addView(statusDetailText)
+        addView(divider(Color.argb(38, 255, 255, 255)))
         lastDeliveryText = text("尚未收到送达回执", 13f).apply {
-            setTextColor(Color.rgb(103, 116, 143))
-            setPadding(0, dp(8), 0, 0)
+            setTextColor(COLOR_ON_DARK_MUTED)
+            setPadding(0, dp(13), 0, 0)
         }
         addView(lastDeliveryText)
     }
 
     private fun buildAuthPanel(): LinearLayout = card().apply {
-        addView(sectionTitle("注册或登录"))
-        addView(helpText("每个账号都有独立通知通道。新用户需要邀请代码；已有账号直接登录。"))
-        usernameInput = input("账号（3–32 位）")
-        addView(usernameInput)
-        passwordInput = input("密码（至少 12 位）").apply {
+        addView(eyebrow("开始使用"))
+        addView(sectionTitle("连接你的私有通知通道"))
+        addView(helpText("一个账号对应一条独立通道。已有账号直接登录，新用户填写邀请代码后注册。"))
+        usernameInput = input("3–32 位字母、数字或 . _ -")
+        addView(field("账号", usernameInput))
+        passwordInput = input("至少 12 位").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
-        addView(passwordInput)
-        inviteInput = input("新用户邀请代码")
-        addView(inviteInput)
-        deviceNameInput = input("手机或平板名称").apply { setText(DeviceIdentity.defaultName()) }
-        addView(deviceNameInput)
+        addView(field("密码", passwordInput))
+        inviteInput = input("仅注册新账号时填写")
+        addView(field("邀请代码", inviteInput))
+        deviceNameInput = input("例如：客厅平板").apply { setText(DeviceIdentity.defaultName()) }
+        addView(field("设备名称", deviceNameInput))
         registerButton = primaryButton("注册并连接") { authenticate(register = true) }
         addView(registerButton)
         loginButton = secondaryButton("已有账号登录") { authenticate(register = false) }
         addView(loginButton)
+        addView(text("账号凭据会使用 Android Keystore 加密保存在此设备。", 12f).apply {
+            setTextColor(COLOR_TEXT_MUTED)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(14), 0, 0)
+        })
     }
 
     private fun buildNavigation(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER
         visibility = View.GONE
+        setPadding(dp(8), dp(7), dp(8), dp(7))
+        background = roundedBackground(Color.WHITE, 22, COLOR_BORDER)
+        elevation = dp(10).toFloat()
         Page.entries.forEach { page ->
             val label = when (page) {
                 Page.MESSAGES -> "消息"
                 Page.DEVICES -> "设备"
                 Page.SETTINGS -> "设置"
             }
-            val nav = Button(this@MainActivity).apply {
+            val iconResource = when (page) {
+                Page.MESSAGES -> R.drawable.ic_ui_messages
+                Page.DEVICES -> R.drawable.ic_ui_devices
+                Page.SETTINGS -> R.drawable.ic_ui_settings
+            }
+            val nav = TextView(this@MainActivity).apply {
                 text = label
-                isAllCaps = false
-                textSize = 15f
+                textSize = 12f
+                gravity = Gravity.CENTER
                 setTypeface(typeface, Typeface.BOLD)
+                setCompoundDrawablesWithIntrinsicBounds(0, iconResource, 0, 0)
+                compoundDrawablePadding = dp(4)
                 setOnClickListener { showPage(page) }
-                layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f).apply {
-                    marginStart = dp(3)
-                    marginEnd = dp(3)
+                layoutParams = LinearLayout.LayoutParams(0, dp(56), 1f).apply {
+                    marginStart = dp(2)
+                    marginEnd = dp(2)
                 }
             }
             navButtons[page] = nav
@@ -273,9 +406,21 @@ class MainActivity : Activity() {
     private fun buildMessagesPage(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         addView(card().apply {
-            addView(sectionTitle("本机历史消息"))
-            addView(helpText("正文只保存在此 App 的私有数据库中；服务器仅短期缓存以便断线补发。"))
+            addView(eyebrow("消息中心"))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(sectionTitle("本机历史消息").apply {
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                messageCountText = countBadge("0 条")
+                addView(messageCountText)
+            })
+            addView(helpText("消息正文只保存在此设备；服务器仅短期缓存，用于断线补发。"))
             searchInput = input("搜索标题、正文或电脑名称")
+            searchInput.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_ui_search, 0, 0, 0)
+            searchInput.compoundDrawablePadding = dp(10)
+            searchInput.compoundDrawableTintList = ColorStateList.valueOf(COLOR_TEXT_MUTED)
             searchInput.addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = refreshMessages()
@@ -285,12 +430,13 @@ class MainActivity : Activity() {
             categoryRow = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
             addView(HorizontalScrollView(this@MainActivity).apply {
                 isHorizontalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
                 addView(categoryRow)
             })
-            addView(space(8))
-            addView(secondaryButton("清空当前分类") { confirmClearCurrentCategory() })
+            addView(space(10))
+            addView(dangerButton("清空当前分类") { confirmClearCurrentCategory() })
         })
-        addView(space(12))
+        addView(space(14))
         messageList = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
         addView(messageList)
     }
@@ -298,19 +444,28 @@ class MainActivity : Activity() {
     private fun buildDevicesPage(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         addView(card().apply {
+            addView(eyebrow("接收端"))
             addView(sectionTitle("当前移动设备"))
-            accountText = text("", 16f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) }
+            accountText = text("", 17f, bold = true).apply { setTextColor(COLOR_TEXT_PRIMARY) }
             addView(accountText)
-            addView(helpText("此设备通过账号的私有 WebSocket 通道接收；其他账号没有读取权限。"))
-            addView(primaryButton("重新连接") {
+            addView(text("已绑定到账号私有 WebSocket 通道，其他账号无法读取。", 13f).apply {
+                setTextColor(COLOR_TEXT_SECONDARY)
+                setPadding(0, dp(6), 0, dp(14))
+            })
+            val reconnectButton = primaryButton("重新连接") {
                 startReceiverService(forceReconnect = true)
                 toast("正在重新连接")
+            }
+            testButton = secondaryButton("发送测试") { sendEndToEndTest() }
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(reconnectButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(5) })
+                addView(testButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginStart = dp(5) })
             })
-            testButton = secondaryButton("发送一条端到端测试") { sendEndToEndTest() }
-            addView(testButton)
         })
-        addView(space(12))
+        addView(space(14))
         addView(card().apply {
+            addView(eyebrow("发送端"))
             addView(sectionTitle("已登录电脑"))
             addView(helpText("电脑使用账号密码登录后会显示在这里。撤销后，该电脑将立即失去发送权限。"))
             addView(secondaryButton("刷新电脑列表") { loadComputers() })
@@ -322,6 +477,7 @@ class MainActivity : Activity() {
     private fun buildSettingsPage(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         addView(card().apply {
+            addView(eyebrow("本地存储"))
             addView(sectionTitle("历史保留"))
             addView(helpText("默认保留 7 天。无论选择多久，每个账号最多保留最近 500 条，避免无限占用手机空间。"))
             val radioGroup = RadioGroup(this@MainActivity).apply { orientation = RadioGroup.VERTICAL }
@@ -336,6 +492,16 @@ class MainActivity : Activity() {
                     tag = days
                     text = label
                     textSize = 15f
+                    setTextColor(COLOR_TEXT_PRIMARY)
+                    buttonTintList = radioButtonTint()
+                    gravity = Gravity.CENTER_VERTICAL
+                    minHeight = dp(52)
+                    setPadding(dp(10), 0, dp(10), 0)
+                    background = roundedBackground(COLOR_SURFACE_SUBTLE, 12)
+                    layoutParams = RadioGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply { bottomMargin = dp(7) }
                     isChecked = historySettings.retentionDays() == days
                 })
             }
@@ -347,25 +513,43 @@ class MainActivity : Activity() {
                 refreshHistorySize()
             }
             addView(radioGroup)
-            historySizeText = helpText("")
+            historySizeText = text("", 13f).apply {
+                setTextColor(COLOR_TEXT_SECONDARY)
+                background = roundedBackground(COLOR_BLUE_SOFT, 12)
+                setPadding(dp(13), dp(11), dp(13), dp(11))
+            }
             addView(historySizeText)
-            addView(secondaryButton("清空全部历史") { confirmClearAllHistory() })
+            addView(dangerButton("清空全部历史") { confirmClearAllHistory() })
         })
-        addView(space(12))
+        addView(space(14))
         addView(card().apply {
+            addView(eyebrow("系统权限"))
             addView(sectionTitle("后台送达设置"))
             addView(helpText("请允许通知、自启动，并把电池管理设为完全允许后台行为。系统选项需要你亲自确认。"))
-            addView(primaryButton("打开通知设置") { BackgroundSettings.openNotificationSettings(this@MainActivity) })
-            addView(secondaryButton("打开自启动设置") { BackgroundSettings.openAutoStartSettings(this@MainActivity) })
-            addView(secondaryButton("打开电池设置") { BackgroundSettings.openBatterySettings(this@MainActivity) })
+            addView(settingRow(R.drawable.ic_ui_notifications, "通知权限", "允许任务完成提醒与手表震动") {
+                BackgroundSettings.openNotificationSettings(this@MainActivity)
+            })
+            addView(space(8))
+            addView(settingRow(R.drawable.ic_ui_autostart, "自启动", "重启手机后自动恢复连接") {
+                BackgroundSettings.openAutoStartSettings(this@MainActivity)
+            })
+            addView(space(8))
+            addView(settingRow(R.drawable.ic_ui_battery, "电池与后台", "允许长时间保持 WebSocket 连接") {
+                BackgroundSettings.openBatterySettings(this@MainActivity)
+            })
         })
-        addView(space(12))
+        addView(space(14))
         addView(card().apply {
-            addView(sectionTitle("账号"))
-            addView(helpText("登录凭据使用 Android Keystore 加密；历史正文不额外加密，但仅位于 App 私有目录且禁止备份。"))
-            logoutButton = secondaryButton("退出并撤销此设备") { askLogoutHistoryChoice() }
+            addView(eyebrow("安全"))
+            addView(sectionTitle("账号与设备"))
+            addView(helpText("登录凭据使用 Android Keystore 加密；历史正文仅保存在 App 私有目录并禁止备份。"))
+            logoutButton = dangerButton("退出并撤销此设备") { askLogoutHistoryChoice() }
             addView(logoutButton)
-            addView(helpText("版本 ${BuildConfig.VERSION_NAME} · 私有 WebSocket 通道"))
+            addView(text("AgentWatch ${BuildConfig.VERSION_NAME}  ·  私有 WebSocket 通道", 12f).apply {
+                setTextColor(COLOR_TEXT_MUTED)
+                gravity = Gravity.CENTER
+                setPadding(0, dp(14), 0, 0)
+            })
         })
     }
 
@@ -446,6 +630,7 @@ class MainActivity : Activity() {
         devicesPage.visibility = if (page == Page.DEVICES) View.VISIBLE else View.GONE
         settingsPage.visibility = if (page == Page.SETTINGS) View.VISIBLE else View.GONE
         navButtons.forEach { (candidate, button) -> styleTab(button, candidate == page) }
+        if (::mainScroll.isInitialized) mainScroll.post { mainScroll.scrollTo(0, 0) }
         when (page) {
             Page.MESSAGES -> refreshMessages()
             Page.DEVICES -> loadComputers()
@@ -460,12 +645,13 @@ class MainActivity : Activity() {
         historyStore.cleanup(account, historySettings.retentionDays())
         val entries = historyStore.entries(account, selectedSource, searchInput.text.toString())
         messageList.removeAllViews()
+        if (::messageCountText.isInitialized) messageCountText.text = getString(R.string.message_count, entries.size)
         if (entries.isEmpty()) {
-            messageList.addView(card().apply { addView(helpText("当前分类还没有历史消息。")) })
+            messageList.addView(emptyMessagesView())
         } else {
             entries.forEach { entry ->
                 messageList.addView(historyRow(entry))
-                messageList.addView(space(8))
+                messageList.addView(space(10))
             }
         }
         refreshHistorySize()
@@ -480,18 +666,24 @@ class MainActivity : Activity() {
             }
         categories.forEach { (source, label) ->
             val selected = source == selectedSource
-            categoryRow.addView(Button(this).apply {
+            categoryRow.addView(TextView(this).apply {
                 text = label
-                isAllCaps = false
                 textSize = 13f
-                setTextColor(if (selected) Color.WHITE else Color.rgb(49, 92, 245))
-                background = pillBackground(selected)
+                gravity = Gravity.CENTER
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(if (selected) Color.WHITE else COLOR_BLUE)
+                background = rippleBackground(
+                    roundedBackground(if (selected) COLOR_BLUE else COLOR_BLUE_SOFT, 13),
+                    if (selected) Color.argb(45, 255, 255, 255) else Color.argb(28, 49, 92, 245),
+                )
                 setOnClickListener {
                     selectedSource = source
                     refreshMessages()
                 }
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42)).apply {
-                    marginEnd = dp(7)
+                minWidth = dp(56)
+                setPadding(dp(16), 0, dp(16), 0)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply {
+                    marginEnd = dp(8)
                 }
             })
         }
@@ -499,26 +691,45 @@ class MainActivity : Activity() {
 
     private fun historyRow(entry: HistoryStore.Entry): LinearLayout = card().apply {
         orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.TOP
+        gravity = Gravity.CENTER_VERTICAL
         setOnClickListener { showHistoryDetail(entry) }
-        addView(ImageView(this@MainActivity).apply {
-            setImageResource(SourcePresentation.largeIcon(entry.source) ?: SourcePresentation.smallIcon(entry.source))
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(12) }
-        })
+        isClickable = true
+        isFocusable = true
+        background = rippleBackground(roundedBackground(Color.WHITE, 19, COLOR_BORDER), Color.argb(24, 49, 92, 245))
+        addView(FrameLayout(this@MainActivity).apply {
+            background = roundedBackground(sourceTint(entry.source), 14)
+            addView(ImageView(this@MainActivity).apply {
+                setImageResource(SourcePresentation.largeIcon(entry.source) ?: SourcePresentation.smallIcon(entry.source))
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                setPadding(dp(5), dp(5), dp(5), dp(5))
+            }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }, LinearLayout.LayoutParams(dp(50), dp(50)).apply { marginEnd = dp(13) })
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addView(text(entry.title, 16f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) })
+            addView(text(entry.title, 16f, bold = true).apply {
+                setTextColor(COLOR_TEXT_PRIMARY)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
             val origin = entry.computerName.ifBlank { "未知电脑" }
             addView(text("${entry.source.displayName} · $origin · ${formatTime(entry.receivedAt)}", 12f).apply {
-                setTextColor(Color.rgb(103, 116, 143))
-                setPadding(0, dp(3), 0, dp(5))
+                setTextColor(COLOR_TEXT_MUTED)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, dp(4), 0, dp(7))
             })
             addView(text(entry.body.lineSequence().firstOrNull().orEmpty().take(180), 14f).apply {
-                setTextColor(Color.rgb(77, 91, 124))
+                setTextColor(COLOR_TEXT_SECONDARY)
                 maxLines = 3
+                ellipsize = TextUtils.TruncateAt.END
+                setLineSpacing(0f, 1.12f)
             })
+        })
+        addView(text("›", 25f).apply {
+            setTextColor(COLOR_TEXT_MUTED)
+            gravity = Gravity.CENTER
+            setPadding(dp(8), 0, 0, 0)
         })
     }
 
@@ -594,11 +805,33 @@ class MainActivity : Activity() {
 
     private fun computerRow(computer: RegistrationClient.Computer): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(0, dp(10), 0, dp(5))
-        addView(text(computer.name, 16f, bold = true).apply { setTextColor(Color.rgb(20, 33, 61)) })
-        val seen = computer.lastSeenAt.takeIf { it > 0 }?.times(1000L)?.let(::formatTime) ?: "尚未发送"
-        addView(helpText("${computer.platform} · 最近活动 $seen"))
-        addView(secondaryButton("撤销这台电脑") { confirmRevokeComputer(computer) })
+        setPadding(dp(14), dp(14), dp(14), dp(12))
+        background = roundedBackground(COLOR_SURFACE_SUBTLE, 14)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(10)
+        }
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(iconTile(R.drawable.ic_ui_devices, COLOR_BLUE), LinearLayout.LayoutParams(dp(40), dp(40)).apply {
+                marginEnd = dp(11)
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(text(computer.name, 16f, bold = true).apply {
+                    setTextColor(COLOR_TEXT_PRIMARY)
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                })
+                val seen = computer.lastSeenAt.takeIf { it > 0 }?.times(1000L)?.let(::formatTime) ?: "尚未发送"
+                addView(text("${computer.platform} · 最近活动 $seen", 12f).apply {
+                    setTextColor(COLOR_TEXT_MUTED)
+                    setPadding(0, dp(4), 0, 0)
+                })
+            })
+        })
+        addView(dangerButton("撤销这台电脑") { confirmRevokeComputer(computer) })
     }
 
     private fun confirmRevokeComputer(computer: RegistrationClient.Computer) {
@@ -743,10 +976,11 @@ class MainActivity : Activity() {
         if (!::authPanel.isInitialized) return
         val session = secretStore.session()
         val authenticationFailed = statusStore.snapshot().state == StatusStore.STATE_AUTH_FAILED
-        authPanel.visibility = if (session.isPrivate && !authenticationFailed) View.GONE else View.VISIBLE
-        navigation.visibility = if (session.isPrivate) View.VISIBLE else View.GONE
-        pageContainer.visibility = if (session.isPrivate) View.VISIBLE else View.GONE
-        if (session.isPrivate) {
+        val visibility = MainUiLogic.sessionVisibility(session.isPrivate, authenticationFailed)
+        authPanel.visibility = if (visibility.showAuthentication) View.VISIBLE else View.GONE
+        navigation.visibility = if (visibility.showNavigation) View.VISIBLE else View.GONE
+        pageContainer.visibility = if (visibility.showPages) View.VISIBLE else View.GONE
+        if (visibility.showPages) {
             accountText.text = getString(R.string.account_and_device, session.username, DeviceIdentity.defaultName())
             refreshMessages()
             if (selectedPage == Page.DEVICES) loadComputers()
@@ -766,11 +1000,14 @@ class MainActivity : Activity() {
             StatusStore.STATE_ERROR -> "需要检查设置"
             else -> "未启动"
         }
-        statusText.setTextColor(
+        statusText.setTextColor(Color.WHITE)
+        statusDot.background = dotBackground(
             when (snapshot.state) {
-                StatusStore.STATE_CONNECTED -> Color.rgb(20, 145, 83)
-                StatusStore.STATE_AUTH_FAILED, StatusStore.STATE_ERROR -> Color.rgb(196, 55, 67)
-                else -> Color.rgb(20, 33, 61)
+                StatusStore.STATE_CONNECTED -> COLOR_SUCCESS
+                StatusStore.STATE_CONNECTING, StatusStore.STATE_RECONNECTING -> COLOR_CYAN
+                StatusStore.STATE_AUTH_FAILED, StatusStore.STATE_ERROR -> COLOR_DANGER_LIGHT
+                StatusStore.STATE_PERMISSION_REQUIRED -> COLOR_WARNING
+                else -> COLOR_MUTED_LIGHT
             },
         )
         statusDetailText.text = snapshot.detail.ifBlank {
@@ -786,7 +1023,7 @@ class MainActivity : Activity() {
     private fun refreshHistorySize() {
         if (!::historySizeText.isInitialized) return
         val bytes = historyStore.databaseSizeBytes()
-        historySizeText.text = "本机历史数据库占用：${formatBytes(bytes)}"
+        historySizeText.text = getString(R.string.history_database_size, formatBytes(bytes))
     }
 
     private fun currentAccount(): String = secretStore.session().username.ifBlank { DeviceIdentity.username(this) }
@@ -804,56 +1041,99 @@ class MainActivity : Activity() {
         loginButton.isEnabled = enabled
     }
 
-    private fun styleTab(button: Button, selected: Boolean) {
-        button.setTextColor(if (selected) Color.WHITE else Color.rgb(49, 92, 245))
-        button.background = pillBackground(selected)
-    }
-
-    private fun pillBackground(selected: Boolean): GradientDrawable = GradientDrawable().apply {
-        setColor(if (selected) Color.rgb(49, 92, 245) else Color.rgb(237, 241, 255))
-        cornerRadius = dp(12).toFloat()
+    private fun styleTab(button: TextView, selected: Boolean) {
+        val color = if (selected) Color.WHITE else COLOR_TEXT_MUTED
+        button.setTextColor(color)
+        button.compoundDrawableTintList = ColorStateList.valueOf(color)
+        button.background = rippleBackground(
+            roundedBackground(if (selected) COLOR_BLUE else Color.TRANSPARENT, 16),
+            if (selected) Color.argb(42, 255, 255, 255) else Color.argb(24, 49, 92, 245),
+        )
+        button.isSelected = selected
     }
 
     private fun card(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(18), dp(18), dp(18), dp(18))
-        background = GradientDrawable().apply {
-            setColor(Color.WHITE)
-            cornerRadius = dp(18).toFloat()
-            setStroke(dp(1), Color.rgb(226, 231, 241))
-        }
-        elevation = dp(1).toFloat()
+        setPadding(dp(19), dp(19), dp(19), dp(19))
+        background = roundedBackground(Color.WHITE, 21, COLOR_BORDER)
+        elevation = dp(2).toFloat()
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
     }
 
-    private fun sectionTitle(value: String): TextView = text(value, 19f, bold = true).apply {
-        setTextColor(Color.rgb(20, 33, 61))
+    private fun darkCard(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(20), dp(19), dp(20), dp(19))
+        background = GradientDrawable(
+            GradientDrawable.Orientation.TL_BR,
+            intArrayOf(COLOR_NAVY, COLOR_BLUE_DARK),
+        ).apply { cornerRadius = dp(24).toFloat() }
+        elevation = dp(6).toFloat()
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    }
+
+    private fun sectionTitle(value: String): TextView = text(value, 20f, bold = true).apply {
+        setTextColor(COLOR_TEXT_PRIMARY)
+        includeFontPadding = false
         setPadding(0, 0, 0, dp(8))
     }
 
+    private fun eyebrow(value: String): TextView = text(value, 12f, bold = true).apply {
+        setTextColor(COLOR_BLUE)
+        letterSpacing = 0.08f
+        setPadding(0, 0, 0, dp(7))
+    }
+
     private fun helpText(value: String): TextView = text(value, 14f).apply {
-        setTextColor(Color.rgb(77, 91, 124))
+        setTextColor(COLOR_TEXT_SECONDARY)
         setLineSpacing(0f, 1.15f)
-        setPadding(0, 0, 0, dp(10))
+        setPadding(0, 0, 0, dp(12))
+    }
+
+    private fun field(label: String, input: EditText): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(text(label, 13f, bold = true).apply {
+            setTextColor(COLOR_TEXT_PRIMARY)
+            setPadding(dp(2), 0, 0, dp(7))
+        })
+        addView(input)
     }
 
     private fun input(hintValue: String): EditText = EditText(this).apply {
         hint = hintValue
-        textSize = 16f
+        textSize = 15f
+        setTextColor(COLOR_TEXT_PRIMARY)
+        setHintTextColor(COLOR_TEXT_MUTED)
         setSingleLine(true)
-        setPadding(dp(14), dp(12), dp(14), dp(12))
-        background = GradientDrawable().apply {
-            setColor(Color.rgb(249, 250, 253))
-            cornerRadius = dp(12).toFloat()
-            setStroke(dp(1), Color.rgb(210, 217, 231))
-        }
-        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply {
-            bottomMargin = dp(10)
+        minHeight = dp(54)
+        setPadding(dp(15), dp(12), dp(15), dp(12))
+        background = roundedBackground(COLOR_INPUT, 14, COLOR_INPUT_BORDER)
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            bottomMargin = dp(12)
         }
     }
 
     private fun primaryButton(label: String, action: () -> Unit): Button = button(label, true, action)
     private fun secondaryButton(label: String, action: () -> Unit): Button = button(label, false, action)
+    private fun dangerButton(label: String, action: () -> Unit): Button = Button(this).apply {
+        text = label
+        textSize = 14f
+        isAllCaps = false
+        gravity = Gravity.CENTER
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(COLOR_DANGER)
+        minHeight = 0
+        minWidth = 0
+        stateListAnimator = null
+        background = rippleBackground(
+            roundedBackground(COLOR_DANGER_SOFT, 14),
+            Color.argb(28, 196, 55, 67),
+        )
+        setOnClickListener { action() }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)).apply { topMargin = dp(8) }
+    }
 
     private fun button(label: String, primary: Boolean, action: () -> Unit): Button = Button(this).apply {
         text = label
@@ -861,10 +1141,115 @@ class MainActivity : Activity() {
         isAllCaps = false
         gravity = Gravity.CENTER
         setTypeface(typeface, Typeface.BOLD)
-        setTextColor(if (primary) Color.WHITE else Color.rgb(49, 92, 245))
-        background = pillBackground(primary)
+        setTextColor(if (primary) Color.WHITE else COLOR_BLUE)
+        minHeight = 0
+        minWidth = 0
+        stateListAnimator = null
+        background = rippleBackground(
+            roundedBackground(if (primary) COLOR_BLUE else COLOR_BLUE_SOFT, 14),
+            if (primary) Color.argb(44, 255, 255, 255) else Color.argb(28, 49, 92, 245),
+        )
         setOnClickListener { action() }
-        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)).apply { topMargin = dp(6) }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { topMargin = dp(7) }
+    }
+
+    private fun settingRow(iconResource: Int, title: String, subtitle: String, action: () -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(13), dp(12), dp(12), dp(12))
+            minimumHeight = dp(72)
+            isClickable = true
+            isFocusable = true
+            background = rippleBackground(
+                roundedBackground(COLOR_SURFACE_SUBTLE, 14),
+                Color.argb(24, 49, 92, 245),
+            )
+            setOnClickListener { action() }
+            addView(iconTile(iconResource, COLOR_BLUE), LinearLayout.LayoutParams(dp(42), dp(42)).apply {
+                marginEnd = dp(12)
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(text(title, 15f, bold = true).apply { setTextColor(COLOR_TEXT_PRIMARY) })
+                addView(text(subtitle, 12f).apply {
+                    setTextColor(COLOR_TEXT_MUTED)
+                    setPadding(0, dp(3), 0, 0)
+                })
+            })
+            addView(text("›", 24f).apply { setTextColor(COLOR_TEXT_MUTED) })
+        }
+
+    private fun emptyMessagesView(): LinearLayout = card().apply {
+        gravity = Gravity.CENTER_HORIZONTAL
+        setPadding(dp(20), dp(30), dp(20), dp(30))
+        addView(ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_ui_empty)
+            imageTintList = ColorStateList.valueOf(COLOR_BLUE)
+            background = roundedBackground(COLOR_BLUE_SOFT, 24)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+        }, LinearLayout.LayoutParams(dp(64), dp(64)))
+        addView(text("还没有消息", 17f, bold = true).apply {
+            setTextColor(COLOR_TEXT_PRIMARY)
+            setPadding(0, dp(14), 0, dp(5))
+        })
+        addView(text("AI 完成任务后，通知和本机历史会出现在这里。", 13f).apply {
+            setTextColor(COLOR_TEXT_MUTED)
+            gravity = Gravity.CENTER
+        })
+    }
+
+    private fun iconTile(iconResource: Int, tint: Int): FrameLayout = FrameLayout(this).apply {
+        background = roundedBackground(COLOR_BLUE_SOFT, 12)
+        addView(ImageView(this@MainActivity).apply {
+            setImageResource(iconResource)
+            imageTintList = ColorStateList.valueOf(tint)
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+        }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    }
+
+    private fun countBadge(value: String): TextView = text(value, 12f, bold = true).apply {
+        setTextColor(COLOR_BLUE)
+        gravity = Gravity.CENTER
+        background = roundedBackground(COLOR_BLUE_SOFT, 10)
+        setPadding(dp(10), dp(5), dp(10), dp(5))
+    }
+
+    private fun roundedBackground(fillColor: Int, radius: Int, strokeColor: Int? = null): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(fillColor)
+            cornerRadius = dp(radius).toFloat()
+            if (strokeColor != null) setStroke(dp(1), strokeColor)
+        }
+
+    private fun rippleBackground(content: GradientDrawable, rippleColor: Int): RippleDrawable =
+        RippleDrawable(ColorStateList.valueOf(rippleColor), content, null)
+
+    private fun dotBackground(color: Int): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
+    }
+
+    private fun divider(color: Int): View = View(this).apply {
+        setBackgroundColor(color)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+    }
+
+    private fun radioButtonTint(): ColorStateList = ColorStateList(
+        arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+        intArrayOf(COLOR_BLUE, COLOR_TEXT_MUTED),
+    )
+
+    private fun sourceTint(source: NtfyMessage.Source): Int = when (source) {
+        NtfyMessage.Source.CODEX -> Color.rgb(235, 248, 244)
+        NtfyMessage.Source.ZCODE -> Color.rgb(241, 239, 255)
+        NtfyMessage.Source.KIMI -> Color.rgb(237, 244, 255)
+        NtfyMessage.Source.GROK -> Color.rgb(242, 243, 247)
+        NtfyMessage.Source.CLAUDE -> Color.rgb(255, 241, 234)
+        NtfyMessage.Source.PI -> Color.rgb(245, 239, 255)
+        NtfyMessage.Source.OPENCODE -> Color.rgb(234, 248, 246)
+        NtfyMessage.Source.OTHER -> COLOR_BLUE_SOFT
     }
 
     private fun text(value: String, size: Float, bold: Boolean = false): TextView = TextView(this).apply {
@@ -892,5 +1277,29 @@ class MainActivity : Activity() {
     companion object {
         const val EXTRA_EVENT_ID = "event_id"
         private const val REQUEST_NOTIFICATIONS = 2001
+        private const val STATE_PAGE = "ui_page"
+        private const val STATE_SOURCE = "ui_source"
+        private const val STATE_SEARCH = "ui_search"
+        private val COLOR_BACKGROUND = Color.rgb(244, 246, 251)
+        private val COLOR_NAVY = Color.rgb(12, 19, 58)
+        private val COLOR_BLUE_DARK = Color.rgb(34, 70, 211)
+        private val COLOR_BLUE = Color.rgb(49, 92, 245)
+        private val COLOR_BLUE_SOFT = Color.rgb(237, 242, 255)
+        private val COLOR_CYAN = Color.rgb(27, 220, 238)
+        private val COLOR_SUCCESS = Color.rgb(76, 231, 157)
+        private val COLOR_WARNING = Color.rgb(255, 196, 85)
+        private val COLOR_DANGER = Color.rgb(190, 52, 66)
+        private val COLOR_DANGER_LIGHT = Color.rgb(255, 125, 137)
+        private val COLOR_DANGER_SOFT = Color.rgb(255, 239, 241)
+        private val COLOR_TEXT_PRIMARY = Color.rgb(20, 30, 57)
+        private val COLOR_TEXT_SECONDARY = Color.rgb(75, 88, 119)
+        private val COLOR_TEXT_MUTED = Color.rgb(112, 124, 151)
+        private val COLOR_ON_DARK = Color.rgb(225, 231, 255)
+        private val COLOR_ON_DARK_MUTED = Color.rgb(184, 197, 241)
+        private val COLOR_MUTED_LIGHT = Color.rgb(166, 179, 222)
+        private val COLOR_BORDER = Color.rgb(226, 231, 241)
+        private val COLOR_INPUT_BORDER = Color.rgb(207, 216, 234)
+        private val COLOR_INPUT = Color.rgb(248, 250, 254)
+        private val COLOR_SURFACE_SUBTLE = Color.rgb(247, 249, 253)
     }
 }

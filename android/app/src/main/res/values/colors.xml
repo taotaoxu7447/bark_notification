@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="agentwatch_blue">#315CF5</color>
-    <color name="agentwatch_background">#F5F7FB</color>
+    <color name="agentwatch_background">#F4F6FB</color>
 </resources>

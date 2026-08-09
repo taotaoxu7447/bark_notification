@@ -82,6 +82,10 @@ the Android app never asks for or displays a computer pairing code.
 Version 0.4.0 consumes only the dynamic per-account topic returned by API v2
 and recognizes Claude, Pi Agent, and OpenCode as first-class sources in the
 notification and history UI.
+Version 0.4.1 refreshes the launcher and themed icons, adds a responsive
+tablet-width layout, keeps navigation visible at the bottom, and redesigns the
+connection, message, device, and settings surfaces without changing delivery
+or account behavior.
 Other accounts have no ACL read access to that topic. ntfy remains a short-term
 offline-delivery buffer (currently about six hours), not a long-term message
 archive; a phone offline beyond that window cannot reconstruct expired events.
