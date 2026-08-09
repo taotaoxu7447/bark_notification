@@ -11,6 +11,119 @@ from unittest import mock
 import codex_watch_notifier as notifier
 
 
+class ConfigDirectoryOverrideTests(unittest.TestCase):
+    def test_explicit_config_directory_is_applied_before_env_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ, {}, clear=False
+        ):
+            for key in (
+                "AGENTWATCH_CONFIG_DIR",
+                "CODEX_WATCH_CONFIG_DIR",
+                "CODEX_WATCH_ENV",
+            ):
+                os.environ.pop(key, None)
+            configured = Path(temp_dir) / "用户!许涛's config"
+
+            result = notifier.apply_config_dir_override(
+                ["--state", "ignored.json", "--config-dir", str(configured)]
+            )
+
+            expected = notifier.absolute_path_without_symlink_resolution(str(configured))
+            self.assertEqual(expected, result)
+            self.assertEqual(str(expected), os.environ["AGENTWATCH_CONFIG_DIR"])
+            self.assertEqual(str(expected), os.environ["CODEX_WATCH_CONFIG_DIR"])
+            self.assertEqual(str(expected / "env"), os.environ["CODEX_WATCH_ENV"])
+            self.assertEqual((expected / "env").resolve(), notifier.default_env_path())
+
+    def test_absent_config_directory_does_not_change_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"AGENTWATCH_CONFIG_DIR": "existing-config"}, clear=False
+        ):
+            self.assertIsNone(notifier.apply_config_dir_override(["--once"]))
+            self.assertEqual("existing-config", os.environ["AGENTWATCH_CONFIG_DIR"])
+
+    def test_explicit_config_directory_overrides_inherited_codex_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {
+                "AGENTWATCH_CONFIG_DIR": "old-agentwatch",
+                "CODEX_WATCH_CONFIG_DIR": "old-codex",
+                "CODEX_WATCH_ENV": "old.env",
+            },
+            clear=False,
+        ):
+            configured = Path(temp_dir) / "explicit"
+            notifier.apply_config_dir_override([f"--config-dir={configured}"])
+
+            expected = notifier.absolute_path_without_symlink_resolution(str(configured))
+            self.assertEqual((expected / "env").resolve(), notifier.default_env_path())
+
+    def test_duplicate_config_directory_is_rejected(self) -> None:
+        with self.assertRaises(SystemExit):
+            notifier.apply_config_dir_override(
+                ["--config-dir", "first", "--config-dir=second"]
+            )
+
+    def test_windowless_service_logs_append_stdout_and_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            configured = Path(temp_dir) / "配置"
+            configured.mkdir()
+            (configured / "task.out.log").write_text("existing stdout\n", encoding="utf-8")
+            original_stdout = notifier.sys.stdout
+            original_stderr = notifier.sys.stderr
+            stdout_handle = None
+            stderr_handle = None
+            try:
+                stdout_handle, stderr_handle = notifier.redirect_service_logs(configured)
+                print("new stdout", file=notifier.sys.stdout, flush=True)
+                print("new stderr", file=notifier.sys.stderr, flush=True)
+            finally:
+                notifier.sys.stdout = original_stdout
+                notifier.sys.stderr = original_stderr
+                if stdout_handle is not None:
+                    stdout_handle.close()
+                if stderr_handle is not None:
+                    stderr_handle.close()
+
+            self.assertEqual(
+                "existing stdout\nnew stdout\n",
+                (configured / "task.out.log").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                "new stderr\n",
+                (configured / "task.err.log").read_text(encoding="utf-8"),
+            )
+
+    def test_windowless_service_logs_preserve_legacy_utf16_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            configured = Path(temp_dir) / "配置"
+            configured.mkdir()
+            output_log = configured / "task.out.log"
+            output_log.write_bytes(
+                b"\xff\xfe" + "existing stdout\r\n".encode("utf-16-le")
+            )
+            original_stdout = notifier.sys.stdout
+            original_stderr = notifier.sys.stderr
+            stdout_handle = None
+            stderr_handle = None
+            try:
+                stdout_handle, stderr_handle = notifier.redirect_service_logs(configured)
+                print("new stdout", file=notifier.sys.stdout, flush=True)
+            finally:
+                notifier.sys.stdout = original_stdout
+                notifier.sys.stderr = original_stderr
+                if stdout_handle is not None:
+                    stdout_handle.close()
+                if stderr_handle is not None:
+                    stderr_handle.close()
+
+            output_bytes = output_log.read_bytes()
+            self.assertEqual(1, output_bytes.count(b"\xff\xfe"))
+            self.assertEqual(0, len(output_bytes) % 2)
+            output = output_bytes.decode("utf-16").replace("\r\n", "\n")
+            self.assertEqual("existing stdout\nnew stdout\n", output)
+
+
 class CodexSessionFilteringTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()

@@ -254,6 +254,8 @@ def validate_existing_private_file(path: Path, description: str) -> None:
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOINHERIT"):
         flags |= os.O_NOINHERIT
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_BINARY"):
@@ -309,6 +311,76 @@ def default_env_path() -> Path:
         or "~/.codex-watch-notifier"
     )
     return expand_path(os.getenv("CODEX_WATCH_ENV", config_root + "/env"))
+
+
+def apply_config_dir_override(argv: list[str]) -> Path | None:
+    """Apply the installer's explicit config root before loading its env file."""
+    occurrences = sum(
+        argument == "--config-dir" or argument.startswith("--config-dir=")
+        for argument in argv
+    )
+    bootstrap = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    bootstrap.add_argument("--config-dir")
+    if occurrences > 1:
+        bootstrap.error("--config-dir may only be provided once")
+    parsed, _unknown = bootstrap.parse_known_args(argv)
+    if parsed.config_dir is None:
+        return None
+    if not parsed.config_dir.strip():
+        bootstrap.error("--config-dir cannot be empty")
+    configured = absolute_path_without_symlink_resolution(parsed.config_dir)
+    os.environ["AGENTWATCH_CONFIG_DIR"] = str(configured)
+    # Explicit service configuration must outrank inherited CODEX_WATCH_*
+    # variables from an interactive desktop or parent process.
+    os.environ["CODEX_WATCH_CONFIG_DIR"] = str(configured)
+    os.environ["CODEX_WATCH_ENV"] = str(configured / "env")
+    return configured
+
+
+def _open_service_log(path: Path, description: str) -> Any:
+    target = prepare_private_file_parent(path, description)
+    validate_existing_private_file(target, description)
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOINHERIT"):
+        flags |= os.O_NOINHERIT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(target, flags, PRIVATE_STATE_FILE_MODE)
+    try:
+        metadata = validate_private_regular_descriptor(descriptor, description)
+        if not path_matches_open_file(target, metadata):
+            raise StateFileError(f"{description} changed while it was opened: {target}")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        prefix = os.read(descriptor, 3)
+        encoding = "utf-8"
+        if prefix.startswith(b"\xff\xfe"):
+            encoding = "utf-16-le"
+        elif prefix.startswith(b"\xfe\xff"):
+            encoding = "utf-16-be"
+        os.lseek(descriptor, 0, os.SEEK_END)
+        handle = os.fdopen(descriptor, "a", encoding=encoding, buffering=1)
+        descriptor = -1
+        return handle
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def redirect_service_logs(configured: Path) -> tuple[Any, Any]:
+    """Give a windowless Windows task durable stdout/stderr diagnostics."""
+    stdout_handle = _open_service_log(configured / "task.out.log", "service stdout log")
+    try:
+        stderr_handle = _open_service_log(
+            configured / "task.err.log", "service stderr log"
+        )
+    except BaseException:
+        stdout_handle.close()
+        raise
+    sys.stdout = stdout_handle
+    sys.stderr = stderr_handle
+    return stdout_handle, stderr_handle
 
 
 def utc_to_local(value: Any) -> str:
@@ -4240,6 +4312,13 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
 
 
 def main() -> int:
+    configured = apply_config_dir_override(sys.argv[1:])
+    if "--service-logs" in sys.argv[1:]:
+        if configured is None:
+            configured = absolute_path_without_symlink_resolution(
+                os.getenv("AGENTWATCH_CONFIG_DIR", "~/.codex-watch-notifier")
+            )
+        redirect_service_logs(configured)
     env_path = default_env_path()
     last_config_error = ""
     one_shot_flags = {
@@ -4270,7 +4349,12 @@ def main() -> int:
             if any(flag in sys.argv[1:] for flag in one_shot_flags):
                 return 78
             time.sleep(30.0)
-    parser = argparse.ArgumentParser(description="Notify when Codex rollout sessions complete or stop.")
+    parser = argparse.ArgumentParser(
+        description="Notify when Codex rollout sessions complete or stop.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--config-dir", help=argparse.SUPPRESS)
+    parser.add_argument("--service-logs", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--sessions-root", action="append", help="Root containing rollout-*.jsonl files.")
     parser.add_argument("--state", default=os.getenv("CODEX_WATCH_STATE", DEFAULT_STATE), help="State JSON path.")
     parser.add_argument("--log", default=os.getenv("CODEX_WATCH_LOG", DEFAULT_LOG), help="Log file path.")

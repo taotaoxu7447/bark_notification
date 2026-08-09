@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -1135,10 +1136,17 @@ class CliSafetyTests(unittest.TestCase):
             self.assertIn(["systemctl", "--user", "disable", agentwatch.LINUX_UNIT], commands)
             self.assertNotIn(["systemctl", "--user", "enable", "--now", agentwatch.LINUX_UNIT], commands)
 
-    def test_windows_task_is_hidden_logged_restartable_and_disabled_before_login(self) -> None:
+    def test_windows_task_runs_watcher_directly_and_is_disabled_before_login(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            with mock.patch.object(agentwatch.platform, "system", return_value="Windows"):
+            python = root / "Python!中文`$'s" / "python.exe"
+            python.parent.mkdir(parents=True)
+            python.write_bytes(b"python")
+            pythonw = python.with_name("pythonw.exe")
+            pythonw.write_bytes(b"pythonw")
+            with mock.patch.object(
+                agentwatch.platform, "system", return_value="Windows"
+            ), mock.patch.object(agentwatch.sys, "executable", str(python)):
                 paths = agentwatch.InstallPaths(root / "config", root / "home")
                 agentwatch.install_runtime(paths, Path(agentwatch.__file__).resolve().parent)
             completed = mock.Mock(returncode=0, stdout="", stderr="")
@@ -1146,6 +1154,12 @@ class CliSafetyTests(unittest.TestCase):
 
             def run_command(command):
                 nonlocal registered
+                if command[0] == "powershell.exe" and "agentwatch:watchers:begin" in command[-1]:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout="agentwatch:watchers:begin\nagentwatch:watchers:end\n",
+                        stderr="",
+                    )
                 if command[0] == "powershell.exe" and "Get-ScheduledTask" in command[-1]:
                     return mock.Mock(
                         returncode=0,
@@ -1160,8 +1174,12 @@ class CliSafetyTests(unittest.TestCase):
                     registered = True
                 return completed
 
-            with mock.patch.object(agentwatch, "_run", side_effect=run_command) as run:
-                agentwatch.ServiceManager(paths, system_name="Windows").install(authenticated=False)
+            with mock.patch.object(
+                agentwatch, "_run", side_effect=run_command
+            ) as run, mock.patch.object(agentwatch.sys, "executable", str(python)):
+                agentwatch.ServiceManager(paths, system_name="Windows").install(
+                    authenticated=False
+                )
 
             commands = [call.args[0] for call in run.call_args_list]
             register = next(
@@ -1170,8 +1188,30 @@ class CliSafetyTests(unittest.TestCase):
                 if command[0] == "powershell.exe" and "Register-ScheduledTask" in command[-1]
             )
             registration_script = register[-1]
-            self.assertIn("-WindowStyle Hidden", registration_script)
+            task_arguments = subprocess.list2cmdline(
+                [
+                    str(paths.runtime / "codex_watch_notifier.py"),
+                    "--config-dir",
+                    str(paths.config),
+                    "--service-logs",
+                ]
+            )
+            self.assertIn(
+                f"-Execute {agentwatch.powershell_literal(str(pythonw))}",
+                registration_script,
+            )
+            self.assertIn(
+                f"-Argument {agentwatch.powershell_literal(task_arguments)}",
+                registration_script,
+            )
+            self.assertIn(
+                f"-WorkingDirectory {agentwatch.powershell_literal(str(paths.runtime))}",
+                registration_script,
+            )
+            self.assertNotIn("run_notifier.ps1", registration_script)
+            self.assertNotIn("-WindowStyle Hidden", registration_script)
             self.assertIn("-RestartCount 999", registration_script)
+            self.assertIn("-ExecutionTimeLimit (New-TimeSpan -Seconds 0)", registration_script)
             self.assertIn("-RunLevel Limited", registration_script)
             self.assertNotIn("-RunLevel LeastPrivilege", registration_script)
             self.assertIn(["schtasks.exe", "/Change", "/TN", agentwatch.WINDOWS_TASK, "/Disable"], commands)
@@ -1321,6 +1361,8 @@ class CliSafetyTests(unittest.TestCase):
                 [
                     "agentwatch:present:ready:true\n",
                     "agentwatch:present:running:true\n",
+                    "agentwatch:present:running:true\n",
+                    "agentwatch:present:running:true\n",
                 ]
             )
 
@@ -1340,7 +1382,103 @@ class CliSafetyTests(unittest.TestCase):
             ) as sleep:
                 agentwatch.ServiceManager(paths, system_name="Windows").start()
 
-            sleep.assert_called_once_with(agentwatch.SERVICE_STATE_POLL_SECONDS)
+            self.assertEqual(3, sleep.call_count)
+            sleep.assert_called_with(agentwatch.SERVICE_STATE_POLL_SECONDS)
+
+    def test_windows_stop_targets_only_the_managed_watcher_under_current_sid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            task_stopped = mock.Mock(
+                returncode=0,
+                stdout="agentwatch:present:ready:false\n",
+                stderr="",
+            )
+            watcher_stopped = mock.Mock(
+                returncode=0,
+                stdout=(
+                    "agentwatch:watchers:begin\n"
+                    "agentwatch:watchers:pid:1234\n"
+                    "agentwatch:watchers:end\n"
+                ),
+                stderr="",
+            )
+            watcher_absent = mock.Mock(
+                returncode=0,
+                stdout="agentwatch:watchers:begin\nagentwatch:watchers:end\n",
+                stderr="",
+            )
+            success = mock.Mock(returncode=0, stdout="", stderr="")
+            watcher_queries = iter([watcher_stopped, watcher_absent])
+
+            def run_command(command):
+                if command[0] == "powershell.exe" and "agentwatch:watchers:begin" in command[-1]:
+                    return next(watcher_queries)
+                if command[0] == "powershell.exe":
+                    return task_stopped
+                return success
+
+            with mock.patch.object(
+                agentwatch, "_run", side_effect=run_command
+            ) as run:
+                agentwatch.ServiceManager(paths, system_name="Windows").stop()
+
+            watcher_scripts = [
+                call.args[0][-1]
+                for call in run.call_args_list
+                if call.args[0][0] == "powershell.exe"
+                and "agentwatch:watchers:begin" in call.args[0][-1]
+            ]
+            self.assertEqual(2, len(watcher_scripts))
+            self.assertIn(str(paths.runtime / "codex_watch_notifier.py"), watcher_scripts[0])
+            self.assertIn("GetOwnerSid", watcher_scripts[0])
+            self.assertIn("WindowsIdentity", watcher_scripts[0])
+            self.assertIn("$trustedExecutables=@(", watcher_scripts[0])
+            self.assertIn(str(Path(agentwatch.sys.executable).absolute()), watcher_scripts[0])
+            self.assertIn("$standardPython=", watcher_scripts[0])
+            self.assertIn("$legacy=$suffix -match", watcher_scripts[0])
+            self.assertIn("--config-dir", watcher_scripts[0])
+            self.assertIn("--service-logs", watcher_scripts[0])
+            self.assertIn("$fresh.CreationDate", watcher_scripts[0])
+            self.assertIn("$fresh.CommandLine -cne $process.CommandLine", watcher_scripts[0])
+            self.assertIn("Stop-Process -Id $fresh.ProcessId", watcher_scripts[0])
+            self.assertNotIn("Stop-Process", watcher_scripts[1])
+            self.assertFalse(any("/IM" in argument for command in (
+                call.args[0] for call in run.call_args_list
+            ) for argument in command))
+
+    def test_windows_stop_fails_closed_when_watcher_owner_cannot_be_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            task_stopped = mock.Mock(
+                returncode=0,
+                stdout="agentwatch:present:ready:false\n",
+                stderr="",
+            )
+            foreign = mock.Mock(
+                returncode=4,
+                stdout=(
+                    "agentwatch:watchers:begin\n"
+                    "agentwatch:watchers:foreign:1234\n"
+                ),
+                stderr="",
+            )
+            success = mock.Mock(returncode=0, stdout="", stderr="")
+
+            def run_command(command):
+                if command[0] == "powershell.exe" and "agentwatch:watchers:begin" in command[-1]:
+                    return foreign
+                if command[0] == "powershell.exe":
+                    return task_stopped
+                return success
+
+            with mock.patch.object(
+                agentwatch, "_run", side_effect=run_command
+            ), self.assertRaisesRegex(
+                agentwatch_core.AgentWatchError, "could not safely stop"
+            ):
+                agentwatch.ServiceManager(paths, system_name="Windows").stop()
 
     def _assert_uninstall_service_failure_preserves_runtime(
         self,
@@ -1443,6 +1581,12 @@ class CliSafetyTests(unittest.TestCase):
         )
 
         def run(command):
+            if command[0] == "powershell.exe" and "agentwatch:watchers:begin" in command[-1]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout="agentwatch:watchers:begin\nagentwatch:watchers:end\n",
+                    stderr="",
+                )
             if command[0] == "powershell.exe":
                 return present
             if command[:2] == ["schtasks.exe", "/Delete"]:

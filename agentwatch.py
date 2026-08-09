@@ -189,6 +189,16 @@ def powershell_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def windows_watcher_executable() -> str:
+    """Prefer the windowless sibling interpreter for a direct scheduled task."""
+    executable = Path(sys.executable)
+    if executable.name.casefold() == "python.exe":
+        windowless = executable.with_name("pythonw.exe")
+        if windowless.is_file():
+            return str(windowless)
+    return str(executable)
+
+
 class InstallPaths:
     def __init__(self, root: Path | None = None, home: Path | None = None) -> None:
         self.config = root or config_dir()
@@ -643,8 +653,18 @@ class ServiceManager:
         elif self.system_name == "Windows":
             self._attempt(["schtasks.exe", "/Change", "/TN", WINDOWS_TASK, "/Enable"])
             self._attempt(["schtasks.exe", "/Run", "/TN", WINDOWS_TASK])
+            consecutive_running = 0
+
+            def running_stably() -> bool:
+                nonlocal consecutive_running
+                if self._windows_task_snapshot() == (True, "running", True):
+                    consecutive_running += 1
+                else:
+                    consecutive_running = 0
+                return consecutive_running >= 3
+
             self._wait_for_state(
-                lambda: self._windows_task_snapshot() == (True, "running", True),
+                running_stably,
                 "AgentWatch scheduled task is not confirmed enabled and running",
             )
         else:
@@ -670,13 +690,18 @@ class ServiceManager:
                 "AgentWatch systemd user service is not confirmed stopped and disabled",
             )
         elif self.system_name == "Windows":
-            self._attempt(["schtasks.exe", "/End", "/TN", WINDOWS_TASK])
             self._attempt(["schtasks.exe", "/Change", "/TN", WINDOWS_TASK, "/Disable"])
+            self._attempt(["schtasks.exe", "/End", "/TN", WINDOWS_TASK])
             self._wait_for_state(
                 lambda: self._windows_snapshot_is_stopped(
                     self._windows_task_snapshot()
                 ),
                 "AgentWatch scheduled task is not confirmed stopped and disabled",
+            )
+            self._windows_managed_watcher_pids(stop=True)
+            self._wait_for_state(
+                lambda: not self._windows_managed_watcher_pids(),
+                "AgentWatch watcher process is still running; credentials and runtime were preserved",
             )
         else:
             raise AgentWatchError(f"unsupported operating system: {self.system_name}")
@@ -868,6 +893,124 @@ class ServiceManager:
             "could not verify whether the AgentWatch scheduled task still exists"
         )
 
+    def _windows_managed_watcher_pids(self, *, stop: bool = False) -> list[int]:
+        """Find only this install's watcher under the current Windows SID."""
+        watcher = str(Path(os.path.abspath(self.paths.runtime / "codex_watch_notifier.py")))
+        trusted_executables = sorted(
+            {
+                str(Path(os.path.abspath(sys.executable))),
+                str(Path(os.path.abspath(windows_watcher_executable()))),
+            },
+            key=str.casefold,
+        )
+        process_verified = (
+            "$freshVerified=@();"
+            "foreach($process in $verified){"
+            "$fresh=Get-CimInstance Win32_Process -Filter "
+            "('ProcessId='+$process.ProcessId) -ErrorAction SilentlyContinue;"
+            "if($null -eq $fresh){continue};"
+            "if(([string]$fresh.CreationDate -cne [string]$process.CreationDate)-or "
+            "($fresh.ExecutablePath -cne $process.ExecutablePath)-or "
+            "($fresh.CommandLine -cne $process.CommandLine)){exit 5};"
+            "$freshOwner=Invoke-CimMethod -InputObject $fresh -MethodName GetOwnerSid "
+            "-ErrorAction Stop;"
+            "if($freshOwner.ReturnValue -ne 0 -or $freshOwner.Sid -ne $currentSid){exit 4};"
+            "$freshVerified+=$fresh"
+            "};"
+            "foreach($fresh in $freshVerified){"
+            "Stop-Process -Id $fresh.ProcessId -Force -ErrorAction SilentlyContinue;"
+            "Write-Output ('agentwatch:watchers:pid:'+$fresh.ProcessId)"
+            "};"
+            if stop
+            else (
+                "foreach($process in $verified){"
+                "Write-Output ('agentwatch:watchers:pid:'+$process.ProcessId)"
+                "};"
+            )
+        )
+        script = (
+            "$ErrorActionPreference='Stop';"
+            f"$watcher={powershell_literal(watcher)};"
+            f"$config={powershell_literal(str(Path(os.path.abspath(self.paths.config))))};"
+            "$trustedExecutables=@("
+            + ",".join(powershell_literal(path) for path in trusted_executables)
+            + ");"
+            "$watcherPattern='^(?<prefix>.*?)\"?'+[regex]::Escape($watcher)+"
+            "'\"?(?<suffix>.*)$';"
+            "$serviceSuffixPattern='^\\s+--config-dir\\s+\"?'+"
+            "[regex]::Escape($config)+'\"?\\s+--service-logs\\s*$';"
+            "$currentSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
+            "Write-Output 'agentwatch:watchers:begin';"
+            "$verified=@();"
+            "$processes=@(Get-CimInstance Win32_Process -ErrorAction Stop);"
+            "foreach($process in $processes){"
+            "if([string]::IsNullOrWhiteSpace($process.ExecutablePath)-or "
+            "[string]::IsNullOrWhiteSpace($process.CommandLine)){continue};"
+            "$executableName=[IO.Path]::GetFileName($process.ExecutablePath);"
+            "$trustedExecutable=$false;"
+            "foreach($candidate in $trustedExecutables){"
+            "if($process.ExecutablePath -ieq $candidate){$trustedExecutable=$true;break}"
+            "};"
+            "$standardPython=($executableName -ieq 'python.exe' -or "
+            "$executableName -ieq 'pythonw.exe');"
+            "if(-not $trustedExecutable -and -not $standardPython){continue};"
+            "$match=[regex]::Match($process.CommandLine,$watcherPattern,"
+            "[Text.RegularExpressions.RegexOptions]::IgnoreCase);"
+            "if(-not $match.Success){continue};"
+            "$prefixPattern='^\\s*\"?'+[regex]::Escape($process.ExecutablePath)+'\"?\\s*$';"
+            "if($match.Groups['prefix'].Value -notmatch $prefixPattern){continue};"
+            "$suffix=$match.Groups['suffix'].Value;"
+            "$legacy=$suffix -match '^\\s*$';"
+            "$managed=$suffix -match $serviceSuffixPattern;"
+            "if(-not $legacy -and -not $managed){continue};"
+            "$owner=Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid "
+            "-ErrorAction Stop;"
+            "if($owner.ReturnValue -ne 0 -or $owner.Sid -ne $currentSid){"
+            "Write-Output ('agentwatch:watchers:foreign:'+$process.ProcessId);exit 4};"
+            "$verified+=$process"
+            "};"
+            f"{process_verified}"
+            "Write-Output 'agentwatch:watchers:end'"
+        )
+        try:
+            result = _run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ]
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AgentWatchError(
+                "could not inspect the AgentWatch watcher process"
+            ) from exc
+        if result.returncode != 0:
+            raise AgentWatchError(
+                "could not safely stop the AgentWatch watcher process"
+            )
+        lines = [
+            line.strip().lower() for line in result.stdout.splitlines() if line.strip()
+        ]
+        if (
+            len(lines) < 2
+            or lines[0] != "agentwatch:watchers:begin"
+            or lines[-1] != "agentwatch:watchers:end"
+        ):
+            raise AgentWatchError(
+                "could not verify the AgentWatch watcher process"
+            )
+        pids: list[int] = []
+        for line in lines[1:-1]:
+            prefix = "agentwatch:watchers:pid:"
+            if not line.startswith(prefix) or not line[len(prefix) :].isdigit():
+                raise AgentWatchError(
+                    "could not verify the AgentWatch watcher process"
+                )
+            pids.append(int(line[len(prefix) :]))
+        return pids
+
     @staticmethod
     def _windows_snapshot_is_stopped(snapshot: tuple[bool, str, bool]) -> bool:
         exists, state, enabled = snapshot
@@ -1012,20 +1155,28 @@ WantedBy=default.target
 
     def _install_windows(self, should_start: bool) -> None:
         self.stop()
-        run_script = self.paths.runtime / "run_notifier.ps1"
-        reject_symlink_path(run_script, self.paths.config.parent)
-        task_command = (
-            "-NoProfile -NonInteractive -ExecutionPolicy Bypass "
-            f'-WindowStyle Hidden -File "{run_script}"'
+        watcher = self.paths.runtime / "codex_watch_notifier.py"
+        reject_symlink_path(watcher, self.paths.config.parent)
+        task_executable = windows_watcher_executable()
+        task_arguments = subprocess.list2cmdline(
+            [
+                str(watcher),
+                "--config-dir",
+                str(self.paths.config),
+                "--service-logs",
+            ]
         )
-        escaped_task_command = task_command.replace("'", "''")
         register_script = (
             "$ErrorActionPreference='Stop';"
-            f"$action=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '{escaped_task_command}';"
+            "$action=New-ScheduledTaskAction "
+            f"-Execute {powershell_literal(task_executable)} "
+            f"-Argument {powershell_literal(task_arguments)} "
+            f"-WorkingDirectory {powershell_literal(str(self.paths.runtime))};"
             "$trigger=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
             "$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited;"
             "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
-            "-RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1);"
+            "-RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) "
+            "-ExecutionTimeLimit (New-TimeSpan -Seconds 0);"
             f"Register-ScheduledTask -TaskName '{WINDOWS_TASK}' -Action $action -Trigger $trigger "
             "-Principal $principal -Settings $settings -Force | Out-Null"
         )
