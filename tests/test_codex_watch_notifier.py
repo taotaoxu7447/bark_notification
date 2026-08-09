@@ -1225,6 +1225,408 @@ class ClaudeHookWatcherTests(unittest.TestCase):
         self.assertEqual([], notifier.claude_hook_event_files(built_path))
 
 
+class ZCodeWatcherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def accepted_record(
+        *,
+        session_id: str = "zcode-session",
+        input_id: str = "query-1",
+        workspace: str = "/tmp/zcode-project",
+        private_prompt: str = "DO_NOT_PERSIST_ZCODE_PROMPT",
+    ) -> dict:
+        # This mirrors the current Ubuntu log: the completion queryId points
+        # back to inputId; the accepted record itself has no queryId.
+        return {
+            "message": "v4 sendText accepted",
+            "sessionId": session_id,
+            "context": {
+                "inputId": input_id,
+                "workspacePath": workspace,
+                "inputText": private_prompt,
+            },
+        }
+
+    @staticmethod
+    def current_completion(
+        *,
+        session_id: str = "zcode-session",
+        turn_id: str = "turn-7",
+        query_id: str = "query-1",
+    ) -> dict:
+        return {
+            "message": "Turn completed",
+            "event": "turn.completed",
+            "status": "completed",
+            "module": "core.runtime",
+            "timestamp": "2026-08-09T11:00:01Z",
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "durationMs": 1_500,
+            "context": {
+                "queryId": query_id,
+                "turnNumber": 7,
+                "toolCallCount": 2,
+            },
+        }
+
+    @staticmethod
+    def legacy_completion() -> dict:
+        return {
+            "message": "ZCode Protocol background turn completed",
+            "timestamp": "2026-08-02T00:00:00Z",
+            "sessionId": "legacy-session",
+            "durationMs": 500,
+            "context": {
+                "inputId": "legacy-input",
+                "queryId": "legacy-query",
+                "workspacePath": "/tmp/legacy-project",
+            },
+        }
+
+    def write_records(self, *records: dict, name: str = "zcode-current.jsonl") -> tuple[Path, list[int]]:
+        path = self.root / name
+        offsets: list[int] = []
+        with path.open("wb") as handle:
+            for record in records:
+                offsets.append(handle.tell())
+                encoded = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+                handle.write(encoded)
+        return path, offsets
+
+    def test_current_ubuntu_completion_recovers_workspace_and_default_icon(self) -> None:
+        accepted = self.accepted_record()
+        completion = self.current_completion()
+        path, offsets = self.write_records(accepted, completion)
+
+        with mock.patch.dict(os.environ, {"ZCODE_BARK_ICON": ""}, clear=False):
+            event = notifier.trigger_from_zcode_record(path, offsets[1], completion)
+
+        self.assertIsNotNone(event)
+        self.assertEqual("zcode_turn_completed", event["event_type"])
+        self.assertEqual("zcode-session", event["session_id"])
+        self.assertEqual("turn-7", event["turn_id"])
+        self.assertEqual("query-1", event["query_id"])
+        self.assertEqual("query-1", event["input_id"])
+        self.assertEqual("/tmp/zcode-project", event["cwd"])
+        self.assertEqual(7, event["turn_number"])
+        self.assertEqual(2, event["tool_call_count"])
+        self.assertEqual(notifier.DEFAULT_ZCODE_BARK_ICON, event["bark_icon"])
+        self.assertNotIn("DO_NOT_PERSIST_ZCODE_PROMPT", json.dumps(event, ensure_ascii=False))
+
+    def test_legacy_completion_remains_supported(self) -> None:
+        record = self.legacy_completion()
+
+        event = notifier.trigger_from_zcode_record(self.root / "missing.jsonl", 0, record)
+
+        self.assertIsNotNone(event)
+        self.assertEqual("legacy-query", event["query_id"])
+        self.assertEqual("legacy-input", event["input_id"])
+        self.assertEqual("/tmp/legacy-project", event["cwd"])
+        self.assertEqual("ZCode background turn completed", event["status_detail"])
+
+    def test_current_completion_requires_exact_terminal_semantics_and_identity(self) -> None:
+        base = self.current_completion()
+        invalid_records = []
+        for key, value in (
+            ("message", "Turn complete"),
+            ("event", "turn.completing"),
+            ("status", "running"),
+            ("module", "network.transport"),
+            ("sessionId", ""),
+        ):
+            changed = json.loads(json.dumps(base))
+            changed[key] = value
+            invalid_records.append((key, changed))
+        missing_query = json.loads(json.dumps(base))
+        missing_query["context"].pop("queryId")
+        invalid_records.append(("queryId", missing_query))
+        invalid_records.append(("context", dict(base, context=[])))
+
+        for label, record in invalid_records:
+            with self.subTest(label=label):
+                self.assertIsNone(
+                    notifier.trigger_from_zcode_record(self.root / "missing.jsonl", 0, record)
+                )
+
+    def test_plain_completed_status_record_is_not_a_terminal_event(self) -> None:
+        record = {
+            "message": "Request completed",
+            "event": "request.completed",
+            "status": "completed",
+            "module": "core.runtime",
+            "sessionId": "zcode-session",
+            "context": {"queryId": "query-1"},
+        }
+
+        self.assertIsNone(
+            notifier.trigger_from_zcode_record(self.root / "missing.jsonl", 0, record)
+        )
+
+    def test_missing_or_invalid_optional_telemetry_does_not_drop_completion(self) -> None:
+        missing = self.current_completion()
+        missing.pop("module")
+        missing.pop("turnId")
+        missing.pop("durationMs")
+        missing["context"].pop("turnNumber")
+        missing["context"].pop("toolCallCount")
+
+        invalid = self.current_completion()
+        invalid["turnId"] = ["not", "an", "id"]
+        invalid["durationMs"] = True
+        invalid["context"]["turnNumber"] = "seven"
+        invalid["context"]["toolCallCount"] = -1
+
+        missing_event = notifier.trigger_from_zcode_record(
+            self.root / "missing.jsonl", 0, missing
+        )
+        invalid_event = notifier.trigger_from_zcode_record(
+            self.root / "missing.jsonl", 0, invalid
+        )
+
+        for event in (missing_event, invalid_event):
+            self.assertIsNotNone(event)
+            self.assertEqual("", event["turn_id"])
+            self.assertIsNone(event["duration_ms"])
+            self.assertIsNone(event["turn_number"])
+            self.assertIsNone(event["tool_call_count"])
+            self.assertNotIn("seven", event["notification_body"])
+            self.assertNotIn("not", event["notification_body"])
+
+    def test_context_recovery_requires_same_session_and_completion_query(self) -> None:
+        matching = self.accepted_record(workspace="/tmp/correct-project")
+        wrong_session = self.accepted_record(
+            session_id="other-session", workspace="/tmp/wrong-session"
+        )
+        wrong_query = self.accepted_record(
+            input_id="other-query", workspace="/tmp/wrong-query"
+        )
+        completion = self.current_completion()
+        path, offsets = self.write_records(
+            matching,
+            wrong_session,
+            wrong_query,
+            completion,
+        )
+
+        event = notifier.trigger_from_zcode_record(path, offsets[-1], completion)
+
+        self.assertEqual("/tmp/correct-project", event["cwd"])
+        self.assertEqual("query-1", event["input_id"])
+
+    def test_context_recovery_keeps_complete_record_at_exact_byte_boundary(self) -> None:
+        prefix = {"message": "unrelated"}
+        accepted = self.accepted_record(workspace="/tmp/boundary-project")
+        completion = self.current_completion()
+        accepted_size = len((json.dumps(accepted, ensure_ascii=False) + "\n").encode("utf-8"))
+        path, offsets = self.write_records(prefix, accepted, completion)
+
+        with mock.patch.object(
+            notifier, "ZCODE_CONTEXT_LOOKBACK_MAX_BYTES", accepted_size
+        ):
+            event = notifier.trigger_from_zcode_record(path, offsets[-1], completion)
+
+        self.assertEqual("/tmp/boundary-project", event["cwd"])
+
+    def test_context_recovery_never_reads_matching_record_after_completion(self) -> None:
+        prefix = {"message": "unrelated"}
+        completion = self.current_completion()
+        accepted_after = self.accepted_record(workspace="/tmp/future-project")
+        path, offsets = self.write_records(prefix, completion, accepted_after)
+
+        event = notifier.trigger_from_zcode_record(path, offsets[1], completion)
+
+        self.assertEqual("(unknown workspace)", event["cwd"])
+        self.assertEqual("", event["input_id"])
+
+    def test_context_recovery_fails_closed_beyond_line_and_byte_bounds(self) -> None:
+        accepted = self.accepted_record(workspace="/tmp/must-not-recover")
+        padding = {"message": "unrelated", "padding": "x" * 512}
+        completion = self.current_completion()
+        path, offsets = self.write_records(accepted, padding, padding, padding, completion)
+
+        with mock.patch.object(
+            notifier, "ZCODE_CONTEXT_LOOKBACK_MAX_LINES", 2
+        ):
+            line_bounded = notifier.trigger_from_zcode_record(path, offsets[-1], completion)
+        with mock.patch.object(
+            notifier, "ZCODE_CONTEXT_LOOKBACK_MAX_BYTES", 128
+        ):
+            byte_bounded = notifier.trigger_from_zcode_record(path, offsets[-1], completion)
+
+        for event in (line_bounded, byte_bounded):
+            self.assertEqual("(unknown workspace)", event["cwd"])
+            self.assertEqual("", event["input_id"])
+
+    def test_stable_id_prefers_session_and_query_across_schema_metadata_changes(self) -> None:
+        legacy = notifier.trigger_from_zcode_record(
+            self.root / "legacy.jsonl",
+            0,
+            {
+                **self.legacy_completion(),
+                "sessionId": "shared-session",
+                "context": {
+                    "inputId": "query-1",
+                    "queryId": "query-1",
+                    "workspacePath": "/tmp/legacy",
+                },
+            },
+        )
+        current = notifier.trigger_from_zcode_record(
+            self.root / "current.jsonl",
+            0,
+            self.current_completion(session_id="shared-session", turn_id="different-turn"),
+        )
+        other_query = dict(current, query_id="query-2")
+
+        legacy_id = notifier.zcode_event_stable_id(legacy, self.root / "legacy.jsonl", 1)
+        current_id = notifier.zcode_event_stable_id(current, self.root / "current.jsonl", 9)
+        other_id = notifier.zcode_event_stable_id(other_query, self.root / "current.jsonl", 9)
+
+        self.assertEqual(legacy_id, current_id)
+        self.assertNotEqual(current_id, other_id)
+
+    def test_incremental_processor_sends_current_completion_once_without_prompt_state(self) -> None:
+        secret = "DO_NOT_PERSIST_ZCODE_PROMPT_8bca0b"
+        accepted = self.accepted_record(private_prompt=secret)
+        completion = self.current_completion()
+        path, _offsets = self.write_records(accepted, completion, completion)
+        state = {"files": {}, "sent": {}}
+        sent_events = []
+
+        class RecordingNotifier:
+            def send(self, title: str, body: str, event: dict) -> bool:
+                del title, body
+                sent_events.append(dict(event))
+                return True
+
+        sent = notifier.process_zcode_file(
+            path,
+            state,
+            RecordingNotifier(),
+            notifier.Logger(None),
+        )
+
+        self.assertEqual(1, sent)
+        self.assertEqual(1, len(sent_events))
+        self.assertEqual(path.stat().st_size, state["files"][str(path)]["offset"])
+        self.assertNotIn(secret, json.dumps(sent_events, ensure_ascii=False))
+        self.assertNotIn(secret, json.dumps(state, ensure_ascii=False))
+
+    def test_modern_retry_blocks_later_event_until_retry_succeeds(self) -> None:
+        first_completion = self.current_completion()
+        second_completion = self.current_completion(turn_id="turn-8", query_id="query-2")
+        path, offsets = self.write_records(
+            self.accepted_record(),
+            first_completion,
+            self.accepted_record(input_id="query-2", workspace="/tmp/second-project"),
+            second_completion,
+        )
+        state = {"files": {}, "sent": {}}
+
+        class SequenceNotifier:
+            def __init__(self) -> None:
+                self.outcomes = [False, True, True]
+                self.calls = []
+
+            def send(self, title: str, body: str, event: dict) -> bool:
+                del title, body
+                self.calls.append((event["query_id"], event["stable_id"]))
+                return self.outcomes.pop(0)
+
+        delivery = SequenceNotifier()
+        with mock.patch.object(
+            notifier, "delivery_retry_delay_seconds", return_value=60
+        ), mock.patch.object(notifier.time, "time", return_value=100):
+            self.assertEqual(
+                0,
+                notifier.process_zcode_file(
+                    path, state, delivery, notifier.Logger(None)
+                ),
+            )
+
+        self.assertEqual(["query-1"], [query for query, _stable_id in delivery.calls])
+        self.assertEqual(offsets[1], state["files"][str(path)]["offset"])
+
+        with mock.patch.object(
+            notifier, "delivery_retry_delay_seconds", return_value=60
+        ), mock.patch.object(notifier.time, "time", return_value=120):
+            self.assertEqual(
+                0,
+                notifier.process_zcode_file(
+                    path, state, delivery, notifier.Logger(None)
+                ),
+            )
+
+        self.assertEqual(["query-1"], [query for query, _stable_id in delivery.calls])
+        self.assertEqual(offsets[1], state["files"][str(path)]["offset"])
+
+        with mock.patch.object(
+            notifier, "delivery_retry_delay_seconds", return_value=60
+        ), mock.patch.object(notifier.time, "time", return_value=160):
+            self.assertEqual(
+                2,
+                notifier.process_zcode_file(
+                    path, state, delivery, notifier.Logger(None)
+                ),
+            )
+
+        self.assertEqual(
+            ["query-1", "query-1", "query-2"],
+            [query for query, _stable_id in delivery.calls],
+        )
+        self.assertEqual(delivery.calls[0][1], delivery.calls[1][1])
+        self.assertEqual(path.stat().st_size, state["files"][str(path)]["offset"])
+
+    def test_existing_modern_log_is_baselined_and_only_appended_turn_is_sent(self) -> None:
+        old_completion = self.current_completion()
+        path, _offsets = self.write_records(
+            self.accepted_record(),
+            old_completion,
+            name="zcode-baseline.jsonl",
+        )
+        old_size = path.stat().st_size
+        state = {"files": {}, "sent": {}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            notifier.baseline_existing_zcode_files(
+                state, self.root, notifier.Logger(None)
+            )
+
+        new_records = (
+            self.accepted_record(input_id="query-2", workspace="/tmp/new-project"),
+            self.current_completion(turn_id="turn-8", query_id="query-2"),
+        )
+        with path.open("ab") as handle:
+            for record in new_records:
+                handle.write(
+                    (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+                )
+
+        sent_events = []
+
+        class RecordingNotifier:
+            def send(self, title: str, body: str, event: dict) -> bool:
+                del title, body
+                sent_events.append(dict(event))
+                return True
+
+        self.assertEqual(old_size, state["files"][str(path)]["offset"])
+        self.assertEqual(
+            1,
+            notifier.process_zcode_file(
+                path, state, RecordingNotifier(), notifier.Logger(None)
+            ),
+        )
+        self.assertEqual(["query-2"], [event["query_id"] for event in sent_events])
+        self.assertEqual("/tmp/new-project", sent_events[0]["cwd"])
+
+
 class KimiWatcherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()

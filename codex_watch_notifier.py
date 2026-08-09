@@ -113,6 +113,10 @@ MIN_DELIVERY_RETRY_DELAY_SECONDS = 30
 MAX_DELIVERY_RETRY_DELAY_SECONDS = 86400
 MAX_EXHAUSTED_DELIVERIES = 500
 NTFY_PROTOCOL_VERSION = 1
+ZCODE_CONTEXT_LOOKBACK_MAX_BYTES = 256 * 1024
+ZCODE_CONTEXT_LOOKBACK_MAX_LINES = 512
+ZCODE_IDENTIFIER_MAX_CHARS = 512
+ZCODE_WORKSPACE_MAX_CHARS = 4096
 
 
 class StateFileError(ValueError):
@@ -1756,23 +1760,121 @@ def codex_event_stable_id(event: dict[str, Any]) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
 
 
+def _bounded_zcode_string(value: Any, limit: int) -> str:
+    if not isinstance(value, str) or len(value) > limit:
+        return ""
+    return value.strip()
+
+
+def _zcode_nonnegative_integer(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def recover_zcode_turn_context(
+    path: Path,
+    offset: int,
+    session_id: str,
+    query_id: str,
+) -> dict[str, str]:
+    """Recover only non-message metadata from a bounded slice before a terminal record."""
+    if not session_id or not query_id or offset <= 0:
+        return {}
+
+    end = max(int(offset), 0)
+    start = max(0, end - ZCODE_CONTEXT_LOOKBACK_MAX_BYTES)
+    starts_at_record_boundary = start == 0
+    try:
+        with path.open("rb") as handle:
+            if start > 0:
+                handle.seek(start - 1)
+                starts_at_record_boundary = handle.read(1) == b"\n"
+            handle.seek(start)
+            chunk = handle.read(end - start)
+    except OSError:
+        return {}
+
+    # If the byte window starts mid-record, discard that partial record. The
+    # complete window and the number of JSONL records considered are both
+    # bounded, regardless of the total log size.
+    if not starts_at_record_boundary:
+        first_newline = chunk.find(b"\n")
+        if first_newline < 0:
+            return {}
+        chunk = chunk[first_newline + 1 :]
+
+    lines = chunk.splitlines()
+    for raw_line in reversed(lines[-ZCODE_CONTEXT_LOOKBACK_MAX_LINES:]):
+        try:
+            candidate = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(candidate, dict) or candidate.get("message") != "v4 sendText accepted":
+            continue
+        context = candidate.get("context")
+        if not isinstance(context, dict):
+            continue
+        candidate_session_id = _bounded_zcode_string(
+            candidate.get("sessionId"), ZCODE_IDENTIFIER_MAX_CHARS
+        )
+        candidate_input_id = _bounded_zcode_string(
+            context.get("inputId"), ZCODE_IDENTIFIER_MAX_CHARS
+        )
+        if candidate_session_id != session_id or candidate_input_id != query_id:
+            continue
+        workspace = _bounded_zcode_string(
+            context.get("workspacePath"), ZCODE_WORKSPACE_MAX_CHARS
+        )
+        return {"input_id": candidate_input_id, "workspace": workspace}
+    return {}
+
+
 def trigger_from_zcode_record(path: Path, offset: int, record: Any) -> dict[str, Any] | None:
     if not isinstance(record, dict):
         return None
-    if record.get("message") != "ZCode Protocol background turn completed":
+
+    is_legacy_completion = record.get("message") == "ZCode Protocol background turn completed"
+    is_current_completion = (
+        record.get("message") == "Turn completed"
+        and record.get("event") == "turn.completed"
+        and record.get("status") == "completed"
+        and (record.get("module") is None or record.get("module") == "core.runtime")
+    )
+    if not is_legacy_completion and not is_current_completion:
         return None
 
     context = record.get("context") or {}
     if not isinstance(context, dict):
         return None
-    session_id = str(record.get("sessionId") or "")
-    input_id = str(context.get("inputId") or "")
-    query_id = str(context.get("queryId") or "")
-    workspace = str(context.get("workspacePath") or "")
+
+    turn_id = ""
+    turn_number: int | None = None
+    tool_call_count: int | None = None
+    if is_current_completion:
+        session_id = _bounded_zcode_string(record.get("sessionId"), ZCODE_IDENTIFIER_MAX_CHARS)
+        turn_id = _bounded_zcode_string(record.get("turnId"), ZCODE_IDENTIFIER_MAX_CHARS)
+        query_id = _bounded_zcode_string(context.get("queryId"), ZCODE_IDENTIFIER_MAX_CHARS)
+        duration_ms = _zcode_nonnegative_integer(record.get("durationMs"))
+        turn_number = _zcode_nonnegative_integer(context.get("turnNumber"))
+        tool_call_count = _zcode_nonnegative_integer(context.get("toolCallCount"))
+        if not session_id or not query_id:
+            return None
+        recovered = recover_zcode_turn_context(path, offset, session_id, query_id)
+        input_id = recovered.get("input_id", "")
+        workspace = recovered.get("workspace", "")
+        status_detail = "ZCode turn completed"
+    else:
+        session_id = str(record.get("sessionId") or "")
+        input_id = str(context.get("inputId") or "")
+        query_id = str(context.get("queryId") or "")
+        workspace = str(context.get("workspacePath") or "")
+        duration_ms = record.get("durationMs")
+        status_detail = "ZCode background turn completed"
+
     display_name = Path(workspace).name if workspace else (session_id or "ZCode")
     timestamp = record.get("timestamp")
     local_time = utc_to_local(timestamp)
-    duration_ms = record.get("durationMs")
     duration = ""
     if isinstance(duration_ms, (int, float)):
         duration = f"{duration_ms / 1000:.1f}s"
@@ -1782,16 +1884,19 @@ def trigger_from_zcode_record(path: Path, offset: int, record: Any) -> dict[str,
         "timestamp": timestamp,
         "local_time": local_time,
         "session_id": session_id,
+        "turn_id": turn_id,
         "input_id": input_id,
         "query_id": query_id,
+        "turn_number": turn_number,
+        "tool_call_count": tool_call_count,
         "status": "完成",
-        "status_detail": "ZCode background turn completed",
+        "status_detail": status_detail,
         "cwd": workspace or "(unknown workspace)",
         "log_path": str(path),
         "offset": offset,
         "duration_ms": duration_ms,
         "bark_group": os.getenv("ZCODE_BARK_GROUP", "ZCode"),
-        "bark_icon": os.getenv("ZCODE_BARK_ICON", ""),
+        "bark_icon": os.getenv("ZCODE_BARK_ICON") or DEFAULT_ZCODE_BARK_ICON,
         "ntfy_url": os.getenv("ZCODE_NTFY_URL", ""),
         "ntfy_tags": os.getenv("ZCODE_NTFY_TAGS", "zap,computer"),
     }
@@ -1820,12 +1925,15 @@ def trigger_from_zcode_record(path: Path, offset: int, record: Any) -> dict[str,
 
 def zcode_event_stable_id(event: dict[str, Any], path: Path, line_offset: int) -> str:
     session_id = str(event.get("session_id") or "")
+    turn_id = str(event.get("turn_id") or "")
     query_id = str(event.get("query_id") or "")
     input_id = str(event.get("input_id") or "")
     event_type = str(event.get("event_type") or "")
     timestamp = str(event.get("timestamp") or "")
     if query_id:
         source = f"zcode:{session_id}:{event_type}:query:{query_id}"
+    elif turn_id:
+        source = f"zcode:{session_id}:{event_type}:turn:{turn_id}"
     elif input_id:
         source = f"zcode:{session_id}:{event_type}:input:{input_id}"
     elif session_id or timestamp:
@@ -3684,7 +3792,7 @@ def send_zcode_test_notification(args: argparse.Namespace, log: Logger) -> int:
         "cwd": str(Path.cwd()),
         "message": "ZCode Watch Notifier test",
         "bark_group": os.getenv("ZCODE_BARK_GROUP", "ZCode"),
-        "bark_icon": os.getenv("ZCODE_BARK_ICON", ""),
+        "bark_icon": os.getenv("ZCODE_BARK_ICON") or DEFAULT_ZCODE_BARK_ICON,
         "ntfy_url": os.getenv("ZCODE_NTFY_URL", ""),
         "ntfy_tags": os.getenv("ZCODE_NTFY_TAGS", "zap,computer"),
     }
