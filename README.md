@@ -132,6 +132,8 @@ API 地址是公开元数据，会直接保存在仓库中；账号密码、comp
 
 AgentWatch 的 Android 源码、构建和签名说明见 [`android/README.md`](android/README.md)，注册服务部署说明见 [`deploy/agentwatch-registration/README.md`](deploy/agentwatch-registration/README.md)。旧电脑升级后即使 env 仍保留 `NTFY_URL/NTFY_TOKEN`，v0.4.0 也会明确忽略它们，绝不会同时向旧共享 topic 双发。
 
+v0.4.2 将账号绑定服务迁移到新的 HK VPS。电脑执行 `agentwatch update` 时只会把项目已退役的旧默认 API 地址改成新地址，自定义服务器地址保持不变；Android 更新后需要至少打开一次 App 以升级加密会话。迁移和回滚检查见 [`deploy/HK_VPS_MIGRATION.md`](deploy/HK_VPS_MIGRATION.md)。
+
 不要把真实的 Bark URL、Bark key、computer token、账号密码或 webhook 地址提交到 GitHub。它们属于个人密钥。
 
 ## 新电脑安装
@@ -423,14 +425,14 @@ python3 codex_watch_notifier.py --test-opencode
 在 macOS 仓库根目录执行：
 
 ```bash
-./build_packages.zsh v0.4.0
+./build_packages.zsh v0.4.2
 ```
 
 产物会输出到 `dist/`：
 
-- `codex-watch-notifier-macos-v0.4.0.zip`
-- `codex-watch-notifier-ubuntu-v0.4.0.tar.gz`
-- `codex-watch-notifier-windows-v0.4.0.zip`
+- `codex-watch-notifier-macos-v0.4.2.zip`
+- `codex-watch-notifier-ubuntu-v0.4.2.tar.gz`
+- `codex-watch-notifier-windows-v0.4.2.zip`
 
 Android 正式 APK 在 `android/` 内使用长期发布密钥单独构建：
 
@@ -439,7 +441,7 @@ cd android
 ./build_release.zsh
 ```
 
-本地产物是 `android/app/build/outputs/apk/release/app-release.apk`；当前 Android UI 版本为 v0.4.1，发布名为 `AgentWatch-android-v0.4.1.apk`。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
+本地产物是 `android/app/build/outputs/apk/release/app-release.apk`；当前 Android UI 版本为 v0.4.2，发布名为 `AgentWatch-android-v0.4.2.apk`。v0.4.1 及更早版本升级后必须至少打开一次 App，程序会使用原有 app token 把旧 HK 地址会话升级到新服务器。发布密钥和密码绝不能进入 Git；丢失密钥将导致以后无法覆盖升级已安装的 APK。
 
 每次发布建议从同一个 git commit 构建三种电脑端安装包和 Android APK。
 

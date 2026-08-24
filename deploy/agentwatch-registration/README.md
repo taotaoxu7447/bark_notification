@@ -174,7 +174,7 @@ Validate before reload, then check schema and service health:
 sudo /usr/local/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl daemon-reload
 sudo systemctl restart agentwatch-registration.service
-curl --fail --silent --show-error https://64.90.8.184:9444/agentwatch/api/v1/health
+curl --fail --silent --show-error https://191.222.219.94:9444/agentwatch/api/v1/health
 sudo -u ntfy -- /usr/bin/python3 -I -c \
   'import sqlite3; db=sqlite3.connect("/var/lib/agentwatch-registration/registration.db"); print(db.execute("PRAGMA user_version").fetchone()[0]); print(db.execute("PRAGMA quick_check").fetchone()[0]); db.close()'
 ```

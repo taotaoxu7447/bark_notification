@@ -318,7 +318,7 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual("https://example.test/api/v1/computers/logout", request.full_url)
         self.assertEqual({}, json.loads(request.data))
         self.assertEqual("Bearer computer-token", request.headers["Authorization"])
-        self.assertEqual("agentwatch-computer/0.4.0", request.headers["User-agent"])
+        self.assertEqual("agentwatch-computer/0.4.2", request.headers["User-agent"])
         self.assertTrue(response["ok"])
 
 
@@ -1033,6 +1033,55 @@ class CliSafetyTests(unittest.TestCase):
 
             self.assertEqual(first, second)
             self.assertTrue(paths.launcher.exists())
+
+    def test_install_runtime_migrates_only_retired_default_api_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            source = Path(agentwatch.__file__).resolve().parent
+            paths.config.mkdir(parents=True)
+            paths.config.joinpath("env").write_text(
+                "BARK_KEY=private\n"
+                f"AGENTWATCH_API_BASE='{agentwatch.LEGACY_DEFAULT_API_BASE}'\n",
+                encoding="utf-8",
+            )
+
+            agentwatch.install_runtime(paths, source)
+
+            content = paths.config.joinpath("env").read_text(encoding="utf-8")
+            self.assertIn("BARK_KEY=private", content)
+            self.assertIn(f"AGENTWATCH_API_BASE='{agentwatch.DEFAULT_API_BASE}'", content)
+            self.assertNotIn(agentwatch.LEGACY_DEFAULT_API_BASE, content)
+            self.assertEqual(0, stat.S_IMODE(paths.config.joinpath("env").stat().st_mode) & 0o077)
+
+    def test_install_runtime_preserves_custom_api_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            source = Path(agentwatch.__file__).resolve().parent
+            paths.config.mkdir(parents=True)
+            expected = "AGENTWATCH_API_BASE=https://notify.example.test/agentwatch/api/v1\n"
+            paths.config.joinpath("env").write_text(expected, encoding="utf-8")
+
+            agentwatch.install_runtime(paths, source)
+
+            self.assertEqual(expected, paths.config.joinpath("env").read_text(encoding="utf-8"))
+
+    def test_install_runtime_refuses_linked_env_during_api_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = agentwatch.InstallPaths(root / "config", root / "home")
+            source = Path(agentwatch.__file__).resolve().parent
+            paths.config.mkdir(parents=True)
+            outside = root / "outside.env"
+            expected = f"AGENTWATCH_API_BASE={agentwatch.LEGACY_DEFAULT_API_BASE}\n"
+            outside.write_text(expected, encoding="utf-8")
+            paths.config.joinpath("env").symlink_to(outside)
+
+            with self.assertRaises(agentwatch_core.AgentWatchError):
+                agentwatch.install_runtime(paths, source)
+
+            self.assertEqual(expected, outside.read_text(encoding="utf-8"))
 
     def test_install_refuses_runtime_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -29,6 +29,8 @@ from agentwatch_core import (
     AgentWatchError,
     ApiError,
     ComputerTokenStore,
+    DEFAULT_API_BASE,
+    LEGACY_DEFAULT_API_BASE,
     atomic_write,
     api_base,
     config_dir,
@@ -66,7 +68,7 @@ from tool_hook_config import (
 )
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.2"
 MACOS_LABEL = "com.xutao.codex-watch-notifier"
 LINUX_UNIT = "codex-watch-notifier.service"
 WINDOWS_TASK = "CodexWatchNotifier"
@@ -1199,6 +1201,42 @@ WantedBy=default.target
             self.stop()
 
 
+def migrate_legacy_api_base(env_path: Path) -> bool:
+    """Move only the retired project default while preserving private config."""
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError) as exc:
+        raise AgentWatchError(
+            f"AgentWatch private env is unreadable or not valid UTF-8: {env_path}"
+        ) from exc
+
+    pattern = re.compile(
+        r"^(?P<prefix>\s*AGENTWATCH_API_BASE\s*=\s*)"
+        r"(?P<quote>[\"']?)"
+        + re.escape(LEGACY_DEFAULT_API_BASE)
+        + r"(?P=quote)(?P<trailing>\s*)(?P<newline>\r?\n)?$"
+    )
+    migrated = False
+    output: list[str] = []
+    for line in text.splitlines(keepends=True):
+        match = pattern.fullmatch(line)
+        if match is None:
+            output.append(line)
+            continue
+        quote = match.group("quote")
+        output.append(
+            f"{match.group('prefix')}{quote}{DEFAULT_API_BASE}{quote}"
+            f"{match.group('trailing')}{match.group('newline') or ''}"
+        )
+        migrated = True
+
+    if migrated:
+        atomic_write(env_path, "".join(output).encode("utf-8"), mode=0o600)
+    return migrated
+
+
 def install_runtime(paths: InstallPaths, source: Path | None = None) -> None:
     source_root = source or Path(__file__).resolve().parent
     system_name = platform.system()
@@ -1231,6 +1269,8 @@ def install_runtime(paths: InstallPaths, source: Path | None = None) -> None:
     reject_symlink_path(env_path, paths.config.parent)
     if not env_path.exists():
         atomic_write(env_path, (source_root / "env.example").read_bytes(), mode=0o600)
+    else:
+        migrate_legacy_api_base(env_path)
 
     paths.launcher_dir.mkdir(parents=True, exist_ok=True)
     if system_name == "Windows":

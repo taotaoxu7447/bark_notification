@@ -86,6 +86,9 @@ Version 0.4.1 refreshes the launcher and themed icons, adds a responsive
 tablet-width layout, keeps navigation visible at the bottom, and redesigns the
 connection, message, device, and settings surfaces without changing delivery
 or account behavior.
+Version 0.4.2 migrates the service endpoint to the replacement HK server. An
+existing installation must be opened once after updating so its encrypted
+private session can be upgraded with the existing app token.
 Other accounts have no ACL read access to that topic. ntfy remains a short-term
 offline-delivery buffer (currently about six hours), not a long-term message
 archive; a phone offline beyond that window cannot reconstruct expired events.

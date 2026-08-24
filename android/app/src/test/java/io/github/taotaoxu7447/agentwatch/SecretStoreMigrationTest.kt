@@ -18,4 +18,19 @@ class SecretStoreMigrationTest {
         assertTrue(SecretStore.legacyUpgradeRequired(legacy, "owner"))
         assertFalse(SecretStore.legacyUpgradeRequired(legacy, ""))
     }
+
+    @Test
+    fun retiredServerPrivateSessionRequiresAddressUpgrade() {
+        val retired = SecretStore.Session(
+            username = "alice",
+            ntfyToken = "tk_123456789",
+            appToken = "abcdefghijklmnopqrstuvwxyz123456",
+            ntfyTopic = "aw-0123456789abcdef0123456789abcdef",
+            ntfyUrl = "https://64.90.8.184:9444/aw-0123456789abcdef0123456789abcdef",
+            ntfyWebsocketUrl = "wss://64.90.8.184:9444/aw-0123456789abcdef0123456789abcdef/ws",
+        )
+
+        assertFalse(retired.isPrivate)
+        assertTrue(SecretStore.legacyUpgradeRequired(retired, "alice"))
+    }
 }
