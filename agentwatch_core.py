@@ -1099,6 +1099,7 @@ class AgentWatchApi:
         title: str,
         body: str,
         priority: str | None = None,
+        audience: str | None = None,
     ) -> dict[str, Any]:
         normalized_source = source.lower().strip()
         if normalized_source not in ALLOWED_SOURCES:
@@ -1111,6 +1112,8 @@ class AgentWatchApi:
         }
         if priority:
             payload["priority"] = priority
+        if audience:
+            payload["audience"] = audience
         status, response = self._post("/publish", payload, token=token)
         if status != 202:
             raise AgentWatchError(f"unexpected publish response status {status}")

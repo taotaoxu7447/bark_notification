@@ -399,6 +399,14 @@ def compact(text: str, limit: int = 900) -> str:
     return normalized[: limit - 1] + "..."
 
 
+def compact_multiline(text: str, limit: int = 3200) -> str:
+    """Bound text while preserving record-oriented lines for dashboard clients."""
+    normalized = "\n".join(" ".join(line.split()) for line in (text or "").splitlines()).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1] + "..."
+
+
 def env_flag(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -776,6 +784,27 @@ class Notifier:
             print("--- end notification ---\n", flush=True)
             return True
 
+        # Running-state updates drive dashboards such as DeskBao. They must not
+        # create a Bark/macOS notification for every prompt, and a delayed retry
+        # could arrive after the terminal event and regress the dashboard back
+        # to "running". Deliver them once to dashboard-capable channels only.
+        if event.get("status_only") or event.get("webhook_only"):
+            self.last_successful_channels = set()
+            for channel in ("agentwatch", "generic_webhook"):
+                if channel not in self.channels or channel in self.disabled_channels:
+                    continue
+                try:
+                    delivered = (
+                        self._send_agentwatch(title, body, event)
+                        if channel == "agentwatch"
+                        else self._send_generic_webhook(title, body, event)
+                    )
+                    if delivered:
+                        self.last_successful_channels.add(channel)
+                except Exception as exc:  # noqa: BLE001 - running updates are best-effort.
+                    self.log(f"best-effort {channel} failed: {exc}")
+            return True
+
         active_channels = [channel for channel in self.channels if channel not in self.disabled_channels]
         if not active_channels:
             if self.delivery_mode is None:
@@ -898,14 +927,17 @@ class Notifier:
             return False
         priority = str(event.get("agentwatch_priority") or os.getenv("AGENTWATCH_PRIORITY", "default")).strip()
         try:
-            AgentWatchApi().publish(
-                token,
-                event_id=stable_event_id(event, self.computer["computer_id"]),
-                source=ntfy_source(event),
-                title=compact(title, 160),
-                body=compact(body, 3200),
-                priority=priority or None,
-            )
+            publish_options: dict[str, Any] = {
+                "event_id": stable_event_id(event, self.computer["computer_id"]),
+                "source": ntfy_source(event),
+                "title": compact(title, 160),
+                "body": compact_multiline(body, 3200),
+                "priority": priority or None,
+            }
+            audience = str(event.get("agentwatch_audience") or "").strip()
+            if audience:
+                publish_options["audience"] = audience
+            AgentWatchApi().publish(token, **publish_options)
         except ApiError as exc:
             if exc.status == 401:
                 self.computer_token = None
@@ -1755,7 +1787,7 @@ def trigger_from_record(
     if not isinstance(payload, dict):
         return None
     event_type = payload.get("type")
-    if event_type not in {"task_complete", "turn_aborted"} and event_type not in extra_types:
+    if event_type not in {"task_started", "task_complete", "turn_aborted"} and event_type not in extra_types:
         return None
 
     meta = meta or load_session_meta(path)
@@ -1764,7 +1796,11 @@ def trigger_from_record(
     timestamp = record.get("timestamp")
     message = payload.get("last_agent_message") or payload.get("reason") or payload.get("message") or ""
 
-    if event_type == "task_complete":
+    if event_type == "task_started":
+        title = "Codex 工作中"
+        status = "running"
+        status_detail = "Codex 正在处理任务"
+    elif event_type == "task_complete":
         status, status_detail = classify_task_complete(str(message))
         if status == "完成":
             title = "Codex 已完成"
@@ -1787,9 +1823,12 @@ def trigger_from_record(
     short_thread = str(thread_id)[:8]
     cwd = meta.get("cwd") or "(unknown cwd)"
     local_time = utc_to_local(timestamp)
+    parsed_timestamp = parse_timestamp(timestamp)
+    updated_at = int(parsed_timestamp.timestamp() * 1000) if parsed_timestamp else int(time.time() * 1000)
     event = {
         "event_type": event_type,
         "timestamp": timestamp,
+        "updated_at": updated_at,
         "local_time": local_time,
         "thread_id": thread_id,
         "turn_id": payload.get("turn_id"),
@@ -1801,6 +1840,9 @@ def trigger_from_record(
         "offset": offset,
         "message": message,
     }
+    if event_type == "task_started":
+        event["status_only"] = True
+        event["agentwatch_audience"] = "deskbao"
 
     body_parts = [
         f"状态: {status}",

@@ -171,6 +171,17 @@ class CodexSessionFilteringTests(unittest.TestCase):
         }
 
     @staticmethod
+    def task_started() -> dict:
+        return {
+            "timestamp": "2026-07-12T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": "turn-1",
+            },
+        }
+
+    @staticmethod
     def turn_aborted() -> dict:
         return {
             "timestamp": "2026-07-12T00:00:00Z",
@@ -189,6 +200,19 @@ class CodexSessionFilteringTests(unittest.TestCase):
 
         self.assertIsNotNone(event)
         self.assertEqual("user-thread", event["thread_id"])
+
+    def test_main_session_task_started_becomes_deskbao_status_event(self) -> None:
+        path = self.write_rollout(self.session_meta("user"))
+
+        event = notifier.trigger_from_record(path, 1, self.task_started(), set())
+
+        self.assertIsNotNone(event)
+        self.assertEqual("task_started", event["event_type"])
+        self.assertEqual("running", event["status"])
+        self.assertEqual("user-thread", event["thread_id"])
+        self.assertEqual(1_783_814_400_000, event["updated_at"])
+        self.assertTrue(event["status_only"])
+        self.assertEqual("deskbao", event["agentwatch_audience"])
 
     def test_subagent_task_complete_is_filtered_by_default(self) -> None:
         path = self.write_rollout(self.session_meta("subagent", parent_thread_id="parent"))

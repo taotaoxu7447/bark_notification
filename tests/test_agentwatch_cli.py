@@ -759,6 +759,39 @@ class ClaudeHookInstallerIntegrationTests(unittest.TestCase):
 
 
 class PrivateNotifierTests(unittest.TestCase):
+    def test_private_publish_preserves_dashboard_body_lines(self) -> None:
+        machine = {
+            "computer_id": "11111111-1111-4111-8111-111111111111",
+            "computer_name": "test",
+            "platform": "macos",
+        }
+        token_store = mock.Mock()
+        token_store.load.return_value = "private-token"
+        api = mock.Mock()
+        api.publish.return_value = {"ok": True}
+        with mock.patch.object(
+            notifier, "load_or_create_machine", return_value=machine
+        ), mock.patch.object(
+            notifier, "ComputerTokenStore", return_value=token_store
+        ), mock.patch.object(notifier, "AgentWatchApi", return_value=api):
+            delivery = notifier.Notifier(False, notifier.Logger(None))
+            delivery._send_agentwatch(
+                "Codex 工作中",
+                "状态: running\n判断: 正在处理\n会话: 测试\n线程: abc12345",
+                {
+                    "event_type": "task_started",
+                    "stable_id": "running-event",
+                    "agentwatch_audience": "deskbao",
+                },
+            )
+
+        published = api.publish.call_args.kwargs
+        self.assertEqual(
+            "状态: running\n判断: 正在处理\n会话: 测试\n线程: abc12345",
+            published["body"],
+        )
+        self.assertEqual("deskbao", published["audience"])
+
     def test_private_session_ignores_legacy_ntfy_and_publishes_exact_event(self) -> None:
         machine = {
             "computer_id": "11111111-1111-4111-8111-111111111111",

@@ -108,6 +108,7 @@ class FakePublisher:
         title: str,
         message: bytes,
         priority: str,
+        targets: tuple[str, ...] = (),
     ) -> None:
         if self.event_failure is not None:
             raise self.event_failure
@@ -120,6 +121,7 @@ class FakePublisher:
                 "title": title,
                 "message": message,
                 "priority": priority,
+                "targets": targets,
             }
         )
 
@@ -503,6 +505,82 @@ class ApiTestCase(unittest.TestCase):
         )
         self.assertEqual(202, status)
 
+    def test_network_latest_is_authenticated_validated_and_isolated(self) -> None:
+        alice = self.register()
+        alice_computer = self.computer_login()
+        now = int(server.time.time())
+        snapshot = {
+            "schema": "deskbao_network_v1",
+            "source_id": "work-be3600",
+            "observed_at": now,
+            "primary_online": True,
+            "uplink_name": "主移动 WiFi",
+            "download_bps": 12_345_678,
+            "upload_bps": 1_234_567,
+            "today_download_bytes": 6_000_000_000,
+            "today_upload_bytes": 900_000_000,
+            "month_download_bytes": 48_000_000_000,
+            "month_upload_bytes": 7_000_000_000,
+            "month_quota_bytes": 100_000_000_000,
+            "latency_ms": 27.4,
+            "packet_loss_percent": 0.5,
+            "carrier": "中国移动",
+            "network_type": "5G",
+            "signal_percent": 82,
+            "signal_dbm": -83,
+            "clients": 8,
+        }
+
+        status, response = self.request(
+            "/network/latest", snapshot, str(alice_computer["computer_token"]), method="PUT"
+        )
+        self.assertEqual(202, status)
+        self.assertTrue(response["ok"])
+        status, response = self.request(
+            "/network/latest", token=str(alice["app_token"]), method="GET"
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(response["available"])
+        self.assertEqual(snapshot, response["snapshot"])
+        self.assertEqual("computer-12345678", response["computer_id"])
+
+        bob = self.register_user("bob.example", "device-bob-12345", "Bob Phone")
+        status, response = self.request(
+            "/network/latest", token=str(bob["app_token"]), method="GET"
+        )
+        self.assertEqual(200, status)
+        self.assertFalse(response["available"])
+
+        status, response = self.request(
+            "/network/latest", {**snapshot, "packet_loss_percent": 101},
+            str(alice_computer["computer_token"]), method="PUT"
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_packet_loss_percent", response["error"])
+
+        status, response = self.request(
+            "/network/latest", snapshot, str(alice["app_token"]), method="PUT"
+        )
+        self.assertEqual(401, status)
+        self.assertEqual("unauthorized", response["error"])
+
+        legacy_snapshot = {
+            key: value
+            for key, value in snapshot.items()
+            if key not in {"month_download_bytes", "month_upload_bytes", "month_quota_bytes"}
+        }
+        status, _ = self.request(
+            "/network/latest", legacy_snapshot,
+            str(alice_computer["computer_token"]), method="PUT"
+        )
+        self.assertEqual(202, status)
+        status, response = self.request(
+            "/network/latest", token=str(alice["app_token"]), method="GET"
+        )
+        self.assertEqual(0, response["snapshot"]["month_download_bytes"])
+        self.assertEqual(0, response["snapshot"]["month_upload_bytes"])
+        self.assertEqual(0, response["snapshot"]["month_quota_bytes"])
+
     def test_publish_failures_log_only_safe_classification_and_keep_502_contract(self) -> None:
         mobile = self.register()
         computer = self.computer_login()
@@ -552,6 +630,44 @@ class ApiTestCase(unittest.TestCase):
             json.dumps(publish),
         ):
             self.assertNotIn(str(sensitive), combined)
+
+    def test_deskbao_audience_targets_only_deskbao_devices(self) -> None:
+        mobile = self.register()
+        status, _ = self.request(
+            "/login",
+            {
+                "username": "alice.example",
+                "password": "a sufficiently long password",
+                "device_id": "deskbao-device-1234",
+                "device_name": "桌宝 · HONOR 100",
+            },
+        )
+        self.assertEqual(200, status)
+        computer = self.computer_login()
+
+        status, response = self.request(
+            "/publish",
+            {
+                "event_id": "deskbao-running-1",
+                "source": "codex",
+                "title": "Codex 工作中",
+                "body": "状态: running",
+                "audience": "deskbao",
+            },
+            str(computer["computer_token"]),
+        )
+
+        self.assertEqual(202, status)
+        self.assertEqual("deskbao", response["audience"])
+        event = self.publisher.events[-1]
+        self.assertEqual(
+            (server.device_target_tag("deskbao-device-1234"),),
+            event["targets"],
+        )
+        self.assertNotIn(
+            server.device_target_tag(str(mobile["device_id"])),
+            event["targets"],
+        )
 
     def test_computer_token_is_hashed_expires_logs_out_and_rotates(self) -> None:
         self.register()
@@ -1175,11 +1291,12 @@ class NtfyPublisherTest(unittest.TestCase):
             },
             separators=(",", ":"),
         ).encode()
-        publisher.publish_event(topic, event_id, "claude", "Done", message, "high")
+        target = server.device_target_tag("deskbao-device-1234")
+        publisher.publish_event(topic, event_id, "claude", "Done", message, "high", (target,))
         request = captured["request"]
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
         self.assertEqual(event_id, request.get_header("X-sequence-id"))
-        self.assertEqual("agentwatch_v2,source_claude", query["tags"][0])
+        self.assertEqual(f"agentwatch_v2,source_claude,{target}", query["tags"][0])
         self.assertEqual("high", query["priority"][0])
         self.assertEqual(message, request.data)
 

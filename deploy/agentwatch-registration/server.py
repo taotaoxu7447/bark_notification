@@ -342,6 +342,14 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS computers_user_active_idx
                     ON computers(user_id, revoked_at, last_seen_at);
+
+                CREATE TABLE IF NOT EXISTS network_snapshots (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    computer_id TEXT NOT NULL COLLATE BINARY,
+                    payload_json TEXT NOT NULL CHECK(length(payload_json) <= 8192),
+                    observed_at INTEGER NOT NULL,
+                    received_at INTEGER NOT NULL
+                );
                 """
             )
             connection.execute(
@@ -726,6 +734,7 @@ class NtfyPublisher:
         title: str,
         message: bytes,
         priority: str,
+        targets: tuple[str, ...] = (),
     ) -> None:
         if source not in TEST_SOURCES:
             raise ValueError("unsupported notification source")
@@ -735,7 +744,7 @@ class NtfyPublisher:
             topic,
             message,
             title,
-            ("agentwatch_v2", f"source_{source}"),
+            ("agentwatch_v2", f"source_{source}", *targets),
             priority,
             event_id,
         )
@@ -947,6 +956,7 @@ class AgentWatchApplication:
             f"{API_PREFIX}/computers/revoke": (30, 300.0),
             f"{API_PREFIX}/computers/logout": (30, 300.0),
             f"{API_PREFIX}/publish": (600, 60.0),
+            f"{API_PREFIX}/network/latest": (600, 60.0),
             f"{API_PREFIX}/health": (120, 60.0),
         }
         route_key = path if path in rules else "unknown"
@@ -1592,6 +1602,164 @@ class AgentWatchApplication:
             },
         )
 
+    @classmethod
+    def _network_label(cls, value: Any, field: str, max_characters: int) -> str:
+        text = unicodedata.normalize("NFKC", cls._string(value, field)).strip()
+        if not 1 <= len(text) <= max_characters or len(text.encode("utf-8")) > max_characters * 4:
+            raise ApiError(400, f"invalid_{field}", f"{field} is empty or too long")
+        if any(unicodedata.category(character).startswith("C") for character in text):
+            raise ApiError(400, f"invalid_{field}", f"{field} contains control characters")
+        return text
+
+    @staticmethod
+    def _network_integer(value: Any, field: str, low: int, high: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ApiError(400, f"invalid_{field}", f"{field} is outside its allowed range")
+        return value
+
+    @staticmethod
+    def _network_number(value: Any, field: str, low: float, high: float) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ApiError(400, f"invalid_{field}", f"{field} must be a number")
+        number = float(value)
+        if not low <= number <= high:
+            raise ApiError(400, f"invalid_{field}", f"{field} is outside its allowed range")
+        return number
+
+    @classmethod
+    def _network_payload(cls, raw: bytes) -> dict[str, Any]:
+        fields = {
+            "schema", "source_id", "observed_at", "primary_online", "uplink_name",
+            "download_bps", "upload_bps", "today_download_bytes", "today_upload_bytes",
+            "latency_ms", "packet_loss_percent", "carrier", "network_type",
+            "signal_percent", "signal_dbm", "clients",
+        }
+        payload = cls._decode_object(
+            raw,
+            fields,
+            {"month_download_bytes", "month_upload_bytes", "month_quota_bytes"},
+        )
+        if payload["schema"] != "deskbao_network_v1":
+            raise ApiError(400, "invalid_schema", "Unsupported network snapshot schema")
+        source_id = cls._string(payload["source_id"], "source_id")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,63}", source_id):
+            raise ApiError(400, "invalid_source_id", "source_id is invalid")
+        observed_at = cls._network_integer(
+            payload["observed_at"], "observed_at", 1, 4_102_444_800
+        )
+        now = int(time.time())
+        if observed_at < now - 86_400 or observed_at > now + 300:
+            raise ApiError(400, "invalid_observed_at", "observed_at is not recent")
+        if not isinstance(payload["primary_online"], bool):
+            raise ApiError(400, "invalid_primary_online", "primary_online must be a boolean")
+        return {
+            "schema": "deskbao_network_v1",
+            "source_id": source_id,
+            "observed_at": observed_at,
+            "primary_online": payload["primary_online"],
+            "uplink_name": cls._network_label(payload["uplink_name"], "uplink_name", 48),
+            "download_bps": cls._network_integer(
+                payload["download_bps"], "download_bps", 0, 100_000_000_000
+            ),
+            "upload_bps": cls._network_integer(
+                payload["upload_bps"], "upload_bps", 0, 100_000_000_000
+            ),
+            "today_download_bytes": cls._network_integer(
+                payload["today_download_bytes"], "today_download_bytes", 0,
+                100_000_000_000_000,
+            ),
+            "today_upload_bytes": cls._network_integer(
+                payload["today_upload_bytes"], "today_upload_bytes", 0,
+                100_000_000_000_000,
+            ),
+            "month_download_bytes": cls._network_integer(
+                payload.get("month_download_bytes", 0), "month_download_bytes", 0,
+                100_000_000_000_000,
+            ),
+            "month_upload_bytes": cls._network_integer(
+                payload.get("month_upload_bytes", 0), "month_upload_bytes", 0,
+                100_000_000_000_000,
+            ),
+            "month_quota_bytes": cls._network_integer(
+                payload.get("month_quota_bytes", 0), "month_quota_bytes", 0,
+                1_000_000_000_000_000,
+            ),
+            "latency_ms": cls._network_number(payload["latency_ms"], "latency_ms", 0, 60_000),
+            "packet_loss_percent": cls._network_number(
+                payload["packet_loss_percent"], "packet_loss_percent", 0, 100
+            ),
+            "carrier": cls._network_label(payload["carrier"], "carrier", 48),
+            "network_type": cls._network_label(payload["network_type"], "network_type", 24),
+            "signal_percent": cls._network_integer(
+                payload["signal_percent"], "signal_percent", -1, 100
+            ),
+            "signal_dbm": cls._network_integer(payload["signal_dbm"], "signal_dbm", -200, 0),
+            "clients": cls._network_integer(payload["clients"], "clients", 0, 10_000),
+        }
+
+    def _network_update(self, raw: bytes, headers: Mapping[str, str]) -> Response:
+        snapshot = self._network_payload(raw)
+        computer = self._authenticate_computer(headers)
+        self._check_rate(f"computer:{computer['computer_row_id']}:network", 60, 60.0)
+        received_at = int(time.time())
+        encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        try:
+            with closing(self.database.connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO network_snapshots(
+                        user_id, computer_id, payload_json, observed_at, received_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        computer_id = excluded.computer_id,
+                        payload_json = excluded.payload_json,
+                        observed_at = excluded.observed_at,
+                        received_at = excluded.received_at
+                    """,
+                    (
+                        computer["user_id"], computer["computer_id"], encoded,
+                        snapshot["observed_at"], received_at,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE computers SET last_seen_at = ? WHERE id = ?",
+                    (received_at, computer["computer_row_id"]),
+                )
+                connection.commit()
+        except sqlite3.Error as exc:
+            raise ApiError(503, "database_error", "Network snapshot could not be saved") from exc
+        return Response(202, {"ok": True, "received_at": received_at})
+
+    def _network_latest(self, headers: Mapping[str, str]) -> Response:
+        device = self._authenticate_app(headers)
+        self._check_rate(f"device:{device['device_row_id']}:network", 60, 60.0)
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT computer_id, payload_json, observed_at, received_at
+                FROM network_snapshots WHERE user_id = ?
+                """,
+                (device["user_id"],),
+            ).fetchone()
+        if row is None:
+            return Response(200, {"api_version": 1, "available": False})
+        try:
+            snapshot = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ApiError(503, "database_error", "Network snapshot is unavailable") from exc
+        return Response(
+            200,
+            {
+                "api_version": 1,
+                "available": True,
+                "computer_id": row["computer_id"],
+                "observed_at": row["observed_at"],
+                "received_at": row["received_at"],
+                "snapshot": snapshot,
+            },
+        )
+
     def _computer_revoke(self, raw: bytes, headers: Mapping[str, str]) -> Response:
         payload = self._decode_object(raw, {"computer_id"})
         computer_id = self._computer_id(payload["computer_id"])
@@ -1649,7 +1817,7 @@ class AgentWatchApplication:
 
     def _publish(self, raw: bytes, headers: Mapping[str, str]) -> Response:
         payload = self._decode_object(
-            raw, {"event_id", "source", "title", "body"}, {"priority"}
+            raw, {"event_id", "source", "title", "body"}, {"priority", "audience"}
         )
         event_id = self._string(payload["event_id"], "event_id")
         if not SEQUENCE_ID_PATTERN.fullmatch(event_id):
@@ -1663,6 +1831,19 @@ class AgentWatchApplication:
         if priority not in NTFY_PRIORITIES:
             raise ApiError(400, "invalid_priority", "priority is invalid")
         computer = self._authenticate_computer(headers)
+        audience = self._string(payload.get("audience", "all"), "audience").lower()
+        if audience not in {"all", "deskbao"}:
+            raise ApiError(400, "invalid_audience", "audience is invalid")
+        targets: tuple[str, ...] = ()
+        if audience == "deskbao":
+            with closing(self.database.connect()) as connection:
+                device_rows = connection.execute(
+                    "SELECT device_id FROM devices WHERE user_id = ? AND device_name LIKE ?",
+                    (computer["user_id"], "桌宝%"),
+                ).fetchall()
+            targets = tuple(device_target_tag(str(row["device_id"])) for row in device_rows)
+            if not targets:
+                raise ApiError(409, "no_deskbao_device", "No DeskBao device is logged in")
         self._check_rate("global:publish", 1000, 60.0)
         self._check_rate(f"user:{computer['user_id']}:publish", 120, 60.0)
         self._check_rate(f"computer:{computer['computer_row_id']}:publish", 120, 60.0)
@@ -1690,6 +1871,7 @@ class AgentWatchApplication:
                 title,
                 encoded,
                 priority,
+                targets,
             )
         except PublishError as exc:
             self._log_publish_failure("event", exc)
@@ -1705,7 +1887,7 @@ class AgentWatchApplication:
             # The message was already accepted by ntfy. Returning an error here
             # would encourage a duplicate retry for mere inventory metadata.
             self.logger.warning("computer_last_seen_update_failed")
-        return Response(202, {"ok": True, "event_id": event_id})
+        return Response(202, {"ok": True, "event_id": event_id, "audience": audience})
 
     def _ack(self, raw: bytes, headers: Mapping[str, str]) -> Response:
         payload = self._decode_object(
@@ -1785,6 +1967,10 @@ class AgentWatchApplication:
             return Response(200, {"ok": True})
         if method == "GET" and path == f"{API_PREFIX}/computers":
             return self._computers(headers)
+        if method == "GET" and path == f"{API_PREFIX}/network/latest":
+            return self._network_latest(headers)
+        if method == "PUT" and path == f"{API_PREFIX}/network/latest":
+            return self._network_update(raw, headers)
         if method != "POST":
             raise ApiError(405, "method_not_allowed", "Method is not allowed")
         if path == f"{API_PREFIX}/register":
@@ -1893,7 +2079,7 @@ class AgentWatchRequestHandler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlsplit(self.path)
             if parsed.query or parsed.fragment:
                 raise ApiError(400, "invalid_url", "Query strings are not accepted")
-            raw = self._body() if self.command == "POST" else b""
+            raw = self._body() if self.command in {"POST", "PUT"} else b""
             response = self.server.application.handle(
                 self.command, parsed.path, self._headers(), raw, self._client_ip()
             )

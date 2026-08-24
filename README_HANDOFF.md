@@ -84,6 +84,7 @@ To avoid false pushes from Codex account/session tools such as Cockpit Tools, th
 
 Triggers:
 
+- `event_msg.payload.type == "task_started"` => best-effort `running` update to DeskBao receivers only (private AgentWatch `audience=deskbao` and optional `CODEX_NOTIFY_WEBHOOK_URL`); it never fans out to Bark or the local macOS banner
 - `event_msg.payload.type == "task_complete"`
 - `event_msg.payload.type == "turn_aborted"`
 - ZCode `message == "ZCode Protocol background turn completed"` from `~/.zcode/cli/log/zcode-*.jsonl`
@@ -105,6 +106,7 @@ Thread title:
 
 Status labeling:
 
+- `task_started` => `running`; includes the rollout timestamp as `updated_at` so a delayed start cannot overwrite a newer terminal state
 - `turn_aborted` => `Codex 会话已中止`
 - `task_complete` with attention markers such as `需要你`, `等你`, `确认`, `是否`, `你看`, `下一步`, `失败`, `报错`, `error`, `confirm` => `Codex 需要处理`
 - `task_complete` with completion markers such as `已完成`, `完成了`, `改完了`, `验证通过`, `已处理`, `done`, `completed` => `Codex 已完成`

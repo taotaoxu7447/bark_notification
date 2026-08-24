@@ -51,6 +51,30 @@ class NotifierDeliveryContractTests(unittest.TestCase):
         self.assertEqual(1, bark_send.call_count)
         self.assertEqual(1, ntfy_send.call_count)
 
+    def test_status_only_running_event_uses_dashboard_channels_without_retry(self) -> None:
+        delivery = notifier.Notifier(False, notifier.Logger(None))
+        delivery.channels = ["bark", "agentwatch", "generic_webhook", "macos"]
+
+        with mock.patch.object(delivery, "_send_generic_webhook", return_value=False) as webhook_send, mock.patch.object(
+            delivery,
+            "_send_agentwatch",
+            return_value=True,
+        ) as agentwatch_send, mock.patch.object(
+            delivery,
+            "_send_bark",
+        ) as bark_send, mock.patch.object(delivery, "_send_macos") as macos_send:
+            sent = delivery.send(
+                "Codex 工作中",
+                "body",
+                {"event_type": "task_started", "status_only": True},
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(1, webhook_send.call_count)
+        self.assertEqual(1, agentwatch_send.call_count)
+        self.assertEqual(0, bark_send.call_count)
+        self.assertEqual(0, macos_send.call_count)
+
     def test_bark_payload_contains_stable_id(self) -> None:
         with mock.patch.dict(os.environ, {"BARK_URL": "https://example.invalid/push"}):
             delivery = notifier.Notifier(False, notifier.Logger(None))
