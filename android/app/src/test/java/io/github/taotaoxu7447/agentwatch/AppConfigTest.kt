@@ -30,16 +30,34 @@ class AppConfigTest {
         assertTrue(
             AppConfig.validPrivateSession(
                 "aw-0123456789abcdef0123456789abcdef",
-                "https://191.222.219.94:9444/aw-0123456789abcdef0123456789abcdef",
-                "wss://191.222.219.94:9444/aw-0123456789abcdef0123456789abcdef/ws",
+                "https://aw.taotaoxu.net/aw-0123456789abcdef0123456789abcdef",
+                "wss://aw.taotaoxu.net/aw-0123456789abcdef0123456789abcdef/ws",
             ),
         )
         assertFalse(
             AppConfig.validPrivateSession(
                 "aw-0123456789abcdef0123456789abcdef",
-                "https://191.222.219.94:9444/aw-0123456789abcdef0123456789abcdef",
+                "https://aw.taotaoxu.net/aw-0123456789abcdef0123456789abcdef",
                 "wss://attacker.example/aw-0123456789abcdef0123456789abcdef/ws",
             ),
         )
+    }
+
+    @Test
+    fun legacySessionIsAcceptedOnlyByLegacyValidator() {
+        val topic = "aw-0123456789abcdef0123456789abcdef"
+        val publish = "https://191.222.219.94:9444/$topic"
+        val websocket = "wss://191.222.219.94:9444/$topic/ws"
+
+        assertTrue(AppConfig.validLegacyPrivateSession(topic, publish, websocket))
+        assertFalse(AppConfig.validPrivateSession(topic, publish, websocket))
+    }
+
+    @Test
+    fun currentUrlsUseImplicitHttpsPort443() {
+        val topic = "aw-0123456789abcdef0123456789abcdef"
+
+        assertEquals("https://aw.taotaoxu.net/$topic", AppConfig.currentPublishUrl(topic))
+        assertEquals("wss://aw.taotaoxu.net/$topic/ws", AppConfig.currentWebsocketUrl(topic))
     }
 }

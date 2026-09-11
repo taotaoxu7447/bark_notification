@@ -2,6 +2,7 @@ package io.github.taotaoxu7447.agentwatch
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class SecretStoreMigrationTest {
@@ -26,11 +27,18 @@ class SecretStoreMigrationTest {
             ntfyToken = "tk_123456789",
             appToken = "abcdefghijklmnopqrstuvwxyz123456",
             ntfyTopic = "aw-0123456789abcdef0123456789abcdef",
-            ntfyUrl = "https://64.90.8.184:9444/aw-0123456789abcdef0123456789abcdef",
-            ntfyWebsocketUrl = "wss://64.90.8.184:9444/aw-0123456789abcdef0123456789abcdef/ws",
+            ntfyUrl = "https://191.222.219.94:9444/aw-0123456789abcdef0123456789abcdef",
+            ntfyWebsocketUrl = "wss://191.222.219.94:9444/aw-0123456789abcdef0123456789abcdef/ws",
         )
 
         assertFalse(retired.isPrivate)
         assertTrue(SecretStore.legacyUpgradeRequired(retired, "alice"))
+
+        val migrated = SecretStore.migratedLegacySession(retired)
+        assertEquals("https://aw.taotaoxu.net/${retired.ntfyTopic}", migrated?.ntfyUrl)
+        assertEquals("wss://aw.taotaoxu.net/${retired.ntfyTopic}/ws", migrated?.ntfyWebsocketUrl)
+        assertEquals(retired.username, migrated?.username)
+        assertEquals(retired.ntfyToken, migrated?.ntfyToken)
+        assertEquals(retired.appToken, migrated?.appToken)
     }
 }

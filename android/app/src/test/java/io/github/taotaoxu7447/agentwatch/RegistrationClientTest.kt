@@ -73,8 +73,8 @@ class RegistrationClientTest {
                 .put("ntfy_token", "tk_123456789")
                 .put("app_token", "abcdefghijklmnopqrstuvwxyz123456")
                 .put("ntfy_topic", "aw-0123456789abcdef0123456789abcdef")
-                .put("ntfy_url", "https://191.222.219.94:9444/aw-0123456789abcdef0123456789abcdef")
-                .put("ntfy_ws_url", "wss://191.222.219.94:9444/aw-0123456789abcdef0123456789abcdef/ws"),
+                .put("ntfy_url", "https://aw.taotaoxu.net/aw-0123456789abcdef0123456789abcdef")
+                .put("ntfy_ws_url", "wss://aw.taotaoxu.net/aw-0123456789abcdef0123456789abcdef/ws"),
         )
         assertEquals("aw-0123456789abcdef0123456789abcdef", session.ntfyTopic)
     }
