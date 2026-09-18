@@ -70,7 +70,7 @@ For coworkers, publish three release artifacts and ask them to download the one 
 
 - ZCode session titles/directories come from a parameterized, read-only lookup in its local `session` table; prompt/message bodies are never queried. Missing or busy databases fall back to log metadata and a generic readable label.
 - DeepSeek Harness uses versioned projection caches (cache v7 / session v3 / turnBoundary v2). Only closed, non-seeded, non-subagent sessions without an active goal notify. It reports end-of-turn, not success. This latest-state interface can coalesce turns while offline; persisted AgentWatch state contains counters/IDs, not titles or prompts.
-- OMP 18.0.4+ uses a separate managed extension. `session_stop` arms a main-session candidate; final `agent_end` rejects continuations and pending messages before synchronous local persistence. Restart OMP after installation. Errors/cancellations without that main-session stop candidate are not currently notified. The stop/continuation contract was checked against the official v18.0.4 tagged source and the locally installed v18.2.4 runtime documentation.
+- OMP 18.0.0+ uses a separate managed extension. `session_stop` arms a main-session candidate; final `agent_end` rejects continuations and pending messages before synchronous local persistence. Restart OMP after installation. Errors/cancellations without that main-session stop candidate are not currently notified. The stop/continuation contract was checked against the official v18.0.0 and v18.0.4 tagged sources and the locally installed v18.2.4 runtime documentation.
 
 Default rollout root:
 

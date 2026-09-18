@@ -121,11 +121,12 @@ class DeepSeekTests(unittest.TestCase):
 
 class OmpTests(unittest.TestCase):
     def test_work_host_omp_version_is_supported(self):
-        with mock.patch.object(agentwatch.shutil, 'which', return_value='/usr/local/bin/omp'), mock.patch.object(
-            agentwatch, '_run', return_value=mock.Mock(returncode=0, stdout='omp/18.0.4', stderr='')
-        ):
-            result = agentwatch._semver_cli_status('omp', agentwatch.MIN_OMP_EXTENSION_VERSION)
-        self.assertTrue(result['cli_compatible'])
+        for version, supported in [('18.0.0', True), ('18.0.4', True), ('18.2.4', True), ('17.9.9', False)]:
+            with self.subTest(version=version), mock.patch.object(agentwatch.shutil, 'which', return_value='/usr/local/bin/omp'), mock.patch.object(
+                agentwatch, '_run', return_value=mock.Mock(returncode=0, stdout='omp/' + version, stderr='')
+            ):
+                result = agentwatch._semver_cli_status('omp', agentwatch.MIN_OMP_EXTENSION_VERSION)
+            self.assertEqual(supported, result['cli_compatible'])
 
     def test_ingestor_routes_omp_and_preserves_title(self):
         payload = test_tool_hooks.valid_hook_payload('omp')
