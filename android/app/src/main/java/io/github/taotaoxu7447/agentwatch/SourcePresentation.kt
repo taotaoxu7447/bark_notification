@@ -20,6 +20,7 @@ internal object SourcePresentation {
         NtfyMessage.Source.OPENCODE -> R.drawable.ic_notify_opencode
         NtfyMessage.Source.DEEPSEEK -> R.drawable.ic_notify_deepseek
         NtfyMessage.Source.OMP -> R.drawable.ic_notify_omp
+        NtfyMessage.Source.CURSOR -> R.drawable.ic_notify_cursor
         NtfyMessage.Source.OTHER -> R.drawable.ic_notify_other
     }
 
@@ -33,6 +34,7 @@ internal object SourcePresentation {
         NtfyMessage.Source.OPENCODE -> R.drawable.source_opencode
         NtfyMessage.Source.DEEPSEEK -> R.drawable.source_deepseek
         NtfyMessage.Source.OMP -> R.drawable.source_omp
+        NtfyMessage.Source.CURSOR -> null
         NtfyMessage.Source.OTHER -> null
     }
 }

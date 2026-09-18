@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
+import subprocess
 from pathlib import Path
 import stat
 from typing import Mapping
@@ -20,6 +22,88 @@ PI_MANAGED_MARKER = "// AgentWatch managed integration v1: pi"
 OPENCODE_MANAGED_MARKER = "// AgentWatch managed integration v1: opencode"
 OMP_MANAGED_MARKER = "// AgentWatch managed integration v1: omp"
 MAX_MANAGED_FILE_BYTES = 512 * 1024
+CURSOR_MANAGED_ID = "io.github.taotaoxu7447.agentwatch.cursor.v1"
+
+
+def build_cursor_hook_handler(python: Path, agentwatch_cli: Path, events_dir: Path) -> dict:
+    arguments = [str(python), str(agentwatch_cli), "cursor-hook", "--events-dir",
+                 str(events_dir), "--managed-hook-id", CURSOR_MANAGED_ID]
+    command = subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
+    return {"command": command}
+
+
+def _owned_cursor_handler(value: object) -> bool:
+    if not isinstance(value, dict) or not isinstance(value.get("command"), str):
+        return False
+    try:
+        args = shlex.split(value["command"], posix=os.name != "nt")
+    except ValueError:
+        return False
+    return (len(args) == 7 and args[2:4] == ["cursor-hook", "--events-dir"]
+            and args[-2:] == ["--managed-hook-id", CURSOR_MANAGED_ID])
+
+
+def _read_cursor_hooks(path: Path) -> tuple[dict, bytes | None]:
+    if path_has_link_component(path):
+        raise AgentWatchError("Cursor hooks path must not contain links")
+    if not path.exists():
+        return {"version": 1, "hooks": {}}, None
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_MANAGED_FILE_BYTES:
+        raise AgentWatchError("Cursor hooks must be a bounded regular JSON file")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise AgentWatchError("Cursor hooks must be owned by the current user")
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise AgentWatchError("Cursor hooks are not valid UTF-8 JSON") from exc
+    if (not isinstance(value, dict) or type(value.get("version", 1)) is not int or value.get("version", 1) != 1
+            or not isinstance(value.get("hooks", {}), dict)):
+        raise AgentWatchError("Unsupported Cursor hooks format")
+    if any(not isinstance(entries, list) for entries in value.get("hooks", {}).values()):
+        raise AgentWatchError("Cursor hook events must contain handler arrays")
+    return value, raw
+
+
+def preflight_cursor_hooks(path: Path) -> None:
+    _read_cursor_hooks(path)
+
+
+def configure_cursor_hooks(path: Path, handler: dict, *, enabled: bool, backup: Path) -> bool:
+    current, raw = _read_cursor_hooks(path)
+    if not enabled and raw is None:
+        return False
+    updated = json.loads(json.dumps(current))
+    hooks = updated.setdefault("hooks", {})
+    for event, entries in list(hooks.items()):
+        if not any(_owned_cursor_handler(entry) for entry in entries):
+            continue
+        hooks[event] = [entry for entry in entries if not _owned_cursor_handler(entry)]
+        if not hooks[event]:
+            del hooks[event]
+    if enabled:
+        updated.setdefault("version", 1)
+        hooks.setdefault("stop", []).append(handler)
+    if updated == current:
+        return False
+    if raw is not None and not backup.exists():
+        if path_has_link_component(backup):
+            raise AgentWatchError("Cursor backup path must not contain links")
+        atomic_write(backup, raw, mode=0o600)
+    atomic_write(path, (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode(), mode=0o600)
+    return True
+
+
+def inspect_cursor_hooks(path: Path, handler: dict, *, enabled: bool) -> dict:
+    result = {"enabled": enabled, "path": str(path), "configured": False, "active": False}
+    try:
+        config, _raw = _read_cursor_hooks(path)
+        result["configured"] = handler in config.get("hooks", {}).get("stop", [])
+        result["active"] = enabled and result["configured"]
+    except AgentWatchError as exc:
+        result["error"] = str(exc)
+    return result
 
 
 def _expanded_absolute(value: str) -> Path:

@@ -309,6 +309,9 @@ class ApiTestCase(unittest.TestCase):
     def test_deepseek_and_omp_sources_are_allowed_for_test_and_publish(self) -> None:
         self.check_sources_allowed(("deepseek", "omp"))
 
+    def test_cursor_source_is_allowed_for_test_and_publish(self) -> None:
+        self.check_sources_allowed(("cursor",))
+
     def check_sources_allowed(self, sources: tuple[str, ...]) -> None:
         credentials = self.register()
         computer = self.computer_login()

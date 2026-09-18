@@ -21,6 +21,8 @@
 
 ## 已支持能力
 
+- **Cursor（初步适配）**：使用官方用户级 `~/.cursor/hooks.json` 的 `stop` 事件，同时进入 Bark / AgentWatch 通道。支持 completed、error、aborted，按 conversation / generation / loop 去重，通知显示项目目录名和本轮状态。安装/更新保留已有 hooks，卸载只移除 AgentWatch 自己的条目；不注册 `subagentStop`、不读取 transcript 或邮箱、不会自动提交 follow-up。此接口代表一轮结束，其他 stop hooks 仍可让 Cursor 后续继续；不代表整个会话永久结束。用户级 stop hooks 不覆盖 Cloud Agent，CLI 是否触发取决于具体版本，需实机验证。
+
 - **ZCode 可读会话**：完成日志中的 session ID 会在本机以只读方式关联 ZCode SQLite 会话库，通知显示会话标题和项目目录；不读取消息正文。新日志的 `v4 prompt admitted` 和旧格式均可识别。
 - **DeepSeek Harness**：监听本机 `~/.dsh/storages/session_projcache/sessions` 的投影缓存（当前支持缓存 v7、session format v3、turnBoundary v2），以关闭的轮次边界提示“本轮已结束”。启动时建立历史基线，同一轮缓存改写不会重复通知，子智能体、seeded 会话及 active goal 默认静默。缓存是最新状态快照，watcher 离线期间或两次轮询之间结束的多轮只提示最新轮次；不将结束推断为成功，不读取压缩对话正文。
 - **OMP / Oh My Pi**：支持 `18.0.0+`，安装/更新自动配置本机扩展。主会话 `session_stop` 仅记录候选，最终 `agent_end` 无续跑和待处理消息时才写入私有队列；子智能体及只触发错误/取消、没有有效主会话停止事件的运行保持静默。已有 OMP 进程需重启以加载扩展。自定义 profile 可配置 `OMP_WATCH_AGENT_DIR`。
@@ -284,6 +286,8 @@ agentwatch uninstall
 | `DEEPSEEK_WATCH_PROJECTION_ROOT` | 可覆盖 DeepSeek 缓存目录；未设置时从 `DSH_HOME`（默认 `~/.dsh`）推导 |
 | `OMP_WATCH_ENABLED` | 是否安装并监听 OMP 扩展，默认 `1` |
 | `OMP_WATCH_AGENT_DIR` | OMP profile 的 agent 目录，默认 `~/.omp/agent`，与 Pi 的安装目录分离 |
+| `CURSOR_WATCH_ENABLED` | 是否配置和监听 Cursor 用户级 stop hook，默认 `1` |
+| `CURSOR_BARK_GROUP` / `CURSOR_BARK_ICON` | Bark 分组默认 `Cursor`；可自行配置公开图标 URL，当前未内置官方大图标 |
 | `KIMI_WATCH_ENABLED` | 是否启用 Kimi Code，默认 `1` |
 | `KIMI_WATCH_SESSIONS_ROOT` | Kimi Code 会话目录，默认 `~/.kimi-code/sessions` |
 | `KIMI_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Kimi 子智能体，默认 `0` |
@@ -408,6 +412,7 @@ python3 codex_watch_notifier.py --test-pi
 python3 codex_watch_notifier.py --test-opencode
 python3 codex_watch_notifier.py --test-deepseek
 python3 codex_watch_notifier.py --test-omp
+python3 codex_watch_notifier.py --test-cursor
 ```
 
 以上 `--test*` 都是真实、显式、单次的通知测试；安装、更新、登录、诊断和构建不得自动调用。如果你新增了某个工具的测试命令，也要把它加入人工验收清单。

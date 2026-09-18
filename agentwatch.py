@@ -54,6 +54,10 @@ from claude_hook_config import (
     preflight_claude_hooks,
 )
 from tool_hook_config import (
+    build_cursor_hook_handler,
+    configure_cursor_hooks,
+    preflight_cursor_hooks,
+    inspect_cursor_hooks,
     OMP_MANAGED_MARKER,
     build_omp_extension,
     omp_extension_path,
@@ -100,6 +104,7 @@ TOOL_HOOK_INPUT_LIMIT_BYTES = 1024 * 1024
 TOOL_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
 TOOL_HOOK_SCHEMA = "agentwatch_tool_hook_v1"
 TOOL_HOOK_SOURCE_SCHEMAS = {
+    "cursor": ("agentwatch_cursor_hook_v1", "stop"),
     "omp": ("agentwatch_omp_hook_v1", "agent_end"),
     "pi": ("agentwatch_pi_hook_v1", "agent_settled"),
     "opencode": ("agentwatch_opencode_hook_v1", "session.idle"),
@@ -369,6 +374,10 @@ def ingest_claude_hook_event(
     if not isinstance(payload, dict):
         return False
 
+    # Cursor can import Claude hooks. Its native integration owns these events.
+    if payload.get("cursor_version") or os.getenv("CURSOR_VERSION"):
+        return False
+
     hook_event_name = _claude_hook_string(payload, "hook_event_name", required=True, limit=32)
     if hook_event_name not in {"Stop", "StopFailure"}:
         return False
@@ -540,6 +549,52 @@ def _write_private_tool_event(events_dir: Path, record: dict[str, Any]) -> Path:
         except FileNotFoundError:
             pass
     return destination
+
+
+def ingest_cursor_hook_event(events_dir: Path | None = None) -> Path:
+    """Normalize only the official main-agent stop payload; never read transcripts."""
+    raw = sys.stdin.buffer.read(TOOL_HOOK_INPUT_LIMIT_BYTES + 1)
+    if not raw or len(raw) > TOOL_HOOK_INPUT_LIMIT_BYTES:
+        raise AgentWatchError("invalid Cursor hook input")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise AgentWatchError("invalid Cursor hook input") from exc
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "stop":
+        raise AgentWatchError("unsupported Cursor hook event")
+    if payload.get("parent_session_id") or payload.get("subagent_id"):
+        raise AgentWatchError("Cursor child session is not a notification source")
+    conversation = _tool_hook_payload_string(payload, "conversation_id", limit=256, required=True)
+    generation = _tool_hook_payload_string(payload, "generation_id", limit=256, required=True)
+    status_value = _tool_hook_payload_string(payload, "status", limit=16, required=True)
+    outcome = {"completed": "completed", "aborted": "cancelled", "error": "error"}.get(status_value)
+    loop_count = payload.get("loop_count", 0)
+    if outcome is None or type(loop_count) is not int or not 0 <= loop_count <= 1_000_000:
+        raise AgentWatchError("invalid Cursor stop status")
+    roots = payload.get("workspace_roots")
+    if not isinstance(roots, list) or not roots or not isinstance(roots[0], str):
+        raise AgentWatchError("Cursor stop has no workspace")
+    cwd = roots[0].strip()
+    if not cwd or len(cwd) > 4096 or not os.path.isabs(cwd):
+        raise AgentWatchError("invalid Cursor workspace")
+    now = int(time.time())
+    record = {
+        "schema": TOOL_HOOK_SCHEMA,
+        "source": "cursor",
+        "event_name": "stop",
+        "session_id": conversation,
+        "event_id": hashlib.sha256(f"{generation}\0{loop_count}".encode()).hexdigest(),
+        "timestamp": now,
+        "received_at": now,
+        "cwd": cwd,
+        "session_title": "",
+        "parent_session": "",
+        "outcome": outcome,
+        "stop_reason": status_value,
+        "message": "",
+        "message_sha256": hashlib.sha256(b"").hexdigest(),
+    }
+    return _write_private_tool_event(events_dir or _tool_hook_events_dir(), record)
 
 
 def ingest_tool_hook_event(source: str, events_dir: Path | None = None) -> Path:
@@ -1743,6 +1798,24 @@ def _persistent_flag(values: dict[str, str], name: str, default: bool = True) ->
     return raw.lower() not in {"0", "false", "no", "off"}
 
 
+def _cursor_hook_status(paths: InstallPaths) -> dict[str, Any]:
+    return inspect_cursor_hooks(
+        paths.home / ".cursor" / "hooks.json",
+        build_cursor_hook_handler(Path(sys.executable), paths.runtime / "agentwatch.py", _tool_hook_events_dir(paths)),
+        enabled=_persistent_flag(_config_values(paths), "CURSOR_WATCH_ENABLED", True),
+    )
+
+
+def _configure_cursor_hook(paths: InstallPaths, *, enabled: bool | None = None) -> bool:
+    requested = _persistent_flag(_config_values(paths), "CURSOR_WATCH_ENABLED", True)
+    return configure_cursor_hooks(
+        paths.home / ".cursor" / "hooks.json",
+        build_cursor_hook_handler(Path(sys.executable), paths.runtime / "agentwatch.py", _tool_hook_events_dir(paths)),
+        enabled=requested if enabled is None else enabled,
+        backup=paths.config / "cursor-hooks.pre-agentwatch.json",
+    )
+
+
 def _semver_cli_status(command: str, minimum: tuple[int, int, int]) -> dict[str, Any]:
     executable = shutil.which(command)
     minimum_text = ".".join(str(part) for part in minimum)
@@ -1975,6 +2048,7 @@ def _tool_hook_desired(paths: InstallPaths) -> dict[str, dict[str, Any]]:
 
 
 def _preflight_installed_tool_hooks(paths: InstallPaths, *, enabled: bool | None = None) -> None:
+    preflight_cursor_hooks(paths.home / ".cursor" / "hooks.json")
     registered = _load_tool_hook_registration(paths)
     if enabled is False:
         desired = _tool_hook_cleanup_targets(paths)
@@ -2019,7 +2093,7 @@ def _configure_installed_tool_hooks(paths: InstallPaths, *, enabled: bool | None
     if enabled is False:
         desired = _tool_hook_cleanup_targets(paths)
         _preflight_installed_tool_hooks(paths, enabled=False)
-        changed = False
+        changed = _configure_cursor_hook(paths, enabled=False)
         for source, entry in list(registered.items()):
             changed = configure_managed_integration(
                 _tool_hook_entry_path(entry),
@@ -2033,7 +2107,7 @@ def _configure_installed_tool_hooks(paths: InstallPaths, *, enabled: bool | None
         return changed
 
     desired = _tool_hook_desired(paths)
-    changed = False
+    changed = _configure_cursor_hook(paths)
     for source, details in desired.items():
         current_path = details["path"]
         marker = details["marker"]
@@ -2242,6 +2316,7 @@ def _status(paths: InstallPaths, service: ServiceManager) -> dict[str, Any]:
         "launcher": str(paths.launcher),
         "claude_hook": _installed_claude_hook_status(paths),
         "tool_hooks": _installed_tool_hook_status(paths),
+        "cursor_hook": _cursor_hook_status(paths),
     }
     result.update(delivery)
     result["login_required"] = bool(
@@ -2372,6 +2447,8 @@ def _human_status(result: dict[str, Any]) -> None:
     else:
         claude_state = "未配置"
     print(f"Claude Code Hook：{claude_state}")
+    cursor_hook = result.get("cursor_hook") or {}
+    print("Cursor Hook：" + ("已配置" if cursor_hook.get("active") else "未配置或已关闭"))
     tool_hooks = result.get("tool_hooks") or {}
     for source, label in (("pi", "Pi Agent 扩展"), ("opencode", "OpenCode 插件"), ("omp", "OMP 扩展")):
         integration = tool_hooks.get(source) or {}
@@ -2446,6 +2523,9 @@ def build_parser() -> argparse.ArgumentParser:
     claude_hook = command("claude-hook", argparse.SUPPRESS)
     claude_hook.add_argument("--events-file", help=argparse.SUPPRESS)
     claude_hook.add_argument("--managed-hook-id", help=argparse.SUPPRESS)
+    cursor_hook = command("cursor-hook", argparse.SUPPRESS)
+    cursor_hook.add_argument("--events-dir", help=argparse.SUPPRESS)
+    cursor_hook.add_argument("--managed-hook-id", help=argparse.SUPPRESS)
     tool_hook = command("tool-hook", argparse.SUPPRESS)
     tool_hook.add_argument("--source", choices=tuple(TOOL_HOOK_SOURCE_SCHEMAS), required=True)
     tool_hook.add_argument("--events-dir", help=argparse.SUPPRESS)
@@ -2470,6 +2550,15 @@ def _prompt_delivery_mode() -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "cursor-hook":
+        try:
+            directory = Path(os.path.abspath(os.path.expanduser(args.events_dir))) if args.events_dir else None
+            ingest_cursor_hook_event(directory)
+        except Exception:
+            pass
+        # Empty output object never blocks or requests an automatic follow-up.
+        print("{}")
+        return 0
     if args.command == "claude-hook":
         # Stop hooks must never delay or block Claude because local notification
         # persistence failed. Invalid input is ignored without stdout/stderr.
@@ -2593,6 +2682,11 @@ def main(argv: list[str] | None = None) -> int:
                     or claude_hook.get("cli_compatible")
                 ),
                 "tool_hook_registration_valid": not tool_hooks.get("registration_error"),
+                "cursor_hook_configured": bool(
+                    not result.get("cursor_hook", {}).get("enabled")
+                    or result.get("cursor_hook", {}).get("active")
+                ),
+                "cursor_hook_config_valid": not result.get("cursor_hook", {}).get("error"),
             }
             for source in ("pi", "opencode", "omp"):
                 integration = tool_hooks[source]
@@ -2843,7 +2937,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             result = {
                 "ok": True,
-                "message": "AgentWatch 后台服务、Claude/Pi/OpenCode/OMP 集成和程序已卸载；本机账号 token 与历史状态已保留",
+                "message": "AgentWatch 后台服务、Claude/Pi/OpenCode/OMP/Cursor 集成和程序已卸载；本机账号 token 与历史状态已保留",
                 "credentials_preserved": True,
             }
             _emit(result, json_output)

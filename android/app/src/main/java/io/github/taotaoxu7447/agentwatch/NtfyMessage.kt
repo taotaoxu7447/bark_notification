@@ -40,6 +40,7 @@ data class NtfyMessage(
         OPENCODE("opencode", "OpenCode"),
         DEEPSEEK("deepseek", "DeepSeek Harness"),
         OMP("omp", "OMP"),
+        CURSOR("cursor", "Cursor"),
         OTHER("other", "其他任务"),
     }
 
@@ -113,6 +114,7 @@ data class NtfyMessage(
                 normalized.startsWith("opencode") || normalized.startsWith("open code") -> Source.OPENCODE
                 normalized.startsWith("deepseek") -> Source.DEEPSEEK
                 normalized.startsWith("omp") -> Source.OMP
+                normalized.startsWith("cursor") -> Source.CURSOR
                 else -> Source.OTHER
             }
         }

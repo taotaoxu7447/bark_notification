@@ -53,7 +53,7 @@ LINUX_BACKENDS = frozenset(
 WINDOWS_TOKEN_FILE_NAME = "computer-token.dpapi"
 KEYCHAIN_SERVICE = "io.github.taotaoxu7447.agentwatch.computer"
 SECRET_TOOL_LABEL = "AgentWatch computer token"
-ALLOWED_SOURCES = {"codex", "zcode", "kimi", "grok", "claude", "pi", "opencode", "deepseek", "omp", "other"}
+ALLOWED_SOURCES = {"codex", "zcode", "kimi", "grok", "claude", "pi", "opencode", "deepseek", "omp", "cursor", "other"}
 
 
 class AgentWatchError(RuntimeError):

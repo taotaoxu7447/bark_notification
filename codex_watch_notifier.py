@@ -91,7 +91,7 @@ TOOL_HOOK_SCHEMA = "agentwatch_tool_hook_v1"
 TOOL_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
 TOOL_HOOK_EVENT_MAX_BYTES = 1024 * 1024
 TOOL_HOOK_EVENT_FILE_RE = re.compile(
-    r"^(?P<created>[0-9]{15,21})-(?P<source>pi|opencode|omp)-"
+    r"^(?P<created>[0-9]{15,21})-(?P<source>pi|opencode|omp|cursor)-"
     r"(?P<identity>[0-9a-f]{16})-(?P<nonce>[0-9a-f]{8})\.json$"
 )
 CLAUDE_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
@@ -514,7 +514,7 @@ def publisher_instance_id() -> str:
 def ntfy_source(event: dict[str, Any]) -> str:
     prefix = str(event.get("event_type") or "").partition("_")[0].lower()
     return prefix if prefix in {
-        "codex", "zcode", "kimi", "grok", "claude", "pi", "opencode", "deepseek", "omp"
+        "codex", "zcode", "kimi", "grok", "claude", "pi", "opencode", "deepseek", "omp", "cursor"
     } else "codex"
 
 
@@ -546,6 +546,7 @@ def ntfy_icon(event: dict[str, Any]) -> str:
         "opencode": DEFAULT_OPENCODE_BARK_ICON,
         "deepseek": DEFAULT_DEEPSEEK_BARK_ICON,
         "omp": DEFAULT_OMP_BARK_ICON,
+        "cursor": "",
     }
     configured = str(event.get("bark_icon") or os.getenv(f"{source.upper()}_BARK_ICON", "") or defaults[source]).strip()
     parsed = urllib.parse.urlparse(configured)
@@ -2475,7 +2476,7 @@ def validated_tool_hook_record(record: Any) -> dict[str, Any] | None:
         message_hash,
     }:
         return None
-    expected_event = {"pi": "agent_settled", "opencode": "session.idle", "omp": "agent_end"}.get(source)
+    expected_event = {"pi": "agent_settled", "opencode": "session.idle", "omp": "agent_end", "cursor": "stop"}.get(source)
     if event_name != expected_event:
         return None
     session_title = record.get("session_title", "")
@@ -2521,7 +2522,7 @@ def trigger_from_tool_hook_record(path: Path, offset: int, record: dict[str, Any
     if not env_flag(f"{source.upper()}_WATCH_ENABLED", True):
         return None
     parent_session = parsed["parent_session"]
-    if source in {"opencode", "omp"} and parent_session:
+    if source in {"opencode", "omp", "cursor"} and parent_session:
         return None
     if (
         source == "pi"
@@ -2530,7 +2531,7 @@ def trigger_from_tool_hook_record(path: Path, offset: int, record: dict[str, Any
     ):
         return None
 
-    labels = {"pi": "Pi Agent", "opencode": "OpenCode", "omp": "OMP"}
+    labels = {"pi": "Pi Agent", "opencode": "OpenCode", "omp": "OMP", "cursor": "Cursor"}
     tool_name = labels[source]
     outcome = parsed["outcome"]
     message = parsed["message"]
@@ -2542,6 +2543,9 @@ def trigger_from_tool_hook_record(path: Path, offset: int, record: dict[str, Any
             "已停下": f"{tool_name} 已停下",
         }[status]
         event_type = f"{source}_turn_completed"
+        if source == "cursor":
+            title = "Cursor 已结束本轮"
+            status_detail = "Cursor stop hook：本轮已结束"
     elif outcome == "cancelled":
         status = "已取消"
         status_detail = f"{tool_name} 本轮被取消或停止"
@@ -2565,6 +2569,7 @@ def trigger_from_tool_hook_record(path: Path, offset: int, record: dict[str, Any
         "pi": DEFAULT_PI_BARK_ICON,
         "opencode": DEFAULT_OPENCODE_BARK_ICON,
         "omp": DEFAULT_OMP_BARK_ICON,
+        "cursor": "",
     }
     event = {
         "event_type": event_type,
@@ -4112,6 +4117,7 @@ def tool_hooks_watch_enabled(args: argparse.Namespace) -> bool:
         env_flag("PI_WATCH_ENABLED", True)
         or env_flag("OPENCODE_WATCH_ENABLED", True)
         or env_flag("OMP_WATCH_ENABLED", True)
+        or env_flag("CURSOR_WATCH_ENABLED", True)
     )
 
 
@@ -4643,6 +4649,7 @@ def main() -> int:
         "--test-opencode",
         "--test-deepseek",
         "--test-omp",
+        "--test-cursor",
     }
     while True:
         try:
@@ -4696,6 +4703,7 @@ def main() -> int:
     parser.add_argument("--test-opencode", action="store_true", help="Send one OpenCode test notification and exit.")
     parser.add_argument("--test-deepseek", action="store_true", help="Send one DeepSeek Harness test notification.")
     parser.add_argument("--test-omp", action="store_true", help="Send one OMP test notification.")
+    parser.add_argument("--test-cursor", action="store_true", help="Send one Cursor test notification.")
     parser.add_argument("--doctor", action="store_true", help="Check configuration, log roots, and LaunchAgent status.")
     parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
     args = parser.parse_args()
@@ -4721,6 +4729,8 @@ def main() -> int:
         return send_external_test_notification(args, log, "DeepSeek Harness", "deepseek")
     if args.test_omp:
         return send_external_test_notification(args, log, "OMP", "omp")
+    if args.test_cursor:
+        return send_external_test_notification(args, log, "Cursor", "cursor")
     if args.doctor:
         return doctor(args, log)
     # Keep these paths lexical so the safety checks can still see a configured
