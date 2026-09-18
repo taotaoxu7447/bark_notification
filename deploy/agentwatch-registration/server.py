@@ -1637,7 +1637,11 @@ class AgentWatchApplication:
         payload = cls._decode_object(
             raw,
             fields,
-            {"month_download_bytes", "month_upload_bytes", "month_quota_bytes"},
+            {
+                "month_download_bytes", "month_upload_bytes", "month_quota_bytes",
+                "desk_mode", "mac_present", "presence_observed_at",
+                "rest_triggered_at", "rest_black_at",
+            },
         )
         if payload["schema"] != "deskbao_network_v1":
             raise ApiError(400, "invalid_schema", "Unsupported network snapshot schema")
@@ -1652,6 +1656,22 @@ class AgentWatchApplication:
             raise ApiError(400, "invalid_observed_at", "observed_at is not recent")
         if not isinstance(payload["primary_online"], bool):
             raise ApiError(400, "invalid_primary_online", "primary_online must be a boolean")
+        desk_mode = str(payload.get("desk_mode", "active"))
+        if desk_mode not in {"active", "rest"}:
+            raise ApiError(400, "invalid_desk_mode", "desk_mode is invalid")
+        mac_present = payload.get("mac_present", True)
+        if not isinstance(mac_present, bool):
+            raise ApiError(400, "invalid_mac_present", "mac_present must be a boolean")
+        presence_observed_at = cls._network_integer(
+            payload.get("presence_observed_at", observed_at),
+            "presence_observed_at", 0, 4_102_444_800,
+        )
+        rest_triggered_at = cls._network_integer(
+            payload.get("rest_triggered_at", 0), "rest_triggered_at", 0, 4_102_444_800,
+        )
+        rest_black_at = cls._network_integer(
+            payload.get("rest_black_at", 0), "rest_black_at", 0, 4_102_444_800,
+        )
         return {
             "schema": "deskbao_network_v1",
             "source_id": source_id,
@@ -1695,6 +1715,11 @@ class AgentWatchApplication:
             ),
             "signal_dbm": cls._network_integer(payload["signal_dbm"], "signal_dbm", -200, 0),
             "clients": cls._network_integer(payload["clients"], "clients", 0, 10_000),
+            "desk_mode": desk_mode,
+            "mac_present": mac_present,
+            "presence_observed_at": presence_observed_at,
+            "rest_triggered_at": rest_triggered_at,
+            "rest_black_at": rest_black_at,
         }
 
     def _network_update(self, raw: bytes, headers: Mapping[str, str]) -> Response:

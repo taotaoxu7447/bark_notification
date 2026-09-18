@@ -529,6 +529,11 @@ class ApiTestCase(unittest.TestCase):
             "signal_percent": 82,
             "signal_dbm": -83,
             "clients": 8,
+            "desk_mode": "rest",
+            "mac_present": False,
+            "presence_observed_at": now,
+            "rest_triggered_at": now,
+            "rest_black_at": now + 9_000,
         }
 
         status, response = self.request(
@@ -567,7 +572,11 @@ class ApiTestCase(unittest.TestCase):
         legacy_snapshot = {
             key: value
             for key, value in snapshot.items()
-            if key not in {"month_download_bytes", "month_upload_bytes", "month_quota_bytes"}
+            if key not in {
+                "month_download_bytes", "month_upload_bytes", "month_quota_bytes",
+                "desk_mode", "mac_present", "presence_observed_at",
+                "rest_triggered_at", "rest_black_at",
+            }
         }
         status, _ = self.request(
             "/network/latest", legacy_snapshot,
@@ -580,6 +589,10 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(0, response["snapshot"]["month_download_bytes"])
         self.assertEqual(0, response["snapshot"]["month_upload_bytes"])
         self.assertEqual(0, response["snapshot"]["month_quota_bytes"])
+        self.assertEqual("active", response["snapshot"]["desk_mode"])
+        self.assertTrue(response["snapshot"]["mac_present"])
+        self.assertEqual(0, response["snapshot"]["rest_triggered_at"])
+        self.assertEqual(0, response["snapshot"]["rest_black_at"])
 
     def test_publish_failures_log_only_safe_classification_and_keep_502_contract(self) -> None:
         mobile = self.register()
