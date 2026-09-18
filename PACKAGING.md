@@ -36,7 +36,7 @@ The Python script loads `~/.codex-watch-notifier/env` itself, so Linux and Windo
 Build all packages from macOS with:
 
 ```bash
-./build_packages.zsh v0.4.2
+./build_packages.zsh v0.4.3
 ```
 
 ## macOS Package
@@ -44,7 +44,7 @@ Build all packages from macOS with:
 Package name:
 
 ```text
-codex-watch-notifier-macos-v0.4.2.zip
+codex-watch-notifier-macos-v0.4.3.zip
 ```
 
 Includes:
@@ -77,7 +77,7 @@ The installer asks for AgentWatch account input only in modes that use AgentWatc
 Package name:
 
 ```text
-codex-watch-notifier-ubuntu-v0.4.2.tar.gz
+codex-watch-notifier-ubuntu-v0.4.3.tar.gz
 ```
 
 Includes:
@@ -112,7 +112,7 @@ Notes:
 Package name:
 
 ```text
-codex-watch-notifier-windows-v0.4.2.zip
+codex-watch-notifier-windows-v0.4.3.zip
 ```
 
 Includes:
@@ -158,6 +158,6 @@ Before each internal release:
 9. Confirm an event is attempted at most twice and a channel that succeeded in round one is never sent again in round two.
 10. Confirm Android exposes dedicated Claude, Pi, and OpenCode icons, notification channels, and history sources, and every desktop package contains all three source icons.
 11. Build all three package files from the same git commit.
-12. Tag the commit `v0.4.2`.
+12. Tag the commit `v0.4.3`.
 13. Run `android/build_release.zsh`, verify the APK signature/application ID, and
-    publish `AgentWatch-android-v0.4.2.apk` from the same commit.
+    publish `AgentWatch-android-v0.4.3.apk` from the same commit.

@@ -20,9 +20,34 @@ object AppConfig {
         return builder.build().toString().replaceFirst("https://", "wss://")
     }
 
-    fun validPrivateSession(topic: String, ntfyUrl: String, ntfyWebsocketUrl: String): Boolean = try {
+    fun validPrivateSession(topic: String, ntfyUrl: String, ntfyWebsocketUrl: String): Boolean =
+        validPrivateSessionForServer(BuildConfig.SERVER_BASE_URL, topic, ntfyUrl, ntfyWebsocketUrl)
+
+    fun validLegacyPrivateSession(topic: String, ntfyUrl: String, ntfyWebsocketUrl: String): Boolean =
+        validPrivateSessionForServer(BuildConfig.LEGACY_SERVER_BASE_URL, topic, ntfyUrl, ntfyWebsocketUrl)
+
+    fun currentPublishUrl(topic: String): String =
+        BuildConfig.SERVER_BASE_URL.toHttpUrl().newBuilder()
+            .addPathSegment(topic)
+            .build()
+            .toString()
+
+    fun currentWebsocketUrl(topic: String): String =
+        BuildConfig.SERVER_BASE_URL.toHttpUrl().newBuilder()
+            .addPathSegment(topic)
+            .addPathSegment("ws")
+            .build()
+            .toString()
+            .replaceFirst("https://", "wss://")
+
+    private fun validPrivateSessionForServer(
+        serverBase: String,
+        topic: String,
+        ntfyUrl: String,
+        ntfyWebsocketUrl: String,
+    ): Boolean = try {
         if (!ntfyWebsocketUrl.startsWith("wss://")) return false
-        val configuredServer = BuildConfig.SERVER_BASE_URL.toHttpUrl()
+        val configuredServer = serverBase.toHttpUrl()
         val publish = ntfyUrl.toHttpUrl()
         val websocket = ntfyWebsocketUrl.replaceFirst("wss://", "https://").toHttpUrl()
         topic.matches(Regex("aw-[0-9a-f]{32}")) &&

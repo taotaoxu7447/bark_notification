@@ -54,14 +54,23 @@ class SecretStore(context: Context) {
         check(editor.commit()) { "Could not persist encrypted private session" }
     }
 
-    fun session(): Session = Session(
-        username = get(USERNAME),
-        ntfyToken = get(NTFY_TOKEN),
-        appToken = get(APP_TOKEN),
-        ntfyTopic = get(NTFY_TOPIC),
-        ntfyUrl = get(NTFY_URL),
-        ntfyWebsocketUrl = get(NTFY_WEBSOCKET_URL),
-    )
+    fun session(): Session {
+        val stored = Session(
+            username = get(USERNAME),
+            ntfyToken = get(NTFY_TOKEN),
+            appToken = get(APP_TOKEN),
+            ntfyTopic = get(NTFY_TOPIC),
+            ntfyUrl = get(NTFY_URL),
+            ntfyWebsocketUrl = get(NTFY_WEBSOCKET_URL),
+        )
+        val migrated = migratedLegacySession(stored) ?: return stored
+        return try {
+            saveSession(migrated)
+            migrated
+        } catch (_: Exception) {
+            stored
+        }
+    }
 
     fun get(name: String): String {
         val encoded = preferences.getString(name, null) ?: return ""
@@ -132,5 +141,22 @@ class SecretStore(context: Context) {
 
         internal fun legacyUpgradeRequired(session: Session, legacyUsername: String): Boolean =
             !session.isPrivate && session.appToken.isNotBlank() && legacyUsername.isNotBlank()
+
+        internal fun migratedLegacySession(session: Session): Session? {
+            val credentialsComplete = session.username.isNotBlank() &&
+                session.ntfyToken.isNotBlank() && session.appToken.isNotBlank()
+            if (!credentialsComplete || !AppConfig.validLegacyPrivateSession(
+                    session.ntfyTopic,
+                    session.ntfyUrl,
+                    session.ntfyWebsocketUrl,
+                )
+            ) {
+                return null
+            }
+            return session.copy(
+                ntfyUrl = AppConfig.currentPublishUrl(session.ntfyTopic),
+                ntfyWebsocketUrl = AppConfig.currentWebsocketUrl(session.ntfyTopic),
+            )
+        }
     }
 }

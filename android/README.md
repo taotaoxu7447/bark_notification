@@ -7,7 +7,7 @@ encrypted with Android Keystore before a foreground `remoteMessaging` service
 opens the authenticated WebSocket.
 
 The phone never connects directly to a sender computer. Each computer publishes
-over authenticated HTTPS to the self-hosted HK_VPS, while AgentWatch maintains
+over authenticated HTTPS to the self-hosted SH VPS, while AgentWatch maintains
 an authenticated `wss://` connection to that same relay. ADB is needed only for
 development or sideloading and may be disabled after installation.
 
@@ -89,6 +89,11 @@ or account behavior.
 Version 0.4.2 migrates the service endpoint to the replacement HK server. An
 existing installation must be opened once after updating so its encrypted
 private session can be upgraded with the existing app token.
+Version 0.4.3 moves the endpoint to `https://aw.taotaoxu.net` and migrates a
+stored private session from `https://191.222.219.94:9444` locally. The topic,
+username, and tokens are preserved, so existing users do not need to log in
+again. Registration responses still require the current domain; legacy URLs
+are accepted only for the one-time local migration.
 Other accounts have no ACL read access to that topic. ntfy remains a short-term
 offline-delivery buffer (currently about six hours), not a long-term message
 archive; a phone offline beyond that window cannot reconstruct expired events.

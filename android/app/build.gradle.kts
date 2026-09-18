@@ -25,10 +25,11 @@ android {
         applicationId = "io.github.taotaoxu7447.agentwatch"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.4.2"
+        versionCode = 8
+        versionName = "0.4.3"
 
-        buildConfigField("String", "SERVER_BASE_URL", "\"https://191.222.219.94:9444\"")
+        buildConfigField("String", "SERVER_BASE_URL", "\"https://aw.taotaoxu.net\"")
+        buildConfigField("String", "LEGACY_SERVER_BASE_URL", "\"https://191.222.219.94:9444\"")
         buildConfigField("String", "API_PREFIX", "\"/agentwatch/api/v1\"")
         buildConfigField("int", "MAX_CATCH_UP_SECONDS", "21600")
     }
