@@ -146,7 +146,7 @@ blocked until every registered mobile installation has `private_ready_at`, so
 one upgraded phone cannot strand another phone on the old shared channel.
 Always back up both SQLite databases transactionally before deployment.
 
-## Install on HK_VPS
+## Install on SH VPS
 
 Install reviewed files and a root-owned secret environment file; never populate
 `service.env` in the checkout:
@@ -174,12 +174,12 @@ Validate before reload, then check schema and service health:
 sudo /usr/local/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl daemon-reload
 sudo systemctl restart agentwatch-registration.service
-curl --fail --silent --show-error https://191.222.219.94:9444/agentwatch/api/v1/health
+curl --fail --silent --show-error https://aw.taotaoxu.net/agentwatch/api/v1/health
 sudo -u ntfy -- /usr/bin/python3 -I -c \
   'import sqlite3; db=sqlite3.connect("/var/lib/agentwatch-registration/registration.db"); print(db.execute("PRAGMA user_version").fetchone()[0]); print(db.execute("PRAGMA quick_check").fetchone()[0]); db.close()'
 ```
 
-The HK host does not require the optional `sqlite3` shell. Use Python's stdlib
+The SH host does not require the optional `sqlite3` shell. Use Python's stdlib
 `sqlite3.Connection.backup()` for online, transactionally consistent backups
 of both `registration.db` and ntfy's `user.db`, then run `PRAGMA quick_check`
 against each backup before replacing server code.

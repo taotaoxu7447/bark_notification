@@ -1,5 +1,5 @@
 # Public metadata; safe to commit. Credentials and password hashes do not belong here.
-base-url: "https://191.222.219.94:9444"
+base-url: "https://aw.taotaoxu.net"
 listen-http: "127.0.0.1:2586"
 
 # Keep a short offline-delivery window and remove deleted SQLite content eagerly.

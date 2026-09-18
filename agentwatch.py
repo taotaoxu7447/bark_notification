@@ -68,7 +68,7 @@ from tool_hook_config import (
 )
 
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 MACOS_LABEL = "com.xutao.codex-watch-notifier"
 LINUX_UNIT = "codex-watch-notifier.service"
 WINDOWS_TASK = "CodexWatchNotifier"

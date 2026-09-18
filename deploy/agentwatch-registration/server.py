@@ -107,7 +107,7 @@ class Config:
     ntfy_subscriber_user: str = "agent-watch-subscriber"
     ntfy_publisher_user: str = "agent-watch-publisher"
     ntfy_internal_url: str = "http://127.0.0.1:2586/agent-watch"
-    ntfy_public_url: str = "https://191.222.219.94:9444/agent-watch"
+    ntfy_public_url: str = "https://aw.taotaoxu.net/agent-watch"
     topic: str = "agent-watch"
     max_request_body: int = 16 * 1024
     max_users: int = 32
@@ -149,7 +149,7 @@ class Config:
                 "AGENTWATCH_NTFY_INTERNAL_URL", "http://127.0.0.1:2586/agent-watch"
             ),
             ntfy_public_url=values.get(
-                "AGENTWATCH_NTFY_PUBLIC_URL", "https://191.222.219.94:9444/agent-watch"
+                "AGENTWATCH_NTFY_PUBLIC_URL", "https://aw.taotaoxu.net/agent-watch"
             ),
             topic=values.get("AGENTWATCH_NTFY_TOPIC", "agent-watch"),
         )

@@ -1,9 +1,9 @@
-# HK_VPS ntfy deployment
+# SH VPS ntfy deployment
 
 The public relay base is:
 
 ```text
-https://191.222.219.94:9444
+https://aw.taotaoxu.net
 ```
 
 The server uses `auth-default-access: deny-all`. v0.2 creates a random private
@@ -17,9 +17,8 @@ with a token, password, password hash, `user.db`, or `cache.db`.
 
 - ntfy `v2.26.3` from the official Linux amd64 Debian package; SHA256 is `fdfcb5f4f3318d2c35dd7edaa351abe4637eb53e7641245f9718cf7a2c0342f4`
 - ntfy listens only on `127.0.0.1:2586`
-- Caddy exposes TLS on `https://191.222.219.94:9444`
-- the persistent nftables policy allows TCP/UDP `9444`; port `2586` remains loopback-only
-- the existing sing-box listeners on `443` and Caddy site on `9443` are unchanged
+- Caddy exposes TLS on `https://aw.taotaoxu.net` using the default HTTPS port 443
+- port `2586` remains loopback-only
 - messages are cached for at most six hours; attachments and the web console are disabled
 - `agent-watch-publisher` has exact `wo` ACLs for provisioned private topics
 - every random `awu...` account principal has `ro` access to exactly one topic
@@ -73,7 +72,7 @@ existing `/etc/ntfy` and systemd overrides. Verify all of the following:
 sudo /usr/local/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl is-active ntfy caddy
 sudo ss -lntp
-curl --fail --silent --show-error https://191.222.219.94:9444/v1/health
+curl --fail --silent --show-error https://aw.taotaoxu.net/v1/health
 ```
 
 For one provisioned private topic, also verify anonymous read/write are 403,
@@ -83,7 +82,7 @@ tests create needless mobile alerts. A user/token from another account must
 receive 403 for this topic.
 
 The server health timer also checks `ntfy`, loopback port `2586`, Caddy, and public
-port `9444`. The Caddy site does not enable an access log, so Authorization headers
+port `443`. The Caddy site does not enable an access log, so Authorization headers
 and topic paths are not written to a separate request log.
 
 If the ntfy site fails, restore the saved Caddyfile, validate it, reload Caddy,

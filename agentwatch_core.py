@@ -28,11 +28,11 @@ import uuid
 
 
 PRODUCT_NAME = "AgentWatch"
-CLIENT_USER_AGENT = "agentwatch-computer/0.4.2"
+CLIENT_USER_AGENT = "agentwatch-computer/0.4.3"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 API_VERSION = 2
-LEGACY_DEFAULT_API_BASE = "https://64.90.8.184:9444/agentwatch/api/v1"
-DEFAULT_API_BASE = "https://191.222.219.94:9444/agentwatch/api/v1"
+LEGACY_DEFAULT_API_BASE = "https://191.222.219.94:9444/agentwatch/api/v1"
+DEFAULT_API_BASE = "https://aw.taotaoxu.net/agentwatch/api/v1"
 DEFAULT_CONFIG_DIR = "~/.codex-watch-notifier"
 MACHINE_FILE_NAME = "machine.json"
 SETTINGS_FILE_NAME = "settings.json"

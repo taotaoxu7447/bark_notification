@@ -318,7 +318,7 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual("https://example.test/api/v1/computers/logout", request.full_url)
         self.assertEqual({}, json.loads(request.data))
         self.assertEqual("Bearer computer-token", request.headers["Authorization"])
-        self.assertEqual("agentwatch-computer/0.4.2", request.headers["User-agent"])
+        self.assertEqual("agentwatch-computer/0.4.3", request.headers["User-agent"])
         self.assertTrue(response["ok"])
 
 

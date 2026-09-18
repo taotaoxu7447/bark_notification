@@ -1,4 +1,30 @@
-# HK VPS 迁移运行手册
+# AgentWatch VPS 迁移运行手册
+
+## SH VPS 迁移（v0.4.3）
+
+AgentWatch 的 ntfy 和账号绑定服务已从 HK VPS 迁到 SH VPS：
+
+```text
+旧地址：https://191.222.219.94:9444
+新地址：https://aw.taotaoxu.net
+SH 地址：124.223.213.72
+```
+
+Android v0.4.3 会保留现有 username、topic 和全部 token，只在本地把旧
+HTTPS/WSS 会话地址改写到新域名。桌面端执行 `agentwatch update` 时只改写
+精确匹配项目旧默认值的 `AGENTWATCH_API_BASE`，自定义服务器地址保持不变。
+
+服务端公开检查：
+
+```bash
+curl --fail --silent --show-error https://aw.taotaoxu.net/agentwatch/api/v1/health
+curl --fail --silent --show-error https://aw.taotaoxu.net/v1/health
+```
+
+预期两个接口均返回 HTTP 200。`aw.taotaoxu.net` 必须解析到 SH VPS，并使用
+正常域名证书和隐式 443 端口。旧 HK 地址在过渡期只用于兼容已有客户端。
+
+## 历史：第一次 HK VPS 迁移（v0.4.2）
 
 AgentWatch、ntfy、订阅站和相关代理服务从旧 HK VPS 迁移到替代服务器：
 
