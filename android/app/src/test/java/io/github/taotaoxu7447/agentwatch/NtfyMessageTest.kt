@@ -66,6 +66,7 @@ class NtfyMessageTest {
             Triple("opencode", "OpenCode 已完成", NtfyMessage.Source.OPENCODE),
             Triple("deepseek", "DeepSeek Harness 已结束本轮", NtfyMessage.Source.DEEPSEEK),
             Triple("omp", "OMP 已完成", NtfyMessage.Source.OMP),
+            Triple("cursor", "Cursor 已结束本轮", NtfyMessage.Source.CURSOR),
         ).forEach { (source, title, expected) ->
             val eventId = "aw2-$source-event"
             val envelope = JSONObject()

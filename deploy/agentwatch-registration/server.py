@@ -49,7 +49,7 @@ SEQUENCE_ID_PATTERN = re.compile(r"[-_A-Za-z0-9]{1,64}\Z")
 APP_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 COMPUTER_TOKEN_PATTERN = re.compile(r"awc_[A-Za-z0-9_-]{32,128}\Z")
 TEST_SOURCES = frozenset(
-    {"codex", "zcode", "kimi", "grok", "claude", "pi", "opencode", "deepseek", "omp", "other"}
+    {"codex", "zcode", "kimi", "grok", "claude", "pi", "opencode", "deepseek", "omp", "cursor", "other"}
 )
 NTFY_PRIORITIES = frozenset({"min", "low", "default", "high", "max"})
 PRIVATE_TOPIC_PATTERN = re.compile(r"aw-[0-9a-f]{32}\Z")
