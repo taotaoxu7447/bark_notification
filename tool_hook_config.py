@@ -54,7 +54,7 @@ def omp_extension_path(home: Path, environ: Mapping[str, str] | None = None) -> 
 
 
 def build_omp_extension(python: Path, agentwatch_cli: Path, events_dir: Path) -> str:
-    """OMP 18.2.4: main-session stop arms, final agent_end confirms settlement."""
+    """OMP 18.0.4+: main-session stop arms, final agent_end confirms settlement."""
     return f'''{OMP_MANAGED_MARKER}
 import {{ spawnSync }} from "node:child_process";
 
