@@ -18,6 +18,8 @@ internal object SourcePresentation {
         NtfyMessage.Source.CLAUDE -> R.drawable.ic_notify_claude
         NtfyMessage.Source.PI -> R.drawable.ic_notify_pi
         NtfyMessage.Source.OPENCODE -> R.drawable.ic_notify_opencode
+        NtfyMessage.Source.DEEPSEEK -> R.drawable.ic_notify_deepseek
+        NtfyMessage.Source.OMP -> R.drawable.ic_notify_omp
         NtfyMessage.Source.OTHER -> R.drawable.ic_notify_other
     }
 
@@ -29,6 +31,8 @@ internal object SourcePresentation {
         NtfyMessage.Source.CLAUDE -> R.drawable.source_claude
         NtfyMessage.Source.PI -> R.drawable.source_pi
         NtfyMessage.Source.OPENCODE -> R.drawable.source_opencode
+        NtfyMessage.Source.DEEPSEEK -> R.drawable.source_deepseek
+        NtfyMessage.Source.OMP -> R.drawable.source_omp
         NtfyMessage.Source.OTHER -> null
     }
 }

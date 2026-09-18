@@ -43,6 +43,8 @@ COMMON=(
   assets/pi-icon-v1.png
   assets/opencode-icon-v1.png
   assets/README.md
+  assets/deepseek-icon-v1.png
+  assets/omp-icon-v1.png
 )
 
 make_pkg() {

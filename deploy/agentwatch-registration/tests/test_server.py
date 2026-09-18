@@ -304,11 +304,17 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual("claude", envelope["source"])
 
     def test_pi_and_opencode_sources_are_allowed_for_test_and_publish(self) -> None:
+        self.check_sources_allowed(("pi", "opencode"))
+
+    def test_deepseek_and_omp_sources_are_allowed_for_test_and_publish(self) -> None:
+        self.check_sources_allowed(("deepseek", "omp"))
+
+    def check_sources_allowed(self, sources: tuple[str, ...]) -> None:
         credentials = self.register()
         computer = self.computer_login()
 
-        self.assertTrue({"pi", "opencode"}.issubset(server.TEST_SOURCES))
-        for source in ("pi", "opencode"):
+        self.assertTrue(set(sources).issubset(server.TEST_SOURCES))
+        for source in sources:
             with self.subTest(endpoint="test", source=source):
                 status, response = self.request(
                     "/test", {"source": source}, str(credentials["app_token"])

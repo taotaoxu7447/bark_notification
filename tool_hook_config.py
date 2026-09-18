@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe installation helpers for the Pi and OpenCode AgentWatch integrations."""
+"""Safe installation helpers for Pi, OpenCode, and OMP AgentWatch integrations."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ PI_EXTENSION_FILE_NAME = "agentwatch-notifications.ts"
 OPENCODE_PLUGIN_FILE_NAME = "agentwatch-notifications.js"
 PI_MANAGED_MARKER = "// AgentWatch managed integration v1: pi"
 OPENCODE_MANAGED_MARKER = "// AgentWatch managed integration v1: opencode"
+OMP_MANAGED_MARKER = "// AgentWatch managed integration v1: omp"
 MAX_MANAGED_FILE_BYTES = 512 * 1024
 
 
@@ -42,6 +43,71 @@ def opencode_plugin_path(home: Path, environ: Mapping[str, str] | None = None) -
         xdg = values.get("XDG_CONFIG_HOME", "").strip()
         root = (_expanded_absolute(xdg) if xdg else home / ".config") / "opencode"
     return root / "plugins" / OPENCODE_PLUGIN_FILE_NAME
+
+
+def omp_extension_path(home: Path, environ: Mapping[str, str] | None = None) -> Path:
+    values = os.environ if environ is None else environ
+    # Keep OMP and Pi distinct even when a shared PI_CODING_AGENT_DIR is set.
+    configured = values.get("OMP_WATCH_AGENT_DIR", "").strip()
+    root = _expanded_absolute(configured) if configured else home / ".omp" / "agent"
+    return root / "extensions" / "agentwatch-omp-notifications.ts"
+
+
+def build_omp_extension(python: Path, agentwatch_cli: Path, events_dir: Path) -> str:
+    """OMP 18.0.4+: main-session stop arms, final agent_end confirms settlement."""
+    return f'''{OMP_MANAGED_MARKER}
+import {{ spawnSync }} from "node:child_process";
+
+export default function agentwatchOmp(pi) {{
+  let candidate = null;
+  pi.on("session_start", () => {{ candidate = null; }});
+  pi.on("session_switch", () => {{ candidate = null; }});
+  pi.on("agent_start", () => {{ candidate = null; }});
+  // OMP never emits session_stop for task/subagent sessions. Other stop
+  // handlers may still request continuation, so do not deliver here.
+  pi.on("session_stop", (event, ctx) => {{
+    const session = ctx.sessionManager;
+    if (!session.getSessionFile()) return;
+    const terminal = session.getBranch().slice().reverse().find(
+      entry => entry?.type === "message" && entry.message?.role === "assistant"
+    );
+    if (!terminal?.id) return;
+    const reason = String(terminal.message.stopReason || "");
+    if (reason !== "stop") return;
+    candidate = {{
+      schema: "agentwatch_omp_hook_v1",
+      event_name: "agent_end",
+      session_id: session.getSessionId(),
+      event_id: terminal.id,
+      timestamp: terminal.timestamp || new Date().toISOString(),
+      cwd: String(ctx.cwd || session.getCwd() || ""),
+      session_title: String(pi.getSessionName() || "").slice(0, 512),
+      parent_session: "",
+      outcome: "completed",
+      stop_reason: reason,
+      message: typeof event.last_assistant_message === "string"
+        ? event.last_assistant_message.slice(0, 65536) : "",
+    }};
+  }});
+  pi.on("agent_end", (event, ctx) => {{
+    const record = candidate;
+    candidate = null;
+    if (!record || event.willContinue || ctx.hasPendingMessages()) return;
+    if (record.session_id !== ctx.sessionManager.getSessionId()) return;
+    const finalAssistant = ctx.sessionManager.getBranch().slice().reverse().find(
+      entry => entry?.type === "message" && entry.message?.role === "assistant"
+    );
+    if (finalAssistant?.id !== record.event_id || finalAssistant.message.stopReason !== "stop") return;
+    try {{
+      spawnSync({_js_string(python)}, [
+        {_js_string(agentwatch_cli)}, "tool-hook", "--source", "omp",
+        "--events-dir", {_js_string(events_dir)}, "--require-persist",
+      ], {{ input: JSON.stringify(record), stdio: ["pipe", "ignore", "ignore"],
+           timeout: 5000, windowsHide: true }});
+    }} catch {{}}
+  }});
+}}
+'''
 
 
 def _js_string(value: str | Path) -> str:

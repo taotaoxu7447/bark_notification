@@ -13,6 +13,8 @@ development or sideloading and may be disabled after installation.
 
 ## Delivery behavior
 
+- DeepSeek Harness and OMP have independent source filters, channels, and status-bar glyphs. Older APKs can still receive their messages under the generic source; installing this Android build enables dedicated presentation.
+
 - Sources are grouped into separate Codex, ZCode, Kimi Code, Grok Build,
   Claude Code, Pi Agent, and OpenCode notification channels with distinct
   small and large icons. Each source also has its own Android history category.

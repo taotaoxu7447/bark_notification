@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import datetime as dt
 import hashlib
 import json
@@ -10,6 +11,7 @@ from pathlib import Path
 import platform
 import re
 import secrets
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -38,8 +40,10 @@ DEFAULT_SESSIONS_ROOT = "~/.codex/sessions"
 DEFAULT_ARCHIVED_ROOT = "~/.codex/archived_sessions"
 DEFAULT_SESSION_INDEX = "~/.codex/session_index.jsonl"
 DEFAULT_ZCODE_LOG_ROOT = "~/.zcode/cli/log"
+DEFAULT_ZCODE_DB_PATH = "~/.zcode/cli/db/db.sqlite"
 DEFAULT_KIMI_SESSIONS_ROOT = "~/.kimi-code/sessions"
 DEFAULT_GROK_SESSIONS_ROOT = "~/.grok/sessions"
+DEFAULT_DEEPSEEK_PROJECTION_ROOT = "~/.dsh/storages/session_projcache/sessions"
 CLAUDE_HOOK_EVENTS_FILE_NAME = "claude-hook-events.jsonl"
 TOOL_HOOK_EVENTS_DIR_NAME = "tool-hook-events"
 DEFAULT_CLAUDE_SPOOL_MAX_BYTES = 4 * 1024 * 1024
@@ -81,11 +85,13 @@ DEFAULT_OPENCODE_BARK_ICON = (
     "https://raw.githubusercontent.com/taotaoxu7447/bark_notification/main/assets/opencode-icon-v1.png"
 )
 CLAUDE_HOOK_SCHEMA = "agentwatch_claude_hook_v1"
+DEFAULT_DEEPSEEK_BARK_ICON = "https://aw.taotaoxu.net/icons/deepseek-icon-v1.png"
+DEFAULT_OMP_BARK_ICON = "https://aw.taotaoxu.net/icons/omp-icon-v1.png"
 TOOL_HOOK_SCHEMA = "agentwatch_tool_hook_v1"
 TOOL_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
 TOOL_HOOK_EVENT_MAX_BYTES = 1024 * 1024
 TOOL_HOOK_EVENT_FILE_RE = re.compile(
-    r"^(?P<created>[0-9]{15,21})-(?P<source>pi|opencode)-"
+    r"^(?P<created>[0-9]{15,21})-(?P<source>pi|opencode|omp)-"
     r"(?P<identity>[0-9a-f]{16})-(?P<nonce>[0-9a-f]{8})\.json$"
 )
 CLAUDE_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
@@ -117,6 +123,8 @@ ZCODE_CONTEXT_LOOKBACK_MAX_BYTES = 256 * 1024
 ZCODE_CONTEXT_LOOKBACK_MAX_LINES = 512
 ZCODE_IDENTIFIER_MAX_CHARS = 512
 ZCODE_WORKSPACE_MAX_CHARS = 4096
+ZCODE_TITLE_MAX_CHARS = 512
+DEEPSEEK_PROJECTION_MAX_BYTES = 2 * 1024 * 1024
 
 
 class StateFileError(ValueError):
@@ -505,7 +513,9 @@ def publisher_instance_id() -> str:
 
 def ntfy_source(event: dict[str, Any]) -> str:
     prefix = str(event.get("event_type") or "").partition("_")[0].lower()
-    return prefix if prefix in {"codex", "zcode", "kimi", "grok", "claude", "pi", "opencode"} else "codex"
+    return prefix if prefix in {
+        "codex", "zcode", "kimi", "grok", "claude", "pi", "opencode", "deepseek", "omp"
+    } else "codex"
 
 
 def ntfy_sequence_id(event: dict[str, Any]) -> str:
@@ -534,6 +544,8 @@ def ntfy_icon(event: dict[str, Any]) -> str:
         "claude": DEFAULT_CLAUDE_BARK_ICON,
         "pi": DEFAULT_PI_BARK_ICON,
         "opencode": DEFAULT_OPENCODE_BARK_ICON,
+        "deepseek": DEFAULT_DEEPSEEK_BARK_ICON,
+        "omp": DEFAULT_OMP_BARK_ICON,
     }
     configured = str(event.get("bark_icon") or os.getenv(f"{source.upper()}_BARK_ICON", "") or defaults[source]).strip()
     parsed = urllib.parse.urlparse(configured)
@@ -1120,6 +1132,8 @@ def load_state(path: Path) -> dict[str, Any]:
         "claude_spool_started_at",
         "drain_stable_since",
         "drain_stable_size",
+        "deepseek_last_turn",
+        "deepseek_boundary_seq",
     }
     for entry in files.values():
         if any(
@@ -1476,6 +1490,14 @@ def zcode_log_files(root: Path) -> list[Path]:
     if root.is_file() and root.name.endswith(".jsonl"):
         return [root]
     return sorted(root.glob("zcode-*.jsonl"), key=lambda path: str(path))
+
+
+def deepseek_projection_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    if root.is_file() and root.name.startswith("session-") and root.suffix == ".json":
+        return [root]
+    return sorted(root.glob("session-*.json"), key=lambda path: str(path))
 
 
 def kimi_wire_files(root: Path, include_subagents: bool | None = None) -> list[Path]:
@@ -1924,7 +1946,10 @@ def recover_zcode_turn_context(
             candidate = json.loads(raw_line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if not isinstance(candidate, dict) or candidate.get("message") != "v4 sendText accepted":
+        if not isinstance(candidate, dict) or candidate.get("message") not in {
+            "v4 sendText accepted",
+            "v4 prompt admitted",
+        }:
             continue
         context = candidate.get("context")
         if not isinstance(context, dict):
@@ -1942,6 +1967,30 @@ def recover_zcode_turn_context(
         )
         return {"input_id": candidate_input_id, "workspace": workspace}
     return {}
+
+
+def zcode_session_metadata(session_id: str) -> dict[str, str]:
+    """Read ZCode's own session title and workspace without reading message bodies."""
+    if not session_id:
+        return {}
+    configured = os.getenv("ZCODE_WATCH_DB_PATH", DEFAULT_ZCODE_DB_PATH)
+    database = lexical_absolute_path(configured)
+    if not regular_file_without_symlink(database):
+        return {}
+    uri = f"file:{urllib.parse.quote(str(database), safe='/:')}?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as connection:
+            row = connection.execute(
+                "SELECT substr(title, 1, 513), substr(directory, 1, 4097) FROM session WHERE id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return {}
+    if not row:
+        return {}
+    title = _bounded_zcode_string(row[0], ZCODE_TITLE_MAX_CHARS)
+    workspace = _bounded_zcode_string(row[1], ZCODE_WORKSPACE_MAX_CHARS)
+    return {"title": title, "workspace": workspace}
 
 
 def trigger_from_zcode_record(path: Path, offset: int, record: Any) -> dict[str, Any] | None:
@@ -1986,7 +2035,11 @@ def trigger_from_zcode_record(path: Path, offset: int, record: Any) -> dict[str,
         duration_ms = record.get("durationMs")
         status_detail = "ZCode background turn completed"
 
-    display_name = Path(workspace).name if workspace else (session_id or "ZCode")
+    metadata = zcode_session_metadata(session_id)
+    session_title = metadata.get("title", "")
+    if not workspace:
+        workspace = metadata.get("workspace", "")
+    display_name = session_title or (Path(workspace).name if workspace else "ZCode 会话")
     timestamp = record.get("timestamp")
     local_time = utc_to_local(timestamp)
     duration = ""
@@ -1998,6 +2051,7 @@ def trigger_from_zcode_record(path: Path, offset: int, record: Any) -> dict[str,
         "timestamp": timestamp,
         "local_time": local_time,
         "session_id": session_id,
+        "session_title": session_title,
         "turn_id": turn_id,
         "input_id": input_id,
         "query_id": query_id,
@@ -2025,10 +2079,6 @@ def trigger_from_zcode_record(path: Path, offset: int, record: Any) -> dict[str,
         body_parts.append(f"目录: {workspace or '(unknown workspace)'}")
     if session_id:
         body_parts.append(f"Session: {session_id[:12]}")
-    if query_id:
-        body_parts.append(f"Query: {query_id[:12]}")
-    if input_id:
-        body_parts.append(f"Input: {input_id[:12]}")
     if duration:
         body_parts.append(f"耗时: {duration}")
 
@@ -2055,6 +2105,152 @@ def zcode_event_stable_id(event: dict[str, Any], path: Path, line_offset: int) -
     else:
         source = f"zcode:{path}:{line_offset}:{event_type}"
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+
+
+def trigger_from_deepseek_projection(path: Path) -> dict[str, Any] | None:
+    """Build one completion event from DeepSeek Harness's bounded projection cache."""
+    if not regular_file_without_symlink(path):
+        return None
+    try:
+        with path.open("rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if metadata.st_size <= 0 or metadata.st_size > DEEPSEEK_PROJECTION_MAX_BYTES:
+                return None
+            raw = stream.read(DEEPSEEK_PROJECTION_MAX_BYTES + 1)
+        if len(raw) > DEEPSEEK_PROJECTION_MAX_BYTES:
+            return None
+        snapshot = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 7 or not isinstance(snapshot.get("record"), dict):
+        return None
+    record = snapshot["record"]
+    identity = record.get("identity")
+    rows = record.get("rows")
+    if not isinstance(identity, dict) or not isinstance(rows, dict):
+        return None
+    if identity.get("formatVersion") != 3 or identity.get("isSeeded"):
+        return None
+    child = rows.get("subagent", {})
+    if not isinstance(child, dict) or not isinstance(child.get("val"), dict):
+        return None
+    if child["val"].get("identity"):
+        return None
+    goal = rows.get("goal", {})
+    if isinstance(goal, dict) and isinstance(goal.get("val"), dict):
+        current_goal = goal["val"].get("current")
+        if isinstance(current_goal, dict) and current_goal.get("phase") == "active":
+            return None
+    boundary_row = rows.get("turnBoundary")
+    if not isinstance(boundary_row, dict) or boundary_row.get("ver") != 2 or not isinstance(boundary_row.get("val"), dict):
+        return None
+    boundary = boundary_row["val"]
+    last_turn = _zcode_nonnegative_integer(boundary.get("lastTurn"))
+    boundary_seq = _zcode_nonnegative_integer(boundary_row.get("seq"))
+    last_step = boundary.get("lastStepBoundary")
+    if (
+        not last_turn
+        or boundary_seq is None
+        or "openTurnStartSeq" not in boundary
+        or boundary["openTurnStartSeq"] is not None
+        or not isinstance(last_step, dict)
+        or last_step.get("kind") != "end"
+    ):
+        return None
+
+    session_id = path.stem.removeprefix("session-")
+    if not session_id or len(session_id) > ZCODE_IDENTIFIER_MAX_CHARS:
+        return None
+    cwd = _bounded_zcode_string(identity.get("cwd"), ZCODE_WORKSPACE_MAX_CHARS)
+    title_row = rows.get("title")
+    title = ""
+    if isinstance(title_row, dict):
+        title = _bounded_zcode_string(title_row.get("val"), ZCODE_TITLE_MAX_CHARS)
+    display_name = title or (Path(cwd).name if cwd else session_id[:12])
+    timestamp = dt.datetime.fromtimestamp(metadata.st_mtime, tz=dt.timezone.utc).isoformat()
+    local_time = utc_to_local(timestamp)
+    stable_source = f"deepseek\0{session_id}\0turn\0{last_turn}"
+    event = {
+        "event_type": "deepseek_turn_completed",
+        "timestamp": timestamp,
+        "local_time": local_time,
+        "session_id": session_id,
+        "session_title": title,
+        "turn_number": last_turn,
+        "boundary_seq": boundary_seq,
+        "status": "已停下",
+        "status_detail": "DeepSeek Harness 本轮已结束",
+        "cwd": cwd or "(unknown workspace)",
+        "log_path": str(path),
+        "offset": boundary_seq,
+        "message": "",
+        "stable_id": hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24],
+        "bark_group": os.getenv("DEEPSEEK_BARK_GROUP", "DeepSeek Harness"),
+        "bark_icon": os.getenv("DEEPSEEK_BARK_ICON") or DEFAULT_DEEPSEEK_BARK_ICON,
+        "ntfy_url": os.getenv("DEEPSEEK_NTFY_URL", ""),
+        "ntfy_tags": os.getenv("DEEPSEEK_NTFY_TAGS", "robot,computer"),
+    }
+    body_parts = [
+        "状态: 已结束本轮",
+        "判断: DeepSeek Harness 本轮已结束",
+        f"会话: {display_name}",
+        f"时间: {local_time}",
+    ]
+    if include_workspace_in_notifications():
+        body_parts.append(f"目录: {cwd or '(unknown workspace)'}")
+    body_parts.append(f"轮次: {last_turn}")
+    event["notification_title"] = f"DeepSeek Harness 已结束本轮: {compact(display_name, 42)}"
+    event["notification_body"] = "\n".join(body_parts)
+    return event
+
+
+def process_deepseek_projection(
+    path: Path,
+    state: dict[str, Any],
+    notifier: Notifier,
+    log: Logger,
+    checkpoint: Callable[[], None] | None = None,
+) -> int:
+    files = state.setdefault("files", {})
+    rec = files.setdefault(str(path), {"kind": "DeepSeek Harness"})
+    event = trigger_from_deepseek_projection(path)
+    if event is None:
+        return 0
+
+    current_turn = int(event.get("turn_number", 0) or 0)
+    current_seq = int(event.get("boundary_seq", 0) or 0)
+    previous_turn = int(rec.get("deepseek_last_turn", 0) or 0)
+    if current_turn <= previous_turn:
+        return 0
+
+    stable_id = str(event["stable_id"])
+    if stable_id in state.setdefault("sent", {}):
+        delivery_attempts_for_state(state).pop(stable_id, None)
+        rec["deepseek_last_turn"] = current_turn
+        return 0
+    else:
+        outcome = deliver_event_with_bounded_retry(
+            state=state,
+            rec=rec,
+            notifier=notifier,
+            log=log,
+            event=event,
+            stable_id=stable_id,
+            source="deepseek",
+            path=path,
+            line_offset=current_seq,
+            line_end=current_seq,
+            checkpoint=checkpoint,
+        )
+    if outcome in {"sent", "exhausted"}:
+        rec["deepseek_last_turn"] = current_turn
+        rec["deepseek_boundary_seq"] = current_seq
+        rec["updated_at"] = int(time.time())
+        delivery_checkpoint(checkpoint)
+    if outcome == "sent":
+        log(f"sent deepseek_turn_completed for {event['session_id']} turn {current_turn}")
+        return 1
+    return 0
 
 
 def _claude_record_string(
@@ -2279,8 +2475,11 @@ def validated_tool_hook_record(record: Any) -> dict[str, Any] | None:
         message_hash,
     }:
         return None
-    expected_event = {"pi": "agent_settled", "opencode": "session.idle"}.get(source)
+    expected_event = {"pi": "agent_settled", "opencode": "session.idle", "omp": "agent_end"}.get(source)
     if event_name != expected_event:
+        return None
+    session_title = record.get("session_title", "")
+    if not isinstance(session_title, str) or len(session_title) > 512:
         return None
     outcome = record.get("outcome")
     if outcome not in {"completed", "error", "cancelled"}:
@@ -2300,6 +2499,7 @@ def validated_tool_hook_record(record: Any) -> dict[str, Any] | None:
     return {
         "source": source,
         "event_name": event_name,
+        "session_title": session_title,
         "session_id": session_id,
         "event_id": event_id,
         "timestamp": timestamp,
@@ -2321,7 +2521,7 @@ def trigger_from_tool_hook_record(path: Path, offset: int, record: dict[str, Any
     if not env_flag(f"{source.upper()}_WATCH_ENABLED", True):
         return None
     parent_session = parsed["parent_session"]
-    if source == "opencode" and parent_session:
+    if source in {"opencode", "omp"} and parent_session:
         return None
     if (
         source == "pi"
@@ -2330,7 +2530,7 @@ def trigger_from_tool_hook_record(path: Path, offset: int, record: dict[str, Any
     ):
         return None
 
-    labels = {"pi": "Pi Agent", "opencode": "OpenCode"}
+    labels = {"pi": "Pi Agent", "opencode": "OpenCode", "omp": "OMP"}
     tool_name = labels[source]
     outcome = parsed["outcome"]
     message = parsed["message"]
@@ -2357,13 +2557,14 @@ def trigger_from_tool_hook_record(path: Path, offset: int, record: dict[str, Any
     session_id = parsed["session_id"]
     event_id = parsed["event_id"]
     cwd = parsed["cwd"]
-    display_name = Path(cwd).name or session_id[:12]
+    display_name = parsed.get("session_title") or Path(cwd).name or session_id[:12]
     timestamp = parsed["timestamp"]
     local_time = utc_to_local(timestamp)
     stable_source = f"{source}\0{session_id}\0{event_id}\0{outcome}"
     default_icons = {
         "pi": DEFAULT_PI_BARK_ICON,
         "opencode": DEFAULT_OPENCODE_BARK_ICON,
+        "omp": DEFAULT_OMP_BARK_ICON,
     }
     event = {
         "event_type": event_type,
@@ -3161,7 +3362,7 @@ def initialize_tool_hook_events(
     state["tool_hooks_initialized"] = key
     action = "from BOF" if process_existing else "at EOF"
     log(
-        f"initialized Pi/OpenCode hook event queue {action} for {count} file(s): {root}",
+        f"initialized Pi/OpenCode/OMP hook event queue {action} for {count} file(s): {root}",
         always_stdout=True,
     )
     return True
@@ -3341,6 +3542,27 @@ def baseline_existing_zcode_files(state: dict[str, Any], root: Path, log: Logger
         count += 1
     state["zcode_initialized"] = True
     log(f"initialized ZCode baseline at EOF for {count} log files", always_stdout=True)
+
+
+def baseline_deepseek_projections(state: dict[str, Any], root: Path, log: Logger) -> None:
+    files = state.setdefault("files", {})
+    count = 0
+    for path in deepseek_projection_files(root):
+        event = trigger_from_deepseek_projection(path)
+        rec: dict[str, Any] = {
+            "kind": "DeepSeek Harness",
+            "updated_at": int(time.time()),
+        }
+        if event is not None:
+            rec["deepseek_last_turn"] = int(event["turn_number"])
+            rec["deepseek_boundary_seq"] = int(event["boundary_seq"])
+        files[str(path)] = rec
+        count += 1
+    state["deepseek_initialized"] = True
+    log(
+        f"initialized DeepSeek Harness baseline for {count} projection files",
+        always_stdout=True,
+    )
 
 
 def baseline_external_files(
@@ -3811,6 +4033,20 @@ def zcode_watch_enabled(args: argparse.Namespace) -> bool:
     return os.getenv("ZCODE_WATCH_ENABLED", "1") not in {"0", "false", "False"}
 
 
+def build_deepseek_projection_root(args: argparse.Namespace) -> Path:
+    default_root = str(Path(os.getenv("DSH_HOME", "~/.dsh")) / "storages/session_projcache/sessions")
+    return expand_path(
+        getattr(args, "deepseek_projection_root", None)
+        or os.getenv("DEEPSEEK_WATCH_PROJECTION_ROOT", default_root)
+    )
+
+
+def deepseek_watch_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "disable_deepseek", False):
+        return False
+    return env_flag("DEEPSEEK_WATCH_ENABLED", True)
+
+
 def build_kimi_sessions_root(args: argparse.Namespace) -> Path:
     return expand_path(
         getattr(args, "kimi_sessions_root", None)
@@ -3872,7 +4108,11 @@ def build_tool_hook_events_dir(args: argparse.Namespace) -> Path:
 def tool_hooks_watch_enabled(args: argparse.Namespace) -> bool:
     if getattr(args, "disable_tool_hooks", False):
         return False
-    return env_flag("PI_WATCH_ENABLED", True) or env_flag("OPENCODE_WATCH_ENABLED", True)
+    return (
+        env_flag("PI_WATCH_ENABLED", True)
+        or env_flag("OPENCODE_WATCH_ENABLED", True)
+        or env_flag("OMP_WATCH_ENABLED", True)
+    )
 
 
 def parse_extra_event_types() -> set[str]:
@@ -3928,6 +4168,8 @@ def send_external_test_notification(
         "CLAUDE": DEFAULT_CLAUDE_BARK_ICON,
         "PI": DEFAULT_PI_BARK_ICON,
         "OPENCODE": DEFAULT_OPENCODE_BARK_ICON,
+        "DEEPSEEK": DEFAULT_DEEPSEEK_BARK_ICON,
+        "OMP": DEFAULT_OMP_BARK_ICON,
     }.get(env_prefix, "")
     event = {
         "event_type": f"{event_prefix}_test",
@@ -3990,6 +4232,7 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     log_path = expand_path(args.log)
     roots = build_roots(args)
     zcode_root = build_zcode_log_root(args)
+    deepseek_root = build_deepseek_projection_root(args)
     kimi_root = build_kimi_sessions_root(args)
     grok_root = build_grok_sessions_root(args)
     claude_events_file = build_claude_hook_events_file(args)
@@ -4047,6 +4290,18 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
     if zcode_watch_enabled(args):
         print_check("ZCode log root", zcode_root.exists(), str(zcode_root))
         print_check("ZCode log files", count_paths(zcode_log_files(zcode_root)) > 0, f"{count_paths(zcode_log_files(zcode_root))} file(s)")
+        zcode_database = lexical_absolute_path(
+            os.getenv("ZCODE_WATCH_DB_PATH", DEFAULT_ZCODE_DB_PATH)
+        )
+        print_check("ZCode session database", regular_file_without_symlink(zcode_database), str(zcode_database))
+    print_check("DeepSeek Harness watch enabled", deepseek_watch_enabled(args), f"root={deepseek_root}")
+    if deepseek_watch_enabled(args):
+        print_check("DeepSeek projection root", deepseek_root.exists(), str(deepseek_root))
+        print_check(
+            "DeepSeek projection files",
+            count_paths(deepseek_projection_files(deepseek_root)) > 0,
+            f"{count_paths(deepseek_projection_files(deepseek_root))} file(s)",
+        )
     kimi_policy = "enabled" if env_flag("KIMI_WATCH_NOTIFY_SUBAGENTS", False) else "main agent only"
     print(f"Kimi subagent notifications: {kimi_policy}")
     print_check("Kimi watch enabled", kimi_watch_enabled(args), f"root={kimi_root}")
@@ -4067,13 +4322,13 @@ def doctor(args: argparse.Namespace, log: Logger) -> int:
             str(claude_events_file),
         )
     print_check(
-        "Pi/OpenCode hook queue enabled",
+        "Pi/OpenCode/OMP hook queue enabled",
         tool_hooks_watch_enabled(args),
         f"events={tool_hook_events_dir}",
     )
     if tool_hooks_watch_enabled(args):
         queue_safe = not path_has_link_component(tool_hook_events_dir)
-        print_check("Pi/OpenCode hook queue path", queue_safe, str(tool_hook_events_dir))
+        print_check("Pi/OpenCode/OMP hook queue path", queue_safe, str(tool_hook_events_dir))
     print_check("state file", state_path.exists(), str(state_path))
     state_file_valid = True
     delivery_state: dict[str, Any] = {}
@@ -4141,6 +4396,8 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
     roots = build_roots(args)
     zcode_enabled = zcode_watch_enabled(args)
     zcode_root = build_zcode_log_root(args)
+    deepseek_enabled = deepseek_watch_enabled(args)
+    deepseek_root = build_deepseek_projection_root(args)
     kimi_enabled = kimi_watch_enabled(args)
     kimi_root = build_kimi_sessions_root(args)
     grok_enabled = grok_watch_enabled(args)
@@ -4171,6 +4428,11 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
         save_state(state_path, state)
 
     did_baseline = False
+    if deepseek_enabled and state.get("deepseek_root") != str(deepseek_root):
+        if not args.process_existing:
+            baseline_deepseek_projections(state, deepseek_root, log)
+            did_baseline = True
+        state["deepseek_root"] = str(deepseek_root)
     if not state.get("initialized") and not args.process_existing:
         baseline_existing_files(state, roots, log)
         did_baseline = True
@@ -4238,6 +4500,8 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
     log(f"watching {', '.join(str(root) for root in roots)} with channels={notifier.channels}", always_stdout=True)
     if zcode_enabled:
         log(f"watching ZCode {zcode_root} with channels={notifier.channels}", always_stdout=True)
+    if deepseek_enabled:
+        log(f"watching DeepSeek Harness projections {deepseek_root}", always_stdout=True)
     if kimi_enabled:
         log(f"watching Kimi Code {kimi_root} with channels={notifier.channels}", always_stdout=True)
     if grok_enabled:
@@ -4246,7 +4510,7 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
         log(f"watching Claude Code hook events {claude_events_file} with channels={notifier.channels}", always_stdout=True)
     if tool_hooks_enabled:
         log(
-            f"watching Pi/OpenCode hook events {tool_hook_events_dir} with channels={notifier.channels}",
+            f"watching Pi/OpenCode/OMP hook events {tool_hook_events_dir} with channels={notifier.channels}",
             always_stdout=True,
         )
 
@@ -4260,6 +4524,9 @@ def run_watcher(args: argparse.Namespace, log: Logger, state_path: Path) -> int:
                 }
                 log(f"new rollout discovered: {path}")
             process_file(path, state, notifier, extra_types, log, checkpoint)
+        if deepseek_enabled:
+            for path in deepseek_projection_files(deepseek_root):
+                process_deepseek_projection(path, state, notifier, log, checkpoint)
         if zcode_enabled:
             for path in zcode_log_files(zcode_root):
                 if str(path) not in state.setdefault("files", {}):
@@ -4374,6 +4641,8 @@ def main() -> int:
         "--test-claude",
         "--test-pi",
         "--test-opencode",
+        "--test-deepseek",
+        "--test-omp",
     }
     while True:
         try:
@@ -4406,14 +4675,16 @@ def main() -> int:
     parser.add_argument("--include-archived", action="store_true", help="Also scan ~/.codex/archived_sessions.")
     parser.add_argument("--zcode-log-root", help="Root containing ZCode zcode-*.jsonl log files.")
     parser.add_argument("--disable-zcode", action="store_true", help="Disable ZCode log notifications.")
+    parser.add_argument("--deepseek-projection-root", help="DeepSeek Harness projection cache directory.")
+    parser.add_argument("--disable-deepseek", action="store_true", help="Disable DeepSeek Harness notifications.")
     parser.add_argument("--kimi-sessions-root", help="Root containing Kimi Code session wire.jsonl files.")
     parser.add_argument("--disable-kimi", action="store_true", help="Disable Kimi Code notifications.")
     parser.add_argument("--grok-sessions-root", help="Root containing Grok Build session events.jsonl files.")
     parser.add_argument("--disable-grok", action="store_true", help="Disable Grok Build notifications.")
     parser.add_argument("--claude-hook-events-file", help="JSONL spool written by the official Claude Code hooks.")
     parser.add_argument("--disable-claude", action="store_true", help="Disable Claude Code hook notifications.")
-    parser.add_argument("--tool-hook-events-dir", help="Private event queue written by Pi and OpenCode integrations.")
-    parser.add_argument("--disable-tool-hooks", action="store_true", help="Disable Pi and OpenCode integration notifications.")
+    parser.add_argument("--tool-hook-events-dir", help="Private event queue written by Pi, OpenCode, and OMP integrations.")
+    parser.add_argument("--disable-tool-hooks", action="store_true", help="Disable Pi, OpenCode, and OMP integration notifications.")
     parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them.")
     parser.add_argument("--verbose", action="store_true", help="Also print log lines to stdout.")
     parser.add_argument("--test", action="store_true", help="Send one test notification and exit.")
@@ -4423,6 +4694,8 @@ def main() -> int:
     parser.add_argument("--test-claude", action="store_true", help="Send one Claude Code test notification and exit.")
     parser.add_argument("--test-pi", action="store_true", help="Send one Pi Agent test notification and exit.")
     parser.add_argument("--test-opencode", action="store_true", help="Send one OpenCode test notification and exit.")
+    parser.add_argument("--test-deepseek", action="store_true", help="Send one DeepSeek Harness test notification.")
+    parser.add_argument("--test-omp", action="store_true", help="Send one OMP test notification.")
     parser.add_argument("--doctor", action="store_true", help="Check configuration, log roots, and LaunchAgent status.")
     parser.add_argument("--replay-file", help="Replay one rollout file from the beginning and exit.")
     args = parser.parse_args()
@@ -4444,6 +4717,10 @@ def main() -> int:
         return send_external_test_notification(args, log, "Pi Agent", "pi")
     if args.test_opencode:
         return send_external_test_notification(args, log, "OpenCode", "opencode")
+    if args.test_deepseek:
+        return send_external_test_notification(args, log, "DeepSeek Harness", "deepseek")
+    if args.test_omp:
+        return send_external_test_notification(args, log, "OMP", "omp")
     if args.doctor:
         return doctor(args, log)
     # Keep these paths lexical so the safety checks can still see a configured

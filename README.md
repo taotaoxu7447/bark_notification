@@ -21,6 +21,10 @@
 
 ## 已支持能力
 
+- **ZCode 可读会话**：完成日志中的 session ID 会在本机以只读方式关联 ZCode SQLite 会话库，通知显示会话标题和项目目录；不读取消息正文。新日志的 `v4 prompt admitted` 和旧格式均可识别。
+- **DeepSeek Harness**：监听本机 `~/.dsh/storages/session_projcache/sessions` 的投影缓存（当前支持缓存 v7、session format v3、turnBoundary v2），以关闭的轮次边界提示“本轮已结束”。启动时建立历史基线，同一轮缓存改写不会重复通知，子智能体、seeded 会话及 active goal 默认静默。缓存是最新状态快照，watcher 离线期间或两次轮询之间结束的多轮只提示最新轮次；不将结束推断为成功，不读取压缩对话正文。
+- **OMP / Oh My Pi**：支持 `18.0.4+`，安装/更新自动配置本机扩展。主会话 `session_stop` 仅记录候选，最终 `agent_end` 无续跑和待处理消息时才写入私有队列；子智能体及只触发错误/取消、没有有效主会话停止事件的运行保持静默。已有 OMP 进程需重启以加载扩展。自定义 profile 可配置 `OMP_WATCH_AGENT_DIR`。
+
 - **通知通道**：iPhone / Apple Watch 可使用个人 Bark；Android 使用项目自研 AgentWatch，通过账号隔离的自建 WebSocket 实时接收。
 - **Android 一次登录**：服务器地址、topic 和连接方式已内置，用户只需用邀请代码注册一次，后续自动连接。
 - **Android 来源分组**：Codex、ZCode、Kimi Code、Grok Build、Claude Code、Pi Agent、OpenCode 使用独立通知频道和定制图标，手机系统可分别管理，App 历史页也按来源分类。
@@ -275,6 +279,11 @@ agentwatch uninstall
 | `CODEX_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Codex 子智能体事件，默认 `0`，只提醒主会话 |
 | `ZCODE_WATCH_ENABLED` | 是否启用 ZCode，默认 `1` |
 | `ZCODE_WATCH_LOG_ROOT` | ZCode 日志目录，默认 `~/.zcode/cli/log` |
+| `ZCODE_WATCH_DB_PATH` | ZCode 只读会话标题库，默认 `~/.zcode/cli/db/db.sqlite` |
+| `DEEPSEEK_WATCH_ENABLED` | 是否监听 DeepSeek Harness，默认 `1` |
+| `DEEPSEEK_WATCH_PROJECTION_ROOT` | 可覆盖 DeepSeek 缓存目录；未设置时从 `DSH_HOME`（默认 `~/.dsh`）推导 |
+| `OMP_WATCH_ENABLED` | 是否安装并监听 OMP 扩展，默认 `1` |
+| `OMP_WATCH_AGENT_DIR` | OMP profile 的 agent 目录，默认 `~/.omp/agent`，与 Pi 的安装目录分离 |
 | `KIMI_WATCH_ENABLED` | 是否启用 Kimi Code，默认 `1` |
 | `KIMI_WATCH_SESSIONS_ROOT` | Kimi Code 会话目录，默认 `~/.kimi-code/sessions` |
 | `KIMI_WATCH_NOTIFY_SUBAGENTS` | 是否提醒 Kimi 子智能体，默认 `0` |
@@ -397,6 +406,8 @@ python3 codex_watch_notifier.py --test-grok
 python3 codex_watch_notifier.py --test-claude
 python3 codex_watch_notifier.py --test-pi
 python3 codex_watch_notifier.py --test-opencode
+python3 codex_watch_notifier.py --test-deepseek
+python3 codex_watch_notifier.py --test-omp
 ```
 
 以上 `--test*` 都是真实、显式、单次的通知测试；安装、更新、登录、诊断和构建不得自动调用。如果你新增了某个工具的测试命令，也要把它加入人工验收清单。

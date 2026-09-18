@@ -29,6 +29,8 @@ class NtfyMessageTest {
         assertEquals(NtfyMessage.Source.OTHER, NtfyMessage.inferSource(emptySet(), "任务已完成"))
         assertEquals(NtfyMessage.Source.OTHER, NtfyMessage.inferSource(emptySet(), "OpenAI 任务已完成"))
         assertEquals(NtfyMessage.Source.OTHER, NtfyMessage.inferSource(emptySet(), "Pipeline 已完成"))
+        assertEquals(NtfyMessage.Source.DEEPSEEK, NtfyMessage.inferSource(emptySet(), "DeepSeek Harness 已结束本轮"))
+        assertEquals(NtfyMessage.Source.OMP, NtfyMessage.sourceForKey("omp"))
     }
 
     @Test
@@ -62,6 +64,8 @@ class NtfyMessageTest {
         listOf(
             Triple("pi", "Pi Agent 已完成", NtfyMessage.Source.PI),
             Triple("opencode", "OpenCode 已完成", NtfyMessage.Source.OPENCODE),
+            Triple("deepseek", "DeepSeek Harness 已结束本轮", NtfyMessage.Source.DEEPSEEK),
+            Triple("omp", "OMP 已完成", NtfyMessage.Source.OMP),
         ).forEach { (source, title, expected) ->
             val eventId = "aw2-$source-event"
             val envelope = JSONObject()

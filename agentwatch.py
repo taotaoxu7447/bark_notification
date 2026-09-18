@@ -54,6 +54,9 @@ from claude_hook_config import (
     preflight_claude_hooks,
 )
 from tool_hook_config import (
+    OMP_MANAGED_MARKER,
+    build_omp_extension,
+    omp_extension_path,
     INTEGRATION_REGISTRATION_FILE_NAME,
     OPENCODE_MANAGED_MARKER,
     PI_MANAGED_MARKER,
@@ -97,11 +100,13 @@ TOOL_HOOK_INPUT_LIMIT_BYTES = 1024 * 1024
 TOOL_HOOK_MESSAGE_LIMIT_CHARS = 64 * 1024
 TOOL_HOOK_SCHEMA = "agentwatch_tool_hook_v1"
 TOOL_HOOK_SOURCE_SCHEMAS = {
+    "omp": ("agentwatch_omp_hook_v1", "agent_end"),
     "pi": ("agentwatch_pi_hook_v1", "agent_settled"),
     "opencode": ("agentwatch_opencode_hook_v1", "session.idle"),
 }
 MIN_PI_EXTENSION_VERSION = (0, 80, 4)
 MIN_OPENCODE_PLUGIN_VERSION = (1, 15, 11)
+MIN_OMP_EXTENSION_VERSION = (18, 0, 4)
 SERVICE_STATE_TIMEOUT_SECONDS = 8.0
 SERVICE_STATE_POLL_SECONDS = 0.2
 # AgentWatch relies on the complete modern Stop payload contract. Exec-form
@@ -562,13 +567,14 @@ def ingest_tool_hook_event(source: str, events_dir: Path | None = None) -> Path:
         "stop_reason",
         "message",
     }
-    if set(payload) != allowed:
+    if set(payload) - {"session_title"} != allowed:
         raise AgentWatchError("invalid tool hook input")
     expected_schema, expected_event = expected
     if payload.get("schema") != expected_schema or payload.get("event_name") != expected_event:
         raise AgentWatchError("invalid tool hook input")
 
     session_id = _tool_hook_payload_string(payload, "session_id", limit=256, required=True)
+    session_title = _tool_hook_payload_string(payload, "session_title", limit=512)
     event_id = _tool_hook_payload_string(payload, "event_id", limit=256, required=True)
     cwd = _tool_hook_payload_string(payload, "cwd", limit=4096, required=True)
     parent_session = _tool_hook_payload_string(payload, "parent_session", limit=4096)
@@ -588,6 +594,7 @@ def ingest_tool_hook_event(source: str, events_dir: Path | None = None) -> Path:
     record = {
         "schema": TOOL_HOOK_SCHEMA,
         "source": source,
+        "session_title": session_title,
         "event_name": expected_event,
         "session_id": session_id,
         "event_id": event_id,
@@ -1770,10 +1777,12 @@ def _tool_hook_registration_path(paths: InstallPaths) -> Path:
 
 TOOL_HOOK_REGISTRATION_VERSION = 2
 TOOL_HOOK_MANAGED_IDS = {
+    "omp": "agentwatch-omp-extension-v1",
     "pi": "agentwatch-pi-extension-v1",
     "opencode": "agentwatch-opencode-plugin-v1",
 }
 TOOL_HOOK_EXPECTED_NAMES = {
+    "omp": "agentwatch-omp-notifications.ts",
     "pi": "agentwatch-notifications.ts",
     "opencode": "agentwatch-notifications.js",
 }
@@ -1900,6 +1909,11 @@ def _tool_hook_cleanup_targets(paths: InstallPaths) -> dict[str, dict[str, Any]]
     path_environment = dict(_config_values(paths))
     path_environment.update(os.environ)
     return {
+        "omp": {
+            "path": omp_extension_path(paths.home, path_environment),
+            "marker": OMP_MANAGED_MARKER,
+            "content": build_omp_extension(sys.executable, paths.runtime / "agentwatch.py", events_dir),
+        },
         "pi": {
             "path": pi_extension_path(paths.home, path_environment),
             "marker": PI_MANAGED_MARKER,
@@ -1918,6 +1932,9 @@ def _tool_hook_desired(paths: InstallPaths) -> dict[str, dict[str, Any]]:
     path_environment = dict(values)
     path_environment.update(os.environ)
     events_dir = _tool_hook_events_dir(paths)
+    omp_cli = _semver_cli_status("omp", MIN_OMP_EXTENSION_VERSION)
+    omp_requested = _persistent_flag(values, "OMP_WATCH_ENABLED", True)
+    omp_eligible = not omp_cli["cli_detected"] or bool(omp_cli["cli_compatible"])
     pi_cli = _semver_cli_status("pi", MIN_PI_EXTENSION_VERSION)
     opencode_cli = _semver_cli_status("opencode", MIN_OPENCODE_PLUGIN_VERSION)
     pi_requested = _persistent_flag(values, "PI_WATCH_ENABLED", True)
@@ -1927,6 +1944,15 @@ def _tool_hook_desired(paths: InstallPaths) -> dict[str, dict[str, Any]]:
     pi_path = pi_extension_path(paths.home, path_environment)
     opencode_path = opencode_plugin_path(paths.home, path_environment)
     return {
+        "omp": {
+            "requested": omp_requested,
+            "enabled": omp_requested and omp_eligible,
+            "eligible": omp_eligible,
+            "path": omp_extension_path(paths.home, path_environment),
+            "marker": OMP_MANAGED_MARKER,
+            "content": build_omp_extension(sys.executable, paths.runtime / "agentwatch.py", events_dir),
+            "cli": omp_cli,
+        },
         "pi": {
             "requested": pi_requested,
             "enabled": pi_requested and pi_eligible,
@@ -2347,7 +2373,7 @@ def _human_status(result: dict[str, Any]) -> None:
         claude_state = "未配置"
     print(f"Claude Code Hook：{claude_state}")
     tool_hooks = result.get("tool_hooks") or {}
-    for source, label in (("pi", "Pi Agent 扩展"), ("opencode", "OpenCode 插件")):
+    for source, label in (("pi", "Pi Agent 扩展"), ("opencode", "OpenCode 插件"), ("omp", "OMP 扩展")):
         integration = tool_hooks.get(source) or {}
         if not integration.get("enabled"):
             state = "已关闭"
@@ -2568,7 +2594,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "tool_hook_registration_valid": not tool_hooks.get("registration_error"),
             }
-            for source in ("pi", "opencode"):
+            for source in ("pi", "opencode", "omp"):
                 integration = tool_hooks[source]
                 checks[f"{source}_integration_configured"] = bool(
                     not integration["enabled"] or integration["configured"]
@@ -2817,7 +2843,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             result = {
                 "ok": True,
-                "message": "AgentWatch 后台服务、Claude/Pi/OpenCode 集成和程序已卸载；本机账号 token 与历史状态已保留",
+                "message": "AgentWatch 后台服务、Claude/Pi/OpenCode/OMP 集成和程序已卸载；本机账号 token 与历史状态已保留",
                 "credentials_preserved": True,
             }
             _emit(result, json_output)

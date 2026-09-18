@@ -1249,6 +1249,8 @@ class MainActivity : Activity() {
         NtfyMessage.Source.CLAUDE -> Color.rgb(255, 241, 234)
         NtfyMessage.Source.PI -> Color.rgb(245, 239, 255)
         NtfyMessage.Source.OPENCODE -> Color.rgb(234, 248, 246)
+        NtfyMessage.Source.DEEPSEEK -> Color.rgb(232, 240, 255)
+        NtfyMessage.Source.OMP -> Color.rgb(255, 240, 224)
         NtfyMessage.Source.OTHER -> COLOR_BLUE_SOFT
     }
 
