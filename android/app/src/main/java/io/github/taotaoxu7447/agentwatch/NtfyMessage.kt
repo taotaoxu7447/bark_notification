@@ -38,6 +38,8 @@ data class NtfyMessage(
         CLAUDE("claude", "Claude Code"),
         PI("pi", "Pi Agent"),
         OPENCODE("opencode", "OpenCode"),
+        DEEPSEEK("deepseek", "DeepSeek Harness"),
+        OMP("omp", "OMP"),
         OTHER("other", "其他任务"),
     }
 
@@ -109,6 +111,8 @@ data class NtfyMessage(
                 normalized.startsWith("claude") -> Source.CLAUDE
                 normalized.startsWith("pi agent") -> Source.PI
                 normalized.startsWith("opencode") || normalized.startsWith("open code") -> Source.OPENCODE
+                normalized.startsWith("deepseek") -> Source.DEEPSEEK
+                normalized.startsWith("omp") -> Source.OMP
                 else -> Source.OTHER
             }
         }

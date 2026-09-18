@@ -48,6 +48,7 @@ def watcher_args(root: Path, spool: Path) -> SimpleNamespace:
         disable_kimi=True,
         kimi_sessions_root=str(root / "missing-kimi"),
         disable_grok=True,
+        disable_deepseek=True,
         grok_sessions_root=str(root / "missing-grok"),
         disable_claude=False,
         claude_hook_events_file=str(spool),

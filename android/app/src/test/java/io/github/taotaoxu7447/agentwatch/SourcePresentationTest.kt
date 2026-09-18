@@ -6,6 +6,14 @@ import org.junit.Test
 
 class SourcePresentationTest {
     @Test
+    fun newSourcesHaveIndependentChannelsAndStatusIcons() {
+        val deepseek = NtfyMessage.Source.DEEPSEEK
+        val omp = NtfyMessage.Source.OMP
+        assertEquals("event_deepseek_v1", SourcePresentation.channelId(deepseek))
+        assertEquals("event_omp_v1", SourcePresentation.channelId(omp))
+        assertNotEquals(SourcePresentation.smallIcon(deepseek), SourcePresentation.smallIcon(omp))
+    }
+    @Test
     fun claudeUsesDedicatedChannelsAndIcons() {
         val claude = NtfyMessage.Source.CLAUDE
         assertEquals("event_claude_v1", SourcePresentation.channelId(claude))

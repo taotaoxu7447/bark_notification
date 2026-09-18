@@ -294,10 +294,11 @@ class ToolHookRegistrationTests(unittest.TestCase):
                 )
                 registration = json.loads(registration_path.read_text(encoding="utf-8"))
                 self.assertEqual(agentwatch.TOOL_HOOK_REGISTRATION_VERSION, registration["version"])
-                self.assertEqual({"pi", "opencode"}, set(registration["integrations"]))
+                self.assertEqual({"pi", "opencode", "omp"}, set(registration["integrations"]))
                 for source, integration_path in (
                     ("pi", pi_path),
                     ("opencode", opencode_path),
+                    ("omp", tool_hook_config.omp_extension_path(paths.home, {})),
                 ):
                     entry = registration["integrations"][source]
                     self.assertEqual(agentwatch.TOOL_HOOK_MANAGED_IDS[source], entry["managed_id"])

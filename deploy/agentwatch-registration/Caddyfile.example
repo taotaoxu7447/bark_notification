@@ -1,5 +1,12 @@
 # AgentWatch site on SH_VPS. The API path is kept intact upstream.
 https://aw.taotaoxu.net {
+	# Copy the two public source PNGs into /var/www/agentwatch-public/icons/.
+	@agentwatch_source_icons path /icons/deepseek-icon-v1.png /icons/omp-icon-v1.png
+	handle @agentwatch_source_icons {
+		root * /var/www/agentwatch-public
+		header Cache-Control "public, max-age=86400"
+		file_server
+	}
 	header -Server
 
 	# ntfy v2.26.3 account tokens can enumerate, create, and revoke every
