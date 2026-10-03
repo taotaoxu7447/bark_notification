@@ -230,6 +230,38 @@ class CodexSessionFilteringTests(unittest.TestCase):
 
         self.assertIsNone(event)
 
+    def test_guardian_review_filters_started_completed_and_aborted(self) -> None:
+        meta_record = self.session_meta("guardian_review", parent_thread_id="parent")
+        meta_record["payload"]["source"] = {"subagent": {"other": "guardian"}}
+        path = self.write_rollout(meta_record, self.task_started(), self.task_complete(), self.turn_aborted())
+        delivery = mock.Mock()
+        state = {"files": {}, "sent": {}}
+        with mock.patch.dict(os.environ, {"CODEX_WATCH_NOTIFY_SUBAGENTS": "0"}):
+            notifier.process_file(path, state, delivery, set(), mock.Mock())
+        delivery.send.assert_not_called()
+        self.assertEqual(path.stat().st_size, state["files"][str(path)]["offset"])
+
+    def test_structured_subagent_source_survives_new_or_missing_thread_type(self) -> None:
+        for thread_source in ("", "new_internal_review", "user"):
+            for source in ({"subagent": {"other": "guardian"}}, '{"subagent":{"fork":{}}}'):
+                with self.subTest(thread_source=thread_source, source=source):
+                    meta_record = self.session_meta(thread_source)
+                    meta_record["payload"]["source"] = source
+                    path = self.write_rollout(meta_record)
+                    with mock.patch.dict(os.environ, {"CODEX_WATCH_NOTIFY_SUBAGENTS": "0"}):
+                        self.assertIsNone(notifier.trigger_from_record(path, 1, self.task_complete(), set()))
+
+    def test_user_fork_and_guardian_named_user_task_remain_visible(self) -> None:
+        # A parent id or user-chosen title alone is not an internal session.
+        meta_record = self.session_meta("user", parent_thread_id="fork-origin")
+        meta_record["payload"]["title"] = "Guardian review"
+        for source in ("vscode", "cli", {"app_server": {}}, "{malformed"):
+            with self.subTest(source=source):
+                meta_record["payload"]["source"] = source
+                path = self.write_rollout(meta_record)
+                with mock.patch.dict(os.environ, {"CODEX_WATCH_NOTIFY_SUBAGENTS": "0"}):
+                    self.assertIsNotNone(notifier.trigger_from_record(path, 1, self.task_complete(), set()))
+
     def test_subagent_notification_can_be_enabled(self) -> None:
         path = self.write_rollout(self.session_meta("subagent", parent_thread_id="parent"))
 

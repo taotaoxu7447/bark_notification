@@ -1719,7 +1719,20 @@ def load_session_meta(path: Path) -> dict[str, Any]:
 
 
 def is_subagent_session(meta: dict[str, Any]) -> bool:
-    return str(meta.get("thread_source") or "").strip().lower() == "subagent"
+    thread_source = str(meta.get("thread_source") or "").strip().lower()
+    if thread_source in {"subagent", "guardian_review"}:
+        return True
+    source = meta.get("source")
+    if isinstance(source, str):
+        if source.strip().lower() == "subagent":
+            return True
+        # Some producers serialize the tagged source enum as a JSON string.
+        if len(source) <= 4096 and source.lstrip().startswith("{"):
+            try:
+                source = json.loads(source)
+            except json.JSONDecodeError:
+                return False
+    return isinstance(source, dict) and "subagent" in source
 
 
 def load_thread_title(thread_id: str) -> str:
